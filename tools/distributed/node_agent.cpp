@@ -28,12 +28,13 @@ static pid_t g_worker_pid = 0;
 
 static void usage(const char * prog) {
     fprintf(stderr,
-            "usage: %s --model PATH --listen HOST:PORT --orchestrator URL [--node-id ID]\n"
-            "example: %s --model llama.gguf --listen 0.0.0.0:9001 --orchestrator http://127.0.0.1:9000\n",
+            "usage: %s --model PATH --listen HOST:PORT --orchestrator URL [--node-id ID] [--advertise-host IP]\n"
+            "example: %s --model llama.gguf --listen 0.0.0.0:9001 --orchestrator http://10.0.0.1:9000 --advertise-host 10.0.0.2\n",
             prog, prog);
 }
 
-static bool parse_args(int argc, char ** argv, std::string & listen, std::string & orchestrator, std::string & node_id) {
+static bool parse_args(int argc, char ** argv, std::string & listen, std::string & orchestrator,
+        std::string & node_id, std::string & advertise_host) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             g_model_path = argv[++i];
@@ -43,6 +44,8 @@ static bool parse_args(int argc, char ** argv, std::string & listen, std::string
             orchestrator = argv[++i];
         } else if (strcmp(argv[i], "--node-id") == 0 && i + 1 < argc) {
             node_id = argv[++i];
+        } else if (strcmp(argv[i], "--advertise-host") == 0 && i + 1 < argc) {
+            advertise_host = argv[++i];
         } else {
             return false;
         }
@@ -210,8 +213,9 @@ static bool start_worker(const std::string & agent_bin, const dist_configure_req
 int main(int argc, char ** argv) {
     std::string listen;
     std::string orchestrator;
+    std::string advertise_host;
 
-    if (!parse_args(argc, argv, listen, orchestrator, g_node_id)) {
+    if (!parse_args(argc, argv, listen, orchestrator, g_node_id, advertise_host)) {
         usage(argv[0]);
         return 1;
     }
@@ -232,9 +236,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::string register_host = bind_host;
+    std::string register_host = !advertise_host.empty() ? advertise_host : bind_host;
     if (register_host == "0.0.0.0" || register_host == "*") {
-        register_host = "127.0.0.1";
+        fprintf(stderr, "node_agent: set --advertise-host to a reachable IP (not 0.0.0.0)\n");
+        return 1;
     }
 
     if (!register_with_orchestrator(orchestrator, g_node_id, register_host, http_port)) {
