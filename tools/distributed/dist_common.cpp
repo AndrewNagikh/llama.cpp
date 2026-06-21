@@ -5,8 +5,13 @@
 #include <fstream>
 #include <thread>
 
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
+#elif !defined(_WIN32)
 #include <sys/sysinfo.h>
+#include <unistd.h>
 #endif
 
 bool dist_parse_host_port(const std::string & listen, std::string & host, int & port) {
@@ -51,7 +56,26 @@ void dist_probe_memory(int64_t & total_mb, int64_t & free_mb) {
     total_mb = 0;
     free_mb  = 0;
 
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+    int64_t mem_bytes = 0;
+    size_t len = sizeof(mem_bytes);
+    if (sysctlbyname("hw.memsize", &mem_bytes, &len, nullptr, 0) == 0) {
+        total_mb = mem_bytes / (1024 * 1024);
+    }
+
+    vm_size_t page_size = 0;
+    if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS) {
+        return;
+    }
+
+    vm_statistics64_data_t vm{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+            reinterpret_cast<host_info64_t>(&vm), &count) == KERN_SUCCESS) {
+        const int64_t free_pages = (int64_t) vm.free_count + (int64_t) vm.purgeable_count;
+        free_mb = free_pages * (int64_t) page_size / (1024 * 1024);
+    }
+#elif !defined(_WIN32)
     struct sysinfo info{};
     if (sysinfo(&info) == 0) {
         total_mb = (int64_t) info.totalram * info.mem_unit / (1024 * 1024);
