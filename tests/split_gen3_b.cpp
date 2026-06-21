@@ -111,12 +111,18 @@ int main(int argc, char ** argv) {
     int bc_port     = -1;
     int layer_start = 5;
     int layer_end   = 10;
+    const char * bc_host = "127.0.0.1";
+    const char * bind_host = "0.0.0.0";
 
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--ab-port") == 0 && i + 1 < argc) {
             ab_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--bc-port") == 0 && i + 1 < argc) {
             bc_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--bc-host") == 0 && i + 1 < argc) {
+            bc_host = argv[++i];
+        } else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
+            bind_host = argv[++i];
         } else if (strcmp(argv[i], "--layer-start") == 0 && i + 1 < argc) {
             layer_start = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--layer-end") == 0 && i + 1 < argc) {
@@ -132,9 +138,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const int listen_fd = split_tcp_listen(ab_port);
+    const int listen_fd = split_tcp_listen_host(bind_host, ab_port);
     if (listen_fd < 0) {
-        fprintf(stderr, "gen3_b: listen failed port=%d\n", ab_port);
+        fprintf(stderr, "gen3_b: listen failed %s:%d\n", bind_host, ab_port);
         return 1;
     }
 
@@ -160,9 +166,9 @@ int main(int argc, char ** argv) {
 
     llama_set_layer_range(ctx, layer_start, layer_end);
 
-    const int bc_fd = split_tcp_connect("127.0.0.1", bc_port);
+    const int bc_fd = split_tcp_connect_retry(bc_host, bc_port, 300, 100);
     if (bc_fd < 0) {
-        fprintf(stderr, "gen3_b: connect to C failed port=%d\n", bc_port);
+        fprintf(stderr, "gen3_b: connect to C failed %s:%d\n", bc_host, bc_port);
         return 1;
     }
 

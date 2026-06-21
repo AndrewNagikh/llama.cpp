@@ -160,10 +160,21 @@ cmake --build build --target \
   test-partial-forward test-injection-proof test-split-tcp \
   split_gen_a split_gen_b test-autoregressive-split \
   split_gen3_a split_gen3_b split_gen3_c test-autoregressive-split-3node \
+  orchestrator node_agent test-orchestrator-3node \
   benchmark-layer-cost -j8
 ```
 
 Binaries land in `build/bin/`.
+
+## Task 5: Orchestrator + Node Agent
+
+```
+User -> Orchestrator (HTTP :9000)
+          -> node_agent x3 (HTTP register/configure)
+                -> split_gen3_{a,b,c} workers (TCP pipeline)
+```
+
+See `docs/task5_orchestrator.md` and deploy repo `distributed-llm/node-agent/`.
 
 ## Known Limitations
 

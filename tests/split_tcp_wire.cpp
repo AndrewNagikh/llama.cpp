@@ -13,6 +13,7 @@ typedef int socklen_t;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -50,6 +51,23 @@ static bool io_recv_all(int fd, void * data, size_t size) {
     return true;
 }
 
+void split_tcp_set_timeouts(int fd, int timeout_ms) {
+    if (fd < 0 || timeout_ms <= 0) {
+        return;
+    }
+#if defined(_WIN32)
+    const DWORD tv = (DWORD) timeout_ms;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *) &tv, sizeof(tv));
+#else
+    timeval tv{};
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 bool split_tcp_send_all(int fd, const void * data, size_t size) {
     return io_send_all(fd, data, size);
 }
@@ -58,7 +76,7 @@ bool split_tcp_recv_all(int fd, void * data, size_t size) {
     return io_recv_all(fd, data, size);
 }
 
-int split_tcp_listen(int port) {
+int split_tcp_listen_host(const char * host, int port) {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
@@ -68,9 +86,19 @@ int split_tcp_listen(int port) {
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *) &yes, sizeof(yes));
 
     sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port        = htons((uint16_t) port);
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t) port);
+
+    if (host == nullptr || host[0] == '\0' || strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0) {
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    } else if (strcmp(host, "0.0.0.0") == 0 || strcmp(host, "*") == 0) {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+#if !defined(_WIN32)
+        close(fd);
+#endif
+        return -1;
+    }
 
     if (bind(fd, (sockaddr *) &addr, sizeof(addr)) != 0) {
 #if !defined(_WIN32)
@@ -79,7 +107,7 @@ int split_tcp_listen(int port) {
         return -1;
     }
 
-    if (listen(fd, 1) != 0) {
+    if (listen(fd, 8) != 0) {
 #if !defined(_WIN32)
         close(fd);
 #endif
@@ -87,6 +115,10 @@ int split_tcp_listen(int port) {
     }
 
     return fd;
+}
+
+int split_tcp_listen(int port) {
+    return split_tcp_listen_host("127.0.0.1", port);
 }
 
 int split_tcp_accept(int listen_fd) {
@@ -105,7 +137,9 @@ int split_tcp_connect(const char * host, int port) {
     addr.sin_family = AF_INET;
     addr.sin_port   = htons((uint16_t) port);
 
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+    if (host == nullptr || host[0] == '\0' || strcmp(host, "localhost") == 0) {
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    } else if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
 #if !defined(_WIN32)
         close(fd);
 #endif
@@ -119,7 +153,24 @@ int split_tcp_connect(const char * host, int port) {
         return -1;
     }
 
+    split_tcp_set_timeouts(fd, 30000);
+
     return fd;
+}
+
+int split_tcp_connect_retry(const char * host, int port, int retries, int delay_ms) {
+    for (int i = 0; i < retries; ++i) {
+        const int fd = split_tcp_connect(host, port);
+        if (fd >= 0) {
+            return fd;
+        }
+#if !defined(_WIN32)
+        if (i + 1 < retries) {
+            usleep((useconds_t) delay_ms * 1000);
+        }
+#endif
+    }
+    return -1;
 }
 
 bool split_tcp_send_hidden(int fd, int32_t n_tokens, int32_t n_embd, int32_t layer_end, const float * data) {

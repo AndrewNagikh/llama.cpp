@@ -62,11 +62,14 @@ struct split_tcp_perf {
 };
 
 int  split_tcp_listen(int port);
+int  split_tcp_listen_host(const char * host, int port);
 int  split_tcp_accept(int listen_fd);
 int  split_tcp_connect(const char * host, int port);
+int  split_tcp_connect_retry(const char * host, int port, int retries, int delay_ms);
 
 bool split_tcp_send_all(int fd, const void * data, size_t size);
 bool split_tcp_recv_all(int fd, void * data, size_t size);
+void split_tcp_set_timeouts(int fd, int timeout_ms);
 
 bool split_tcp_send_hidden(int fd, int32_t n_tokens, int32_t n_embd, int32_t layer_end, const float * data);
 bool split_tcp_recv_hidden(int fd, split_tcp_hidden_msg & msg);

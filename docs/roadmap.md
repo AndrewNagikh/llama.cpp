@@ -28,18 +28,25 @@
 
 ---
 
+### Task 5 - Orchestrator + Node Agent
+- [x] `orchestrator` HTTP coordinator
+- [x] `node_agent` supervisor (registers, launches split_gen3 workers)
+- [x] Node registration `/register`
+- [x] Static pipeline layout A `[0,5) [5,10) [10,16)`
+- [x] End-to-end generation `/session/generate`
+- [x] `test-orchestrator-3node` (32/32 vs split baseline)
+- [x] Graceful failure when middle node stops
+- [x] Remote host TCP (`--b-host`, `--bc-host`, `--bind`)
+- [x] Separate deploy repo `distributed-llm/node-agent/`
+
+---
+
 ## Next Steps (Suggested)
 
-### Task 5 - Orchestrator Prototype
-- [ ] Read `layer_cost.csv` and node capability descriptors
-- [ ] Given N heterogeneous nodes, compute optimal layer partition
-- [ ] Dynamic process spawn (still localhost first)
-- [ ] Reconfigure pipeline without manual layout constants
-
-### Task 6 - Multi-Machine TCP
-- [ ] Replace `127.0.0.1` with configurable host addresses
-- [ ] Connection retry and basic health checks
-- [ ] Larger hidden-state payloads (batching, compression - optional)
+### Task 6 - Multi-Machine Hardening
+- [ ] Advertise host / NAT-friendly registration
+- [ ] Connection retry and health checks between sessions
+- [ ] Larger hidden-state payloads (optional compression)
 
 ### Task 7 - Production Hardening
 - [ ] Graceful shutdown and error propagation through pipeline
@@ -75,6 +82,7 @@ MODEL=/path/to/llama-3.2-1b-instruct-q4_k_m.gguf
 ./build/bin/test-split-tcp "$MODEL"
 ./build/bin/test-autoregressive-split "$MODEL"
 ./build/bin/test-autoregressive-split-3node "$MODEL"
+./build/bin/test-orchestrator-3node "$MODEL"
 ./build/bin/benchmark-layer-cost "$MODEL" --csv tests/layer_cost.csv
 ```
 
