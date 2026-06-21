@@ -105,7 +105,14 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    const int32_t layer_start = cparams.layer_start;
+    const int32_t layer_end   = cparams.layer_end < 0 ? (int32_t) n_layer : cparams.layer_end;
+
+    if (layer_start > 0) {
+        inpL = build_inp_hidden();
+    } else {
+        inpL = build_inp_embd(model.tok_embd);
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -123,7 +130,24 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    GGML_ASSERT(layer_start >= 0);
+    GGML_ASSERT(layer_start <= layer_end);
+    GGML_ASSERT(layer_end <= n_layer);
+
+    if (layer_start > 0 || layer_end < n_layer) {
+        LLAMA_LOG_INFO("%s: layer_start=%d layer_end=%d (effective_end=%d n_layer=%d)\n",
+                __func__, layer_start, cparams.layer_end, layer_end, (int) n_layer);
+        LLAMA_LOG_INFO("%s: running layers %d-%d\n", __func__, layer_start, layer_end - 1);
+        LLAMA_LOG_INFO("%s: executed %d transformer layers\n", __func__, layer_end - layer_start);
+        if (layer_start > 0) {
+            LLAMA_LOG_INFO("%s: skipping layers 0-%d\n", __func__, layer_start - 1);
+        }
+        if (layer_end < n_layer) {
+            LLAMA_LOG_INFO("%s: skipping layers %d-%d\n", __func__, layer_end, (int) n_layer - 1);
+        }
+    }
+
+    for (int il = layer_start; il < layer_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -171,7 +195,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == layer_end - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -228,19 +252,27 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     }
     cur = inpL;
 
-    cur = build_norm(cur,
-            model.output_norm, NULL,
-            LLM_NORM_RMS, -1);
+    const bool partial = layer_end < n_layer;
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+    if (!partial) {
+        cur = build_norm(cur,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, -1);
 
-    if constexpr (!embed) {
-        // lm_head
-        cur = build_lora_mm(model.output, cur, model.output_s);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
 
-        cb(cur, "result_output", -1);
-        res->t_logits = cur;
+        if constexpr (!embed) {
+            // lm_head
+            cur = build_lora_mm(model.output, cur, model.output_s);
+
+            cb(cur, "result_output", -1);
+            res->t_logits = cur;
+        }
+    } else {
+        cb(cur, "partial_out", -1);
+        res->t_embd   = cur;
+        res->t_logits = nullptr;
     }
 
     ggml_build_forward_expand(gf, cur);

@@ -116,6 +116,9 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_layer_range(int32_t start, int32_t end);
+    void set_hidden_state(const float * data, int32_t n_tokens);
+    void clear_hidden_state();
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -230,6 +233,8 @@ private:
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
+    bool is_layer_partial_out() const;
+
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
@@ -299,6 +304,10 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // hidden state input for partial forward when layer_start > 0
+    std::vector<float> hidden_state_inp;
+    int32_t            hidden_state_n_tokens = 0;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

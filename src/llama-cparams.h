@@ -20,6 +20,10 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // partial forward: execute layers in [layer_start, layer_end); layer_end < 0 means n_layer()
+    int32_t  layer_start = 0;
+    int32_t  layer_end   = -1;
+
     float rope_freq_base;
     float rope_freq_scale;
 

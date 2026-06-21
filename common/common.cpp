@@ -6,6 +6,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1293,6 +1294,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return;
+    }
+
+    if (params.layer_start > 0 || params.layer_end >= 0) {
+        llama_set_layer_range(lctx, params.layer_start, params.layer_end);
     }
 
     pimpl->context.reset(lctx);

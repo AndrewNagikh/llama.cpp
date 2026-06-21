@@ -518,6 +518,10 @@ struct common_params {
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
+
+    // partial forward pass (Llama arch prototype): execute [layer_start, layer_end)
+    int32_t layer_start = 0;
+    int32_t layer_end   = -1; // -1 = all layers
     bool    offline                    = false;
     bool    skip_download              = false; // skip model file downloading
 

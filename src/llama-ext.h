@@ -110,6 +110,17 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// Partial forward: execute only layers in [start, end). end < 0 means n_layer().
+LLAMA_API void llama_set_layer_range(struct llama_context * ctx, int32_t start, int32_t end);
+
+// Provide hidden state input for partial forward when layer_start > 0.
+// data layout: [n_embd * n_tokens], row-major per token (same as batch.embd).
+// copied into context; caller may free data after the call.
+LLAMA_API void llama_set_hidden_state(struct llama_context * ctx, const float * data, int32_t n_tokens);
+
+// Clear hidden state set by llama_set_hidden_state().
+LLAMA_API void llama_clear_hidden_state(struct llama_context * ctx);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);

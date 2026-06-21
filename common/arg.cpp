@@ -2571,6 +2571,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--layer-start"}, "N",
+        "[EXPERIMENTAL] first transformer layer to execute (inclusive, default: 0)",
+        [](common_params & params, int value) {
+            params.layer_start = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--layer-end"}, "N",
+        "[EXPERIMENTAL] last transformer layer boundary (exclusive, default: n_layer). "
+        "Example: --layer-end 16 runs layers 0-15 and outputs hidden state via llama_get_embeddings()",
+        [](common_params & params, int value) {
+            params.layer_end = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-a", "--alias"}, "STRING",
         "set model name aliases, comma-separated (to be used by API)",
         [](common_params & params, const std::string & value) {

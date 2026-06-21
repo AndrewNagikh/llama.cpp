@@ -1160,6 +1160,45 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_layer_range(int32_t start, int32_t end) {
+    LLAMA_LOG_DEBUG("%s: start = %d, end = %d\n", __func__, start, end);
+
+    GGML_ASSERT(start >= 0);
+    GGML_ASSERT(end < 0 || end >= start);
+
+    if (cparams.layer_start == start && cparams.layer_end == end) {
+        return;
+    }
+
+    cparams.layer_start = start;
+    cparams.layer_end   = end;
+
+    sched_need_reserve = true;
+}
+
+void llama_context::set_hidden_state(const float * data, int32_t n_tokens) {
+    LLAMA_LOG_DEBUG("%s: n_tokens = %d\n", __func__, n_tokens);
+
+    GGML_ASSERT(data != nullptr);
+    GGML_ASSERT(n_tokens > 0);
+
+    const uint32_t n_embd = model.hparams.n_embd;
+
+    hidden_state_inp.resize((size_t) n_embd * n_tokens);
+    std::memcpy(hidden_state_inp.data(), data, hidden_state_inp.size() * sizeof(float));
+    hidden_state_n_tokens = n_tokens;
+}
+
+void llama_context::clear_hidden_state() {
+    hidden_state_inp.clear();
+    hidden_state_n_tokens = 0;
+}
+
+bool llama_context::is_layer_partial_out() const {
+    const int32_t end = cparams.layer_end < 0 ? (int32_t) model.hparams.n_layer() : cparams.layer_end;
+    return end < (int32_t) model.hparams.n_layer();
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1692,6 +1731,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    llama_batch batch_use = batch_inp;
+
+    if (cparams.layer_start > 0) {
+        if (!batch_use.embd) {
+            if (hidden_state_n_tokens <= 0) {
+                LLAMA_LOG_ERROR("%s: layer_start = %d requires hidden state input (batch.embd or llama_set_hidden_state)\n",
+                        __func__, cparams.layer_start);
+                return -1;
+            }
+
+            if (hidden_state_n_tokens != batch_inp.n_tokens) {
+                LLAMA_LOG_ERROR("%s: hidden state n_tokens = %d, batch n_tokens = %d\n",
+                        __func__, hidden_state_n_tokens, batch_inp.n_tokens);
+                return -1;
+            }
+
+            batch_use.token = nullptr;
+            batch_use.embd  = hidden_state_inp.data();
+        } else {
+            batch_use.token = nullptr;
+        }
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -1728,7 +1790,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    if (!balloc->init(batch_use, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -1879,7 +1941,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //}
 
         auto * t_logits  = res->get_logits();
-        auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
+        auto * t_embd    = (cparams.embeddings || is_layer_partial_out()) ? res->get_embd() : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
 
         if (t_embd && res->get_embd_pooled()) {
@@ -1902,7 +1964,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
-        if (embd.data && t_embd && n_outputs > 0) {
+        if (embd.data && t_embd && (n_outputs > 0 || is_layer_partial_out())) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -1912,12 +1974,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         // extract token embeddings
                         GGML_ASSERT(embd.data != nullptr);
                         const uint32_t n_embd_out = hparams.n_embd_out();
-                        float * embd_out = embd.data + n_outputs_prev*n_embd_out;
 
-                        if (n_outputs) {
-                            GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                            GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd.size);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
+                        if (is_layer_partial_out()) {
+                            const int64_t n_rows = n_outputs > 0 ? n_outputs : (int64_t) ubatch.n_tokens;
+                            float * embd_out = embd.data + n_outputs_prev*n_embd_out;
+
+                            GGML_ASSERT(n_rows > 0);
+                            GGML_ASSERT((n_outputs_prev + n_rows)*n_embd_out <= (int64_t) embd.size);
+                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_rows*n_embd_out*sizeof(float));
+                        } else {
+                            float * embd_out = embd.data + n_outputs_prev*n_embd_out;
+
+                            if (n_outputs) {
+                                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                                GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd.size);
+                                ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
+                            }
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_MEAN:
@@ -2070,8 +2142,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = true;
-    bool has_embd       = cparams.embeddings;
+    bool has_logits     = !is_layer_partial_out();
+    bool has_embd       = cparams.embeddings || is_layer_partial_out();
     bool has_embd_nextn = cparams.embeddings_nextn;
 
     // TODO: hacky enc-dec support
@@ -2087,6 +2159,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
+
+    if (is_layer_partial_out()) {
+        // partial forward may extract hidden states for every token in the batch
+        embd.size = (size_t) n_embd_out * n_batch;
+    }
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
@@ -3705,6 +3782,18 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_layer_range(llama_context * ctx, int32_t start, int32_t end) {
+    ctx->set_layer_range(start, end);
+}
+
+void llama_set_hidden_state(llama_context * ctx, const float * data, int32_t n_tokens) {
+    ctx->set_hidden_state(data, n_tokens);
+}
+
+void llama_clear_hidden_state(llama_context * ctx) {
+    ctx->clear_hidden_state();
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

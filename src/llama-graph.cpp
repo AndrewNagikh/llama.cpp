@@ -106,6 +106,19 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_hidden::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->embd);
+    GGML_ASSERT(n_embd == h->ne[0]);
+
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+}
+
+bool llm_graph_input_hidden::can_reuse(const llm_graph_params & params) {
+    return h && h->ne[1] == (int64_t) params.ubatch.n_tokens;
+}
+
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -1914,6 +1927,24 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     // make sure the produced embeddings are immediately materialized in the ggml graph
     // ref: https://github.com/ggml-org/llama.cpp/pull/18599
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_hidden() const {
+    const int64_t n_embd = hparams.n_embd;
+
+    auto inp = std::make_unique<llm_graph_input_hidden>(n_embd);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
+    cb(inp->h, "inp_hidden", -1);
+    ggml_set_input(inp->h);
+
+    ggml_tensor * cur = inp->h;
+
+    res->add_input(std::move(inp));
+
     ggml_build_forward_expand(gf, cur);
 
     return cur;

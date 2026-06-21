@@ -123,6 +123,21 @@ public:
     const int64_t n_embd = 0;
 };
 
+// hidden state input for partial forward when layer_start > 0
+class llm_graph_input_hidden : public llm_graph_input_i {
+public:
+    llm_graph_input_hidden(int64_t n_embd) : n_embd(n_embd) {}
+    virtual ~llm_graph_input_hidden() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * h = nullptr; // F32 [n_embd, n_tokens]
+
+    const int64_t n_embd = 0;
+};
+
 // similar to llm_graph_input_embd but with an additional hidden state input
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
@@ -687,6 +702,11 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.layer_start != other.cparams.layer_start ||
+            cparams.layer_end   != other.cparams.layer_end) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -952,6 +972,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    ggml_tensor * build_inp_hidden() const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
