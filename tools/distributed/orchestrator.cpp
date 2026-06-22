@@ -1,4 +1,5 @@
 #include "dist_common.h"
+#include "layer_planner.h"
 #include "split_gen_common.h"
 #include "split_tcp_wire.h"
 
@@ -30,7 +31,7 @@ struct dist_session {
     std::vector<dist_pipeline_stage> pipeline;
     std::string entry_host;
     int entry_ctrl_port = 0;
-    int layer_a_end     = DIST_LAYOUT_A_END;
+    int entry_layer_end = 0;
     bool active         = false;
 };
 
@@ -79,105 +80,124 @@ static bool configure_node(
     }
 }
 
+static const dist_node_info * find_node(const std::map<std::string, dist_node_info> & nodes, const std::string & id) {
+    const auto it = nodes.find(id);
+    return it == nodes.end() ? nullptr : &it->second;
+}
+
 static bool setup_pipeline(
-        const std::vector<dist_node_info *> & picked,
+        const std::string & session_id,
+        int n_layers,
+        const std::vector<dist_layer_assignment> & assignments,
+        const std::map<std::string, dist_node_info> & node_map,
         dist_session & session,
         std::string & err) {
-    if (picked.size() != 3) {
-        err = "need exactly 3 nodes";
+    if (assignments.empty()) {
+        err = "empty layer plan";
         return false;
     }
 
-    const int base = 9100 + (int) (getpid() % 500);
-    const int pipe_base = base + 10;
+    const int pipe_base = 9100 + (int) (getpid() % 500) + 10;
+    const size_t n_stages = assignments.size();
 
-    dist_pipeline_stage stage_c{};
-    stage_c.node_id     = picked[2]->node_id;
-    stage_c.host        = picked[2]->host;
-    stage_c.http_port   = picked[2]->http_port;
-    stage_c.peer_port   = pipe_base + 3;
-    stage_c.layer_start = DIST_LAYOUT_C_START;
-    stage_c.layer_end   = picked[2]->n_layer;
-    stage_c.role        = DIST_ROLE_FINAL;
+    std::vector<dist_pipeline_stage> stages;
+    stages.reserve(n_stages);
 
-    dist_pipeline_stage stage_b{};
-    stage_b.node_id     = picked[1]->node_id;
-    stage_b.host        = picked[1]->host;
-    stage_b.http_port   = picked[1]->http_port;
-    stage_b.peer_port   = pipe_base + 2;
-    stage_b.layer_start = DIST_LAYOUT_B_START;
-    stage_b.layer_end   = DIST_LAYOUT_B_END;
-    stage_b.role        = DIST_ROLE_MIDDLE;
+    for (size_t i = 0; i < n_stages; ++i) {
+        const auto & assign = assignments[i];
+        const dist_node_info * node = find_node(node_map, assign.node_id);
+        if (!node) {
+            err = "unknown node in plan: " + assign.node_id;
+            return false;
+        }
 
-    dist_pipeline_stage stage_a{};
-    stage_a.node_id     = picked[0]->node_id;
-    stage_a.host        = picked[0]->host;
-    stage_a.http_port   = picked[0]->http_port;
-    stage_a.ctrl_port   = pipe_base + 1;
-    stage_a.layer_start = 0;
-    stage_a.layer_end   = DIST_LAYOUT_A_END;
-    stage_a.role        = DIST_ROLE_ENTRY;
+        dist_pipeline_stage stage{};
+        stage.node_id     = node->node_id;
+        stage.host        = node->host;
+        stage.http_port   = node->http_port;
+        stage.layer_start = assign.layer_start;
+        stage.layer_end   = assign.layer_end;
+        stage.score       = assign.score;
 
-    json cfg_c = {
-        { "role", "final" },
-        { "layer_start", stage_c.layer_start },
-        { "layer_end", stage_c.layer_end },
-        { "peer_port", stage_c.peer_port },
-        { "peer_bind", "0.0.0.0" },
-    };
+        if (i == 0) {
+            stage.role      = DIST_ROLE_ENTRY;
+            stage.ctrl_port = pipe_base + 1;
+        } else if (i + 1 == n_stages) {
+            stage.role      = DIST_ROLE_FINAL;
+            stage.peer_port = pipe_base + (int) i + 1;
+        } else {
+            stage.role      = DIST_ROLE_MIDDLE;
+            stage.peer_port = pipe_base + (int) i + 1;
+        }
 
-    if (!configure_node(*picked[2], cfg_c)) {
-        err = "failed to configure final node " + stage_c.node_id;
-        return false;
+        stages.push_back(stage);
     }
+
+    // Configure reverse: final -> ... -> entry
+    for (int ri = (int) n_stages - 1; ri >= 0; --ri) {
+        const auto & stage = stages[(size_t) ri];
+        const dist_node_info * node = find_node(node_map, stage.node_id);
+        if (!node) {
+            err = "node vanished: " + stage.node_id;
+            return false;
+        }
+
+        json cfg = {
+            { "session_id", session_id },
+            { "layer_start", stage.layer_start },
+            { "layer_end", stage.layer_end },
+            { "peer_bind", "0.0.0.0" },
+        };
+
+        if (stage.role == DIST_ROLE_FINAL) {
+            cfg["role"] = "final";
+            cfg["peer_port"] = stage.peer_port;
+        } else if (stage.role == DIST_ROLE_MIDDLE) {
+            const auto & next = stages[(size_t) ri + 1];
+            cfg["role"] = "middle";
+            cfg["peer_port"] = stage.peer_port;
+            cfg["next_host"] = next.host;
+            cfg["next_port"] = next.peer_port;
+        } else {
+            const auto & next = stages[1];
+            cfg["role"] = "entry";
+            cfg["ctrl_port"] = stage.ctrl_port;
+            cfg["next_host"] = next.host;
+            cfg["next_port"] = next.peer_port;
+        }
+
+        if (!configure_node(*node, cfg)) {
+            err = "failed to configure " + stage.node_id +
+                  " layers=[" + std::to_string(stage.layer_start) + "," +
+                  std::to_string(stage.layer_end) + ")";
+            return false;
+        }
 
 #if !defined(_WIN32)
-    usleep(200000);
+        usleep(ri == 0 ? 500000 : 200000);
 #endif
-
-    json cfg_b = {
-        { "role", "middle" },
-        { "layer_start", stage_b.layer_start },
-        { "layer_end", stage_b.layer_end },
-        { "peer_port", stage_b.peer_port },
-        { "peer_bind", "0.0.0.0" },
-        { "next_host", stage_c.host },
-        { "next_port", stage_c.peer_port },
-    };
-
-    if (!configure_node(*picked[1], cfg_b)) {
-        err = "failed to configure middle node " + stage_b.node_id;
-        return false;
     }
 
-#if !defined(_WIN32)
-    usleep(200000);
-#endif
-
-    json cfg_a = {
-        { "role", "entry" },
-        { "layer_start", stage_a.layer_start },
-        { "layer_end", stage_a.layer_end },
-        { "ctrl_port", stage_a.ctrl_port },
-        { "next_host", stage_b.host },
-        { "next_port", stage_b.peer_port },
-    };
-
-    if (!configure_node(*picked[0], cfg_a)) {
-        err = "failed to configure entry node " + stage_a.node_id;
-        return false;
-    }
-
-#if !defined(_WIN32)
-    usleep(500000);
-#endif
-
-    session.pipeline = { stage_a, stage_b, stage_c };
-    session.entry_host       = stage_a.host;
-    session.entry_ctrl_port  = stage_a.ctrl_port;
-    session.layer_a_end      = stage_a.layer_end;
+    session.pipeline         = stages;
+    session.entry_host       = stages[0].host;
+    session.entry_ctrl_port  = stages[0].ctrl_port;
+    session.entry_layer_end  = stages[0].layer_end;
     session.active           = true;
     return true;
+}
+
+static json layout_json(const dist_session & session) {
+    json layout = json::array();
+    for (const auto & s : session.pipeline) {
+        layout.push_back({
+            { "node", s.node_id },
+            { "start", s.layer_start },
+            { "end", s.layer_end },
+            { "score", s.score },
+            { "role", dist_role_name(s.role) },
+        });
+    }
+    return layout;
 }
 
 static json pipeline_json(const dist_session & session) {
@@ -189,6 +209,7 @@ static json pipeline_json(const dist_session & session) {
             { "role", dist_role_name(s.role) },
             { "layer_start", s.layer_start },
             { "layer_end", s.layer_end },
+            { "score", s.score },
             { "ctrl_port", s.ctrl_port },
             { "peer_port", s.peer_port },
         });
@@ -210,7 +231,7 @@ static bool run_generation(
 
     split_gen3_a_resp resp{};
 
-    if (!gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_RESET, 0, 0, session.layer_a_end, nullptr, resp)) {
+    if (!gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_RESET, 0, 0, session.entry_layer_end, nullptr, resp)) {
         err = "reset failed";
         close(ctrl_fd);
         return false;
@@ -222,7 +243,7 @@ static bool run_generation(
     }
 
     if (!gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_PREFILL, (int32_t) prompt.size(), 0,
-            session.layer_a_end, ptoks.data(), resp)) {
+            session.entry_layer_end, ptoks.data(), resp)) {
         err = "prefill failed";
         close(ctrl_fd);
         return false;
@@ -242,7 +263,7 @@ static bool run_generation(
         const int32_t tok_i32 = (int32_t) cur;
         const int32_t pos     = n_prompt + step - 1;
 
-        if (!gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, session.layer_a_end, &tok_i32, resp)) {
+        if (!gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, session.entry_layer_end, &tok_i32, resp)) {
             err = "decode failed at step " + std::to_string(step);
             close(ctrl_fd);
             return false;
@@ -258,7 +279,7 @@ static bool run_generation(
         out_tokens.push_back(cur);
     }
 
-    gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_SHUTDOWN, 0, 0, session.layer_a_end, nullptr, resp);
+    gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_SHUTDOWN, 0, 0, session.entry_layer_end, nullptr, resp);
     close(ctrl_fd);
     return true;
 }
@@ -317,7 +338,20 @@ int main(int argc, char ** argv) {
         node.n_embd  = body.value("n_embd", 0);
         node.memory_total_mb = body.value("memory_total_mb", 0);
         node.memory_free_mb  = body.value("memory_free_mb", 0);
+        node.score = body.value("score", 1.0);
+        if (body.contains("performance")) {
+            node.score = body["performance"].value("score", node.score);
+        }
+        node.last_seen = dist_now_unix();
         node.online = true;
+
+        if (body.contains("hardware")) {
+            const auto & hw = body["hardware"];
+            node.hardware.cpu_threads = hw.value("cpu_threads", 4);
+            node.hardware.ram_gb      = hw.value("ram_gb", 0);
+            node.hardware.gpu_name    = hw.value("gpu_name", "none");
+            node.hardware.gpu_vram_gb = hw.value("gpu_vram_gb", 0);
+        }
 
         if (body.contains("capabilities")) {
             const auto & caps = body["capabilities"];
@@ -337,8 +371,8 @@ int main(int argc, char ** argv) {
             g_nodes[node.node_id] = node;
         }
 
-        fprintf(stderr, "orchestrator: registered node %s at %s:%d layers=%d\n",
-                node.node_id.c_str(), node.host.c_str(), node.http_port, node.n_layer);
+        fprintf(stderr, "orchestrator: registered node %s at %s:%d layers=%d score=%.1f\n",
+                node.node_id.c_str(), node.host.c_str(), node.http_port, node.n_layer, node.score);
 
         res.set_content(json({ { "ok", true }, { "node_id", node.node_id } }).dump(), "application/json");
     });
@@ -354,7 +388,15 @@ int main(int argc, char ** argv) {
                 { "port", n.http_port },
                 { "n_layer", n.n_layer },
                 { "n_embd", n.n_embd },
+                { "score", n.score },
                 { "online", n.online },
+                { "last_seen", n.last_seen },
+                { "hardware", {
+                    { "cpu_threads", n.hardware.cpu_threads },
+                    { "ram_gb", n.hardware.ram_gb },
+                    { "gpu_name", n.hardware.gpu_name },
+                    { "gpu_vram_gb", n.hardware.gpu_vram_gb },
+                }},
             });
         }
         res.set_content(json({ { "nodes", nodes } }).dump(), "application/json");
@@ -372,30 +414,36 @@ int main(int argc, char ** argv) {
 
         const std::string model = body.value("model", "llama-3.2-1b");
 
-        std::vector<dist_node_info *> picked;
+        std::map<std::string, dist_node_info> node_map;
+        int n_layers = 0;
         {
             std::lock_guard<std::mutex> lock(g_mu);
-            for (auto & kv : g_nodes) {
+            for (const auto & kv : g_nodes) {
                 if (kv.second.online && kv.second.n_layer > 0) {
-                    picked.push_back(&kv.second);
+                    node_map[kv.first] = kv.second;
+                    n_layers = std::max(n_layers, kv.second.n_layer);
                 }
             }
         }
 
-        std::sort(picked.begin(), picked.end(), [](const dist_node_info * a, const dist_node_info * b) {
-            return a->node_id < b->node_id;
-        });
-
-        if (picked.size() < 3) {
+        if (node_map.size() < 1) {
             res.status = 503;
-            res.set_content(json({
-                { "error", "need at least 3 registered nodes" },
-                { "registered", picked.size() },
-            }).dump(), "application/json");
+            res.set_content(json({ { "error", "need at least 1 registered node" } }).dump(), "application/json");
             return;
         }
 
-        picked.resize(3);
+        std::vector<dist_planner_node> planner_nodes;
+        planner_nodes.reserve(node_map.size());
+        for (const auto & kv : node_map) {
+            planner_nodes.push_back({ kv.second.node_id, kv.second.score });
+        }
+
+        const auto assignments = dist_plan_layers(n_layers, planner_nodes);
+        if (assignments.empty()) {
+            res.status = 500;
+            res.set_content(R"({"error":"layer planning failed"})", "application/json");
+            return;
+        }
 
         dist_session session{};
         session.session_id = make_id("sess");
@@ -403,7 +451,7 @@ int main(int argc, char ** argv) {
         session.model_path = g_model_path;
 
         std::string err;
-        if (!setup_pipeline(picked, session, err)) {
+        if (!setup_pipeline(session.session_id, n_layers, assignments, node_map, session, err)) {
             res.status = 500;
             res.set_content(json({ { "error", err } }).dump(), "application/json");
             return;
@@ -414,8 +462,15 @@ int main(int argc, char ** argv) {
             g_sessions[session.session_id] = session;
         }
 
+        fprintf(stderr, "orchestrator: session %s layout:", session.session_id.c_str());
+        for (const auto & s : session.pipeline) {
+            fprintf(stderr, " %s=[%d,%d)", s.node_id.c_str(), s.layer_start, s.layer_end);
+        }
+        fprintf(stderr, "\n");
+
         res.set_content(json({
             { "session_id", session.session_id },
+            { "layout", layout_json(session) },
             { "pipeline", pipeline_json(session) },
         }).dump(), "application/json");
     });
@@ -494,7 +549,7 @@ int main(int argc, char ** argv) {
         }).dump(), "application/json");
     });
 
-    fprintf(stderr, "orchestrator: listening on %s:%d\n", bind_host.c_str(), port);
+    fprintf(stderr, "orchestrator: listening on %s:%d (dynamic layer planner)\n", bind_host.c_str(), port);
 
     if (!svr.listen(bind_host.c_str(), port)) {
         fprintf(stderr, "orchestrator: failed to bind\n");

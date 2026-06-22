@@ -11,6 +11,13 @@ enum dist_node_role : uint32_t {
     DIST_ROLE_FINAL        = 3,
 };
 
+struct dist_node_hardware {
+    int32_t     cpu_threads   = 4;
+    int32_t     ram_gb        = 0;
+    std::string gpu_name      = "none";
+    int32_t     gpu_vram_gb   = 0;
+};
+
 struct dist_node_capabilities {
     std::string gpu_backend   = "cpu";
     std::string gpu_name      = "none";
@@ -27,6 +34,9 @@ struct dist_node_info {
     int         n_embd      = 0;
     int64_t     memory_total_mb = 0;
     int64_t     memory_free_mb  = 0;
+    double      score       = 1.0;
+    int64_t     last_seen   = 0;
+    dist_node_hardware hardware;
     dist_node_capabilities caps;
     bool online = true;
 };
@@ -39,10 +49,12 @@ struct dist_pipeline_stage {
     int         peer_port   = 0;
     int         layer_start = 0;
     int         layer_end   = 0;
+    double      score       = 0.0;
     dist_node_role role = DIST_ROLE_UNCONFIGURED;
 };
 
 struct dist_configure_req {
+    std::string    session_id;
     dist_node_role role        = DIST_ROLE_UNCONFIGURED;
     int            layer_start = 0;
     int            layer_end   = 0;
@@ -67,12 +79,8 @@ struct dist_gen_resp {
 
 static constexpr int DIST_MAX_NEW_TOKENS = 32;
 
-static constexpr int DIST_LAYOUT_A_END  = 5;
-static constexpr int DIST_LAYOUT_B_START = 5;
-static constexpr int DIST_LAYOUT_B_END   = 10;
-static constexpr int DIST_LAYOUT_C_START = 10;
-
 bool dist_parse_host_port(const std::string & listen, std::string & host, int & port);
 std::string dist_role_name(dist_node_role role);
 dist_node_capabilities dist_probe_capabilities();
 void dist_probe_memory(int64_t & total_mb, int64_t & free_mb);
+int64_t dist_now_unix();

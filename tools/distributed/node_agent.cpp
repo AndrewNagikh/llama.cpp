@@ -24,11 +24,12 @@ static std::string g_model_path;
 static std::string g_node_id;
 static int32_t g_n_layer = 0;
 static int32_t g_n_embd  = 0;
+static double g_score = 1.0;
 static pid_t g_worker_pid = 0;
 
 static void usage(const char * prog) {
     fprintf(stderr,
-            "usage: %s --model PATH --listen HOST:PORT --orchestrator URL [--node-id ID] [--advertise-host IP]\n"
+            "usage: %s --model PATH --listen HOST:PORT --orchestrator URL [--node-id ID] [--advertise-host IP] [--score N]\n"
             "example: %s --model llama.gguf --listen 0.0.0.0:9001 --orchestrator http://10.0.0.1:9000 --advertise-host 10.0.0.2\n",
             prog, prog);
 }
@@ -46,6 +47,8 @@ static bool parse_args(int argc, char ** argv, std::string & listen, std::string
             node_id = argv[++i];
         } else if (strcmp(argv[i], "--advertise-host") == 0 && i + 1 < argc) {
             advertise_host = argv[++i];
+        } else if (strcmp(argv[i], "--score") == 0 && i + 1 < argc) {
+            g_score = std::stod(argv[++i]);
         } else {
             return false;
         }
@@ -86,6 +89,7 @@ static dist_configure_req parse_configure(const json & body) {
     }
     req.layer_start = body.value("layer_start", 0);
     req.layer_end   = body.value("layer_end", 0);
+    req.session_id  = body.value("session_id", "");
     req.ctrl_port   = body.value("ctrl_port", 0);
     req.peer_port   = body.value("peer_port", 0);
     req.next_host   = body.value("next_host", "127.0.0.1");
@@ -114,14 +118,23 @@ static bool register_with_orchestrator(
         { "port", http_port },
         { "n_layer", g_n_layer },
         { "n_embd", g_n_embd },
-        { "gpu_name", caps.gpu_name },
+        { "score", g_score },
         { "memory_total_mb", total_mb },
         { "memory_free_mb", free_mb },
+        { "hardware", {
+            { "cpu_threads", caps.cpu_threads },
+            { "ram_gb", (int) ((total_mb + 512) / 1024) },
+            { "gpu_name", caps.gpu_name },
+            { "gpu_vram_gb", caps.gpu_memory_mb / 1024 },
+        }},
         { "capabilities", {
             { "gpu_backend", caps.gpu_backend },
             { "gpu_memory_mb", caps.gpu_memory_mb },
             { "cpu_threads", caps.cpu_threads },
             { "supported_arch", caps.supported_arch },
+        }},
+        { "performance", {
+            { "score", g_score },
         }},
     };
 
@@ -252,6 +265,26 @@ int main(int argc, char ** argv) {
 
     svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
         res.set_content(json({ { "status", "ok" }, { "node_id", g_node_id } }).dump(), "application/json");
+    });
+
+    svr.Get("/capabilities", [](const httplib::Request &, httplib::Response & res) {
+        int64_t total_mb = 0;
+        int64_t free_mb  = 0;
+        dist_probe_memory(total_mb, free_mb);
+        const auto caps = dist_probe_capabilities();
+
+        res.set_content(json({
+            { "node_id", g_node_id },
+            { "hardware", {
+                { "cpu_threads", caps.cpu_threads },
+                { "ram_gb", (int) ((total_mb + 512) / 1024) },
+                { "gpu_name", caps.gpu_name },
+                { "gpu_vram_gb", caps.gpu_memory_mb / 1024 },
+            }},
+            { "performance", {
+                { "score", g_score },
+            }},
+        }).dump(), "application/json");
     });
 
     svr.Get("/status", [](const httplib::Request &, httplib::Response & res) {

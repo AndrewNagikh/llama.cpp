@@ -1,5 +1,6 @@
 #include "dist_common.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -41,15 +42,6 @@ std::string dist_role_name(dist_node_role role) {
         case DIST_ROLE_FINAL:  return "final";
         default:               return "unconfigured";
     }
-}
-
-dist_node_capabilities dist_probe_capabilities() {
-    dist_node_capabilities caps;
-    caps.cpu_threads = (int) std::thread::hardware_concurrency();
-    if (caps.cpu_threads <= 0) {
-        caps.cpu_threads = 4;
-    }
-    return caps;
 }
 
 void dist_probe_memory(int64_t & total_mb, int64_t & free_mb) {
@@ -98,4 +90,18 @@ void dist_probe_memory(int64_t & total_mb, int64_t & free_mb) {
         }
     }
 #endif
+}
+
+dist_node_capabilities dist_probe_capabilities() {
+    dist_node_capabilities caps;
+    caps.cpu_threads = (int) std::thread::hardware_concurrency();
+    if (caps.cpu_threads <= 0) {
+        caps.cpu_threads = 4;
+    }
+    return caps;
+}
+
+int64_t dist_now_unix() {
+    return (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
 }

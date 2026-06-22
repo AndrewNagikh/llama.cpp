@@ -43,7 +43,21 @@
 
 ## Next Steps (Suggested)
 
-### Task 6 - Multi-Machine Hardening
+### Task 6 - Dynamic Layer Planner
+- [x] `GET /capabilities` on node agent
+- [x] `--score` CLI flag
+- [x] Score/hardware in registration
+- [x] `layer_planner.h/cpp` proportional algorithm
+- [x] Dynamic layout in `POST /session/create`
+- [x] N-node pipeline configuration (not hardcoded 3)
+- [x] `test-layer-planner`
+- [x] `test-orchestrator-dynamic-layout`
+
+---
+
+## Next Steps (Suggested)
+
+### Task 7 - Auto Benchmark
 - [ ] Advertise host / NAT-friendly registration
 - [ ] Connection retry and health checks between sessions
 - [ ] Larger hidden-state payloads (optional compression)
