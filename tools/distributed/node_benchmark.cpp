@@ -260,9 +260,11 @@ BenchmarkResult run_node_benchmark(const std::string & model_path) {
 
     llama_model_params mparams = llama_model_default_params();
     ggml_backend_dev_t gpu_dev = dist_first_gpu_device();
+    ggml_backend_dev_t gpu_devs[2] = { nullptr, nullptr };
     if (gpu_dev) {
-        mparams.devices      = &gpu_dev;
-        mparams.n_gpu_layers = 999;
+        gpu_devs[0]          = gpu_dev;
+        mparams.devices      = gpu_devs;
+        mparams.n_gpu_layers = -1;
         fprintf(stderr, "node_benchmark: using GPU %s\n", ggml_backend_dev_description(gpu_dev));
     } else {
         fprintf(stderr, "node_benchmark: no GPU backend, using CPU\n");
