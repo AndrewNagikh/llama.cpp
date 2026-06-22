@@ -44,6 +44,16 @@ endfunction()
 dist_add_exe_light(node_agent node_agent.cpp)
 dist_add_exe(orchestrator orchestrator.cpp)
 
+function(dist_add_worker name main_source)
+    add_executable(${name} ${main_source} ${CMAKE_SOURCE_DIR}/tests/split_tcp_wire.cpp)
+    target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(${name} PRIVATE llama llama-common Threads::Threads)
+endfunction()
+
+dist_add_worker(split_gen3_a ${CMAKE_SOURCE_DIR}/tests/split_gen3_a.cpp)
+dist_add_worker(split_gen3_b ${CMAKE_SOURCE_DIR}/tests/split_gen3_b.cpp)
+dist_add_worker(split_gen3_c ${CMAKE_SOURCE_DIR}/tests/split_gen3_c.cpp)
+
 if (LLAMA_BUILD_TESTS)
     add_executable(test-layer-planner test-layer-planner.cpp ${DIST_PLANNER_SOURCES})
     target_include_directories(test-layer-planner PRIVATE ${DIST_INCLUDE_DIRS})

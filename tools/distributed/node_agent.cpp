@@ -148,7 +148,13 @@ static bool register_with_orchestrator(
 
     const auto res = cli.Post("/register", body.dump(), "application/json");
     if (!res || res->status != 200) {
-        fprintf(stderr, "node_agent: register failed status=%d\n", res ? res->status : 0);
+        if (!res) {
+            fprintf(stderr, "node_agent: register failed — cannot reach orchestrator at %s\n",
+                    orchestrator.c_str());
+        } else {
+            fprintf(stderr, "node_agent: register failed HTTP %d: %s\n",
+                    res->status, res->body.c_str());
+        }
         return false;
     }
 
