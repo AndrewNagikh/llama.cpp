@@ -62,6 +62,23 @@ int main() {
     ok &= check_plan(16, { 100.0, 50.0, 25.0 }, { { 0, 9 }, { 9, 14 }, { 14, 16 } });
 
     {
+        // GPU node score >> CPU nodes: every node must still get >= 1 layer.
+        const auto plan = dist_plan_layers(16, {
+            { "node-c", 4385.0 }, { "node-b", 201.0 }, { "node-a", 34.0 },
+        });
+        if (plan.size() != 3) {
+            ok = false;
+        } else {
+            for (const auto & p : plan) {
+                if (p.layer_end <= p.layer_start) {
+                    fprintf(stderr, "skewed scores: node %s got empty range\n", p.node_id.c_str());
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    {
         std::vector<dist_planner_node> nodes = {
             { "a", 100.0 }, { "b", 60.0 }, { "c", 40.0 }, { "d", 20.0 },
         };

@@ -72,6 +72,26 @@ std::vector<dist_layer_assignment> dist_plan_layers(
         counts[remainders[(size_t) i].idx]++;
     }
 
+    // Each node must run at least one layer when the model has enough layers.
+    if (n_layers >= (int) n_nodes) {
+        for (size_t i = 0; i < n_nodes; ++i) {
+            if (counts[i] > 0) {
+                continue;
+            }
+            size_t donor = 0;
+            for (size_t j = 1; j < n_nodes; ++j) {
+                if (counts[j] > counts[donor]) {
+                    donor = j;
+                }
+            }
+            if (counts[donor] <= 1) {
+                break;
+            }
+            counts[donor]--;
+            counts[i]++;
+        }
+    }
+
     int cursor = 0;
     for (size_t i = 0; i < n_nodes; ++i) {
         out[i].node_id     = sorted[i].node_id;
