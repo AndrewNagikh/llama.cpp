@@ -26,6 +26,13 @@ struct dist_node_capabilities {
     std::vector<std::string> supported_arch = { "llama" };
 };
 
+struct dist_node_performance {
+    double score       = 1.0;
+    double decode_tps  = 0.0;
+    double prefill_tps = 0.0;
+    double load_ms     = 0.0;
+};
+
 struct dist_node_info {
     std::string node_id;
     std::string host;
@@ -35,6 +42,7 @@ struct dist_node_info {
     int64_t     memory_total_mb = 0;
     int64_t     memory_free_mb  = 0;
     double      score       = 1.0;
+    dist_node_performance performance;
     int64_t     last_seen   = 0;
     dist_node_hardware hardware;
     dist_node_capabilities caps;

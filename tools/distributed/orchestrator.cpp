@@ -62,22 +62,80 @@ static bool gen3_send_recv(
 static bool configure_node(
         const dist_node_info & node,
         const json & body,
+        std::string & err,
         int timeout_ms = 30000) {
     httplib::Client cli(node.host.c_str(), node.http_port);
     cli.set_connection_timeout(5, 0);
     cli.set_read_timeout(timeout_ms / 1000, (timeout_ms % 1000) * 1000);
 
     const auto res = cli.Post("/configure", body.dump(), "application/json");
-    if (!res || res->status != 200) {
+    if (!res) {
+        err = "no response from " + node.node_id + " at " + node.host + ":" + std::to_string(node.http_port);
+        return false;
+    }
+    if (res->status != 200) {
+        err = node.node_id + " configure HTTP " + std::to_string(res->status) + ": " + res->body;
         return false;
     }
 
     try {
         const json j = json::parse(res->body);
-        return j.value("ok", false);
+        if (!j.value("ok", false)) {
+            err = node.node_id + ": " + j.value("error", "configure failed");
+            return false;
+        }
+        return true;
     } catch (...) {
+        err = node.node_id + ": invalid configure response";
         return false;
     }
+}
+
+static bool shutdown_node(const dist_node_info & node) {
+    httplib::Client cli(node.host.c_str(), node.http_port);
+    cli.set_connection_timeout(2, 0);
+    cli.set_read_timeout(5, 0);
+    const auto res = cli.Post("/shutdown", "", "application/json");
+    return res && res->status == 200;
+}
+
+static bool check_node_health(const dist_node_info & node, std::string & err) {
+    httplib::Client cli(node.host.c_str(), node.http_port);
+    cli.set_connection_timeout(3, 0);
+    cli.set_read_timeout(3, 0);
+    const auto res = cli.Get("/health");
+    if (!res) {
+        err = node.node_id + " unreachable at " + node.host + ":" + std::to_string(node.http_port);
+        return false;
+    }
+    if (res->status != 200) {
+        err = node.node_id + " health check failed HTTP " + std::to_string(res->status);
+        return false;
+    }
+    return true;
+}
+
+static json planned_layout_json(const std::vector<dist_layer_assignment> & assignments) {
+    json layout = json::array();
+    const char * roles[] = { "entry", "middle", "final" };
+    for (size_t i = 0; i < assignments.size(); ++i) {
+        const char * role = "middle";
+        if (i == 0) {
+            role = "entry";
+        } else if (i + 1 == assignments.size()) {
+            role = "final";
+        } else if (assignments.size() == 1) {
+            role = "entry";
+        }
+        layout.push_back({
+            { "node", assignments[i].node_id },
+            { "start", assignments[i].layer_start },
+            { "end", assignments[i].layer_end },
+            { "score", assignments[i].score },
+            { "role", role },
+        });
+    }
+    return layout;
 }
 
 static const dist_node_info * find_node(const std::map<std::string, dist_node_info> & nodes, const std::string & id) {
@@ -133,6 +191,17 @@ static bool setup_pipeline(
         stages.push_back(stage);
     }
 
+    for (const auto & stage : stages) {
+        const dist_node_info * node = find_node(node_map, stage.node_id);
+        if (!node) {
+            continue;
+        }
+        shutdown_node(*node);
+    }
+#if !defined(_WIN32)
+    usleep(300000);
+#endif
+
     // Configure reverse: final -> ... -> entry
     for (int ri = (int) n_stages - 1; ri >= 0; --ri) {
         const auto & stage = stages[(size_t) ri];
@@ -166,10 +235,7 @@ static bool setup_pipeline(
             cfg["next_port"] = next.peer_port;
         }
 
-        if (!configure_node(*node, cfg)) {
-            err = "failed to configure " + stage.node_id +
-                  " layers=[" + std::to_string(stage.layer_start) + "," +
-                  std::to_string(stage.layer_end) + ")";
+        if (!configure_node(*node, cfg, err)) {
             return false;
         }
 
@@ -340,7 +406,12 @@ int main(int argc, char ** argv) {
         node.memory_free_mb  = body.value("memory_free_mb", 0);
         node.score = body.value("score", 1.0);
         if (body.contains("performance")) {
-            node.score = body["performance"].value("score", node.score);
+            const auto & perf = body["performance"];
+            node.performance.score       = perf.value("score", node.score);
+            node.performance.decode_tps  = perf.value("decode_tps", 0.0);
+            node.performance.prefill_tps = perf.value("prefill_tps", 0.0);
+            node.performance.load_ms     = perf.value("load_ms", 0.0);
+            node.score = node.performance.score;
         }
         node.last_seen = dist_now_unix();
         node.online = true;
@@ -371,8 +442,9 @@ int main(int argc, char ** argv) {
             g_nodes[node.node_id] = node;
         }
 
-        fprintf(stderr, "orchestrator: registered node %s at %s:%d layers=%d score=%.1f\n",
-                node.node_id.c_str(), node.host.c_str(), node.http_port, node.n_layer, node.score);
+        fprintf(stderr, "orchestrator: registered node %s at %s:%d layers=%d score=%.1f decode=%.1f prefill=%.1f\n",
+                node.node_id.c_str(), node.host.c_str(), node.http_port, node.n_layer, node.score,
+                node.performance.decode_tps, node.performance.prefill_tps);
 
         res.set_content(json({ { "ok", true }, { "node_id", node.node_id } }).dump(), "application/json");
     });
@@ -389,13 +461,24 @@ int main(int argc, char ** argv) {
                 { "n_layer", n.n_layer },
                 { "n_embd", n.n_embd },
                 { "score", n.score },
+                { "decode_tps", n.performance.decode_tps },
+                { "prefill_tps", n.performance.prefill_tps },
+                { "load_ms", n.performance.load_ms },
                 { "online", n.online },
                 { "last_seen", n.last_seen },
+                { "gpu", n.hardware.gpu_name },
+                { "ram_gb", n.hardware.ram_gb },
                 { "hardware", {
                     { "cpu_threads", n.hardware.cpu_threads },
                     { "ram_gb", n.hardware.ram_gb },
                     { "gpu_name", n.hardware.gpu_name },
                     { "gpu_vram_gb", n.hardware.gpu_vram_gb },
+                }},
+                { "performance", {
+                    { "score", n.performance.score },
+                    { "decode_tps", n.performance.decode_tps },
+                    { "prefill_tps", n.performance.prefill_tps },
+                    { "load_ms", n.performance.load_ms },
                 }},
             });
         }
@@ -445,6 +528,20 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        const json planned = planned_layout_json(assignments);
+
+        for (const auto & kv : node_map) {
+            std::string herr;
+            if (!check_node_health(kv.second, herr)) {
+                res.status = 503;
+                res.set_content(json({
+                    { "error", herr },
+                    { "layout", planned },
+                }).dump(), "application/json");
+                return;
+            }
+        }
+
         dist_session session{};
         session.session_id = make_id("sess");
         session.model      = model;
@@ -453,7 +550,10 @@ int main(int argc, char ** argv) {
         std::string err;
         if (!setup_pipeline(session.session_id, n_layers, assignments, node_map, session, err)) {
             res.status = 500;
-            res.set_content(json({ { "error", err } }).dump(), "application/json");
+            res.set_content(json({
+                { "error", err },
+                { "layout", planned },
+            }).dump(), "application/json");
             return;
         }
 

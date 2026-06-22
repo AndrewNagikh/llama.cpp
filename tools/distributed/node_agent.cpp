@@ -1,4 +1,5 @@
 #include "dist_common.h"
+#include "node_benchmark.h"
 
 #include "httplib.h"
 #include "nlohmann/json.hpp"
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if !defined(_WIN32)
 #include <signal.h>
@@ -24,18 +26,19 @@ static std::string g_model_path;
 static std::string g_node_id;
 static int32_t g_n_layer = 0;
 static int32_t g_n_embd  = 0;
-static double g_score = 1.0;
+static BenchmarkResult g_benchmark{};
 static pid_t g_worker_pid = 0;
 
 static void usage(const char * prog) {
     fprintf(stderr,
-            "usage: %s --model PATH --listen HOST:PORT --orchestrator URL [--node-id ID] [--advertise-host IP] [--score N]\n"
+            "usage: %s --model PATH --listen HOST:PORT --orchestrator URL "
+            "[--node-id ID] [--advertise-host IP] [--rebenchmark]\n"
             "example: %s --model llama.gguf --listen 0.0.0.0:9001 --orchestrator http://10.0.0.1:9000 --advertise-host 10.0.0.2\n",
             prog, prog);
 }
 
 static bool parse_args(int argc, char ** argv, std::string & listen, std::string & orchestrator,
-        std::string & node_id, std::string & advertise_host) {
+        std::string & node_id, std::string & advertise_host, bool & rebenchmark) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             g_model_path = argv[++i];
@@ -47,8 +50,8 @@ static bool parse_args(int argc, char ** argv, std::string & listen, std::string
             node_id = argv[++i];
         } else if (strcmp(argv[i], "--advertise-host") == 0 && i + 1 < argc) {
             advertise_host = argv[++i];
-        } else if (strcmp(argv[i], "--score") == 0 && i + 1 < argc) {
-            g_score = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--rebenchmark") == 0) {
+            rebenchmark = true;
         } else {
             return false;
         }
@@ -112,13 +115,15 @@ static bool register_with_orchestrator(
     dist_probe_memory(total_mb, free_mb);
     const auto caps = dist_probe_capabilities();
 
+    const double score = g_benchmark.score;
+
     json body = {
         { "node_id", node_id },
         { "host", host },
         { "port", http_port },
         { "n_layer", g_n_layer },
         { "n_embd", g_n_embd },
-        { "score", g_score },
+        { "score", score },
         { "memory_total_mb", total_mb },
         { "memory_free_mb", free_mb },
         { "hardware", {
@@ -134,7 +139,10 @@ static bool register_with_orchestrator(
             { "supported_arch", caps.supported_arch },
         }},
         { "performance", {
-            { "score", g_score },
+            { "score", score },
+            { "decode_tps", g_benchmark.decode_tps },
+            { "prefill_tps", g_benchmark.prefill_tps },
+            { "load_ms", g_benchmark.load_ms },
         }},
     };
 
@@ -144,7 +152,8 @@ static bool register_with_orchestrator(
         return false;
     }
 
-    fprintf(stderr, "node_agent: registered as %s at %s:%d\n", node_id.c_str(), host.c_str(), http_port);
+    fprintf(stderr, "node_agent: registered as %s at %s:%d score=%.1f\n",
+            node_id.c_str(), host.c_str(), http_port, score);
     return true;
 }
 
@@ -227,8 +236,9 @@ int main(int argc, char ** argv) {
     std::string listen;
     std::string orchestrator;
     std::string advertise_host;
+    bool rebenchmark = false;
 
-    if (!parse_args(argc, argv, listen, orchestrator, g_node_id, advertise_host)) {
+    if (!parse_args(argc, argv, listen, orchestrator, g_node_id, advertise_host, rebenchmark)) {
         usage(argv[0]);
         return 1;
     }
@@ -244,9 +254,20 @@ int main(int argc, char ** argv) {
         g_node_id = bind_host + ":" + std::to_string(http_port);
     }
 
-    if (!load_model_metadata()) {
-        fprintf(stderr, "node_agent: failed to read model metadata from %s\n", g_model_path.c_str());
+    fprintf(stderr, "node_agent: running benchmark on %s\n", g_model_path.c_str());
+    g_benchmark = dist_get_or_run_benchmark(g_model_path, rebenchmark);
+    if (g_benchmark.score <= 0.0f) {
+        fprintf(stderr, "node_agent: benchmark failed\n");
         return 1;
+    }
+
+    g_n_layer = g_benchmark.n_layer;
+    g_n_embd  = g_benchmark.n_embd;
+    if (g_n_layer <= 0 || g_n_embd <= 0) {
+        if (!load_model_metadata()) {
+            fprintf(stderr, "node_agent: failed to read model metadata from %s\n", g_model_path.c_str());
+            return 1;
+        }
     }
 
     std::string register_host = !advertise_host.empty() ? advertise_host : bind_host;
@@ -282,7 +303,10 @@ int main(int argc, char ** argv) {
                 { "gpu_vram_gb", caps.gpu_memory_mb / 1024 },
             }},
             { "performance", {
-                { "score", g_score },
+                { "score", g_benchmark.score },
+                { "decode_tps", g_benchmark.decode_tps },
+                { "prefill_tps", g_benchmark.prefill_tps },
+                { "load_ms", g_benchmark.load_ms },
             }},
         }).dump(), "application/json");
     });
@@ -332,7 +356,8 @@ int main(int argc, char ** argv) {
         res.set_content(R"({"ok":true})", "application/json");
     });
 
-    fprintf(stderr, "node_agent: listening on %s:%d model=%s\n", bind_host.c_str(), http_port, g_model_path.c_str());
+    fprintf(stderr, "node_agent: listening on %s:%d model=%s score=%.1f\n",
+            bind_host.c_str(), http_port, g_model_path.c_str(), g_benchmark.score);
 
     if (!svr.listen(bind_host.c_str(), http_port)) {
         fprintf(stderr, "node_agent: failed to bind %s:%d\n", bind_host.c_str(), http_port);

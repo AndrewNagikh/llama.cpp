@@ -57,7 +57,7 @@ static bool wait_http_ok(const std::string & url, int retries = 100) {
     return false;
 }
 
-static bool wait_nodes_registered(const std::string & url, int min_nodes, int retries = 150) {
+static bool wait_nodes_registered(const std::string & url, int min_nodes, int retries = 300) {
     for (int i = 0; i < retries; ++i) {
         httplib::Client cli(url.c_str());
         cli.set_connection_timeout(1, 0);
@@ -102,19 +102,19 @@ int main(int argc, char ** argv) {
         dir + "node_agent", "--model", model_path,
         "--listen", "127.0.0.1:" + std::to_string(base + 1),
         "--orchestrator", orch_url,
-        "--node-id", "node-a", "--score", "100",
+        "--node-id", "node-a",
     });
     pid_t pid_b = spawn_bg({
         dir + "node_agent", "--model", model_path,
         "--listen", "127.0.0.1:" + std::to_string(base + 2),
         "--orchestrator", orch_url,
-        "--node-id", "node-b", "--score", "50",
+        "--node-id", "node-b",
     });
     pid_t pid_c = spawn_bg({
         dir + "node_agent", "--model", model_path,
         "--listen", "127.0.0.1:" + std::to_string(base + 3),
         "--orchestrator", orch_url,
-        "--node-id", "node-c", "--score", "25",
+        "--node-id", "node-c",
     });
 
     if (!wait_http_ok(orch_url) || !wait_nodes_registered(orch_url, 3)) {
@@ -137,9 +137,19 @@ int main(int argc, char ** argv) {
     json create_out = json::parse(create->body);
     const auto layout = create_out["layout"];
 
-    const auto expected = dist_plan_layers(16, {
-        { "node-a", 100.0 }, { "node-b", 50.0 }, { "node-c", 25.0 },
-    });
+    const auto nodes_res = cli.Get("/nodes");
+    std::vector<dist_planner_node> planner_nodes;
+    if (nodes_res && nodes_res->status == 200) {
+        const json nodes_json = json::parse(nodes_res->body)["nodes"];
+        for (const auto & n : nodes_json) {
+            planner_nodes.push_back({
+                n.value("node_id", ""),
+                n.value("score", 1.0),
+            });
+        }
+    }
+
+    const auto expected = dist_plan_layers(16, planner_nodes);
 
     bool layout_ok = layout.size() == expected.size();
     for (size_t i = 0; i < expected.size() && layout_ok; ++i) {
