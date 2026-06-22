@@ -1,5 +1,7 @@
 #include "dist_common.h"
 
+#include "ggml-backend.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -98,6 +100,35 @@ dist_node_capabilities dist_probe_capabilities() {
     if (caps.cpu_threads <= 0) {
         caps.cpu_threads = 4;
     }
+
+    ggml_backend_load_all();
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const auto dev_type = ggml_backend_dev_type(dev);
+        if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+            dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+
+        const char * desc = ggml_backend_dev_description(dev);
+        caps.gpu_name = (desc && desc[0]) ? desc : ggml_backend_dev_name(dev);
+
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg) {
+            const char * reg_name = ggml_backend_reg_name(reg);
+            if (reg_name && reg_name[0]) {
+                caps.gpu_backend = reg_name;
+            }
+        }
+
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+        caps.gpu_memory_mb = (int32_t) (total_bytes / (1024 * 1024));
+        break;
+    }
+
     return caps;
 }
 

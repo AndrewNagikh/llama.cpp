@@ -241,13 +241,35 @@ static bool bench_decode_tokens(
     return true;
 }
 
+static ggml_backend_dev_t dist_first_gpu_device() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const auto dev_type = ggml_backend_dev_type(dev);
+        if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+            dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
 BenchmarkResult run_node_benchmark(const std::string & model_path) {
     BenchmarkResult result{};
 
     ggml_backend_load_all();
 
+    llama_model_params mparams = llama_model_default_params();
+    ggml_backend_dev_t gpu_dev = dist_first_gpu_device();
+    if (gpu_dev) {
+        mparams.devices      = &gpu_dev;
+        mparams.n_gpu_layers = 999;
+        fprintf(stderr, "node_benchmark: using GPU %s\n", ggml_backend_dev_description(gpu_dev));
+    } else {
+        fprintf(stderr, "node_benchmark: no GPU backend, using CPU\n");
+    }
+
     const int64_t t_load0 = ggml_time_us();
-    llama_model * model = llama_model_load_from_file(model_path.c_str(), llama_model_default_params());
+    llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (!model) {
         fprintf(stderr, "node_benchmark: failed to load model %s\n", model_path.c_str());
         return result;
