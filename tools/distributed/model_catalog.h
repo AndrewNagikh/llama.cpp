@@ -108,6 +108,7 @@ public:
     bool remove_model(const std::string & model_id);
     
     // Installation helpers
+    void set_models_dir(const std::string & dir);
     std::string get_models_dir() const;          // ~/.distributed-llm/models/
     std::string get_model_path(const std::string & model_id) const;
     

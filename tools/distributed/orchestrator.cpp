@@ -858,10 +858,86 @@ int main(int argc, char ** argv) {
         res.set_content(catalog_json.dump(), "application/json");
     });
 
-    // GET /models - List installed models across cluster
+    // GET /models - List installed models across cluster (aggregated from nodes)
     svr.Get("/models", [](const httplib::Request &, httplib::Response & res) {
-        // TODO: Query all nodes for their installed models.
-        res.set_content(json::array().dump(), "application/json");
+        std::vector<dist_node_info> nodes;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            for (const auto & kv : g_nodes) {
+                if (kv.second.online) {
+                    nodes.push_back(kv.second);
+                }
+            }
+        }
+
+        // model_id -> aggregated info
+        struct agg_model {
+            int total_nodes = 0;
+            int ready_nodes = 0;
+            json nodes = json::array();
+        };
+        std::map<std::string, agg_model> models;
+
+        for (const auto & node : nodes) {
+            httplib::Client client(node.host.c_str(), node.http_port);
+            client.set_connection_timeout(3, 0);
+            client.set_read_timeout(10, 0);
+
+            const auto result = client.Get("/models/local");
+            if (!result || result->status != 200) {
+                continue;
+            }
+
+            json local;
+            try {
+                local = json::parse(result->body);
+            } catch (...) {
+                continue;
+            }
+            if (!local.is_array()) {
+                continue;
+            }
+
+            for (const auto & m : local) {
+                const std::string id = m.value("model_id", "");
+                if (id.empty()) {
+                    continue;
+                }
+                const bool ready = m.value("ready", false);
+                auto & a = models[id];
+                a.total_nodes += 1;
+                if (ready) {
+                    a.ready_nodes += 1;
+                }
+                a.nodes.push_back({
+                    { "node_id", node.node_id },
+                    { "ready", ready },
+                    { "status", m.value("status", "unknown") },
+                    { "local_path", m.value("local_path", "") },
+                });
+            }
+        }
+
+        json out = json::array();
+        for (const auto & [id, a] : models) {
+            std::string status = "unknown";
+            if (a.ready_nodes > 0 && a.ready_nodes == a.total_nodes) {
+                status = "ready";
+            } else if (a.ready_nodes > 0) {
+                status = "partial";
+            } else if (a.total_nodes > 0) {
+                status = "downloading";
+            }
+            out.push_back({
+                { "id", id },
+                { "status", status },
+                { "ready_nodes", a.ready_nodes },
+                { "total_nodes", a.total_nodes },
+                { "nodes", a.nodes },
+            });
+        }
+
+        res.set_content(out.dump(), "application/json");
     });
 
     // POST /models/install - Start installing a model across the cluster.

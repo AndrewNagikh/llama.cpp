@@ -153,3 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Distributed runtime state / E2E test artifacts
+/state/
+/logs/

@@ -63,6 +63,13 @@ dist_add_worker(split_gen3_a ${DIST_WORKERS_DIR}/split_gen3_a.cpp)
 dist_add_worker(split_gen3_b ${DIST_WORKERS_DIR}/split_gen3_b.cpp)
 dist_add_worker(split_gen3_c ${DIST_WORKERS_DIR}/split_gen3_c.cpp)
 
+# End-to-end cluster validation suite (Task 7.5). Defined unconditionally so a
+# single `build.sh e2e` builds them even when LLAMA_BUILD_TESTS is OFF.
+dist_add_test_exe(test-cluster-e2e test-cluster-e2e.cpp)
+dist_add_test_exe(test-cluster-e2e-install-reuse test-cluster-e2e-install-reuse.cpp)
+dist_add_test_exe(test-cluster-e2e-node-loss test-cluster-e2e-node-loss.cpp)
+dist_add_test_exe(test-cluster-e2e-orchestrator-restart test-cluster-e2e-orchestrator-restart.cpp)
+
 if (LLAMA_BUILD_TESTS)
     add_executable(test-layer-planner test-layer-planner.cpp ${DIST_PLANNER_SOURCES})
     target_include_directories(test-layer-planner PRIVATE ${DIST_INCLUDE_DIRS})

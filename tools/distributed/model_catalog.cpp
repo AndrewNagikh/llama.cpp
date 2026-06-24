@@ -322,6 +322,10 @@ bool model_store::remove_model(const std::string & model_id) {
     return false;
 }
 
+void model_store::set_models_dir(const std::string & dir) {
+    models_dir_ = dir;
+}
+
 std::string model_store::get_models_dir() const {
     if (!models_dir_.empty()) {
         return models_dir_;

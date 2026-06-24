@@ -40,6 +40,7 @@ static std::mutex g_model_store_mu;
 static std::set<std::string> g_active_downloads;
 static std::map<std::string, std::string> g_download_errors;
 static std::string g_models_state_path;
+static std::string g_models_dir;
 
 static uint64_t now_ms() {
     const auto now = std::chrono::system_clock::now();
@@ -69,7 +70,7 @@ static uint64_t file_size_or_zero(const std::string & path) {
 static void usage(const char * prog) {
     fprintf(stderr,
             "usage: %s --model PATH --listen HOST:PORT --orchestrator URL "
-            "[--node-id ID] [--advertise-host IP] [--rebenchmark]\n"
+            "[--node-id ID] [--advertise-host IP] [--models-dir DIR] [--rebenchmark]\n"
             "example: %s --model llama.gguf --listen 0.0.0.0:9001 --orchestrator http://10.0.0.1:9000 --advertise-host 10.0.0.2\n",
             prog, prog);
 }
@@ -87,10 +88,17 @@ static bool parse_args(int argc, char ** argv, std::string & listen, std::string
             node_id = argv[++i];
         } else if (strcmp(argv[i], "--advertise-host") == 0 && i + 1 < argc) {
             advertise_host = argv[++i];
+        } else if (strcmp(argv[i], "--models-dir") == 0 && i + 1 < argc) {
+            g_models_dir = argv[++i];
         } else if (strcmp(argv[i], "--rebenchmark") == 0) {
             rebenchmark = true;
         } else {
             return false;
+        }
+    }
+    if (g_models_dir.empty()) {
+        if (const char * env = std::getenv("MODELS_DIR")) {
+            g_models_dir = env;
         }
     }
     return !g_model_path.empty() && !listen.empty() && !orchestrator.empty();
@@ -103,6 +111,25 @@ static std::string exe_dir(const char * argv0) {
         return p.substr(0, pos + 1);
     }
     return "./";
+}
+
+// Locate an already-present GGUF that satisfies the requested catalog file,
+// so install can seed locally (symlink) instead of downloading over the network.
+static std::string find_local_source(const std::string & file) {
+    if (file.empty()) {
+        return "";
+    }
+    // The node already runs against a model file; reuse it when names match.
+    if (!g_model_path.empty()) {
+        std::error_code ec;
+        if (std::filesystem::exists(g_model_path, ec)) {
+            const std::string base = std::filesystem::path(g_model_path).filename().string();
+            if (base == file) {
+                return g_model_path;
+            }
+        }
+    }
+    return "";
 }
 
 static void start_model_download(
@@ -355,6 +382,9 @@ int main(int argc, char ** argv) {
     }
 
     // Initialize model store
+    if (!g_models_dir.empty()) {
+        g_model_store.set_models_dir(g_models_dir);
+    }
     g_models_state_path = g_model_store.get_models_dir() + "/models.json";
     if (!g_model_store.load_state(g_models_state_path)) {
         fprintf(stderr, "node_agent: warning - failed to load model state from %s\n", g_models_state_path.c_str());
@@ -369,6 +399,15 @@ int main(int argc, char ** argv) {
     if (!register_with_orchestrator(orchestrator, g_node_id, register_host, http_port)) {
         return 1;
     }
+
+    // Heartbeat: periodically re-register so the orchestrator recovers this node
+    // after an orchestrator restart (registration is upserted by node_id).
+    std::thread([orchestrator, register_host, http_port]() {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            register_with_orchestrator(orchestrator, g_node_id, register_host, http_port);
+        }
+    }).detach();
 
     const std::string agent_bin = exe_dir(argv[0]);
 
@@ -525,6 +564,40 @@ int main(int argc, char ** argv) {
                     { "local_path", expected_path }
                 }).dump(), "application/json");
                 return;
+            }
+
+            // Fast path: seed from an already-present GGUF (symlink) instead of
+            // downloading. Keeps installs offline/fast when the file is local.
+            const std::string local_src = find_local_source(file);
+            if (!local_src.empty()) {
+                std::error_code ec;
+                std::filesystem::create_directories(
+                        std::filesystem::path(expected_path).parent_path(), ec);
+                std::filesystem::remove(expected_path, ec);
+                std::filesystem::create_symlink(local_src, expected_path, ec);
+                if (ec) {
+                    // Fall back to a copy if symlinks are unsupported.
+                    ec.clear();
+                    std::filesystem::copy_file(local_src, expected_path,
+                            std::filesystem::copy_options::overwrite_existing, ec);
+                }
+                if (!ec && file_size_or_zero(expected_path) > 0) {
+                    installed_model seeded;
+                    seeded.model_id = model_id;
+                    seeded.local_path = expected_path;
+                    seeded.size_bytes = file_size_or_zero(expected_path);
+                    seeded.ready = true;
+                    seeded.installed_ms = now_ms();
+                    g_model_store.add_model(seeded);
+                    g_download_errors.erase(model_id);
+                    g_model_store.save_state(g_models_state_path);
+                    res.set_content(json({
+                        { "model_id", model_id },
+                        { "status", "already_installed" },
+                        { "local_path", expected_path }
+                    }).dump(), "application/json");
+                    return;
+                }
             }
 
             installed_model new_model;
