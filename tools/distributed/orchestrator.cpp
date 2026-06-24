@@ -732,24 +732,30 @@ int main(int argc, char ** argv) {
             { "status", "started" }
         }).dump(), "application/json");
         
-        // Trigger installation on all registered nodes (async)
-        std::thread([job_id, model_id, model_info]() {
-            std::lock_guard<std::mutex> lock(g_mu);
-            
-            // Get all online nodes
-            std::vector<dist_node_info> online_nodes;
+        // Get all online nodes (before async thread to avoid mutex deadlock)
+        std::vector<dist_node_info> online_nodes;
+        {
+            std::lock_guard<std::mutex> nodes_lock(g_mu);
             for (const auto & [node_id, node] : g_nodes) {
                 if (node.online) {
                     online_nodes.push_back(node);
                 }
             }
+        }
+        
+        // Trigger installation on all registered nodes (async)
+        std::thread([job_id, model_id, model_info, online_nodes]() {
             
             if (online_nodes.empty()) {
+                std::lock_guard<std::mutex> lock(g_mu);
                 g_catalog.update_job_status(job_id, install_status::error, "No online nodes available");
                 return;
             }
             
-            g_catalog.update_job_status(job_id, install_status::downloading, "", 0.1);
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                g_catalog.update_job_status(job_id, install_status::downloading, "", 0.1);
+            }
             
             // Send installation request to each node
             int completed_nodes = 0;
@@ -775,10 +781,15 @@ int main(int argc, char ** argv) {
                 }
                 
                 // Update progress
-                double progress = 0.1 + (0.9 * completed_nodes / static_cast<double>(online_nodes.size()));
-                g_catalog.update_job_status(job_id, install_status::downloading, "", progress);
+                {
+                    std::lock_guard<std::mutex> lock(g_mu);
+                    double progress = 0.1 + (0.9 * completed_nodes / static_cast<double>(online_nodes.size()));
+                    g_catalog.update_job_status(job_id, install_status::downloading, "", progress);
+                }
             }
             
+            // Final status update
+            std::lock_guard<std::mutex> lock(g_mu);
             if (completed_nodes == static_cast<int>(online_nodes.size())) {
                 g_catalog.complete_job(job_id);
                 printf("Model installation completed on all %d nodes\n", completed_nodes);
