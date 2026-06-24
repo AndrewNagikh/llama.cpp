@@ -52,6 +52,12 @@ bool model_catalog::load_catalog(const std::string & catalog_path) {
 }
 
 bool model_catalog::save_catalog(const std::string & catalog_path) const {
+    const std::filesystem::path path(catalog_path);
+    if (path.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
+
     std::ofstream file(catalog_path);
     if (!file.is_open()) {
         return false;

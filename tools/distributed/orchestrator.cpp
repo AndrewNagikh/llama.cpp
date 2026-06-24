@@ -662,14 +662,16 @@ int main(int argc, char ** argv) {
     });
 
     // Model management API
-    
+
     // GET /catalog - List available models in catalog
     svr.Get("/catalog", [](const httplib::Request &, httplib::Response & res) {
+        std::vector<model_info> models;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            models = g_catalog.get_models();
+        }
+
         json catalog_json = json::array();
-        
-        std::lock_guard<std::mutex> lock(g_mu);
-        auto models = g_catalog.get_models();
-        
         for (const auto & model : models) {
             catalog_json.push_back({
                 { "id", model.id },
@@ -679,23 +681,17 @@ int main(int argc, char ** argv) {
                 { "n_embd", model.n_embd }
             });
         }
-        
+
         res.set_content(catalog_json.dump(), "application/json");
     });
-    
+
     // GET /models - List installed models across cluster
     svr.Get("/models", [](const httplib::Request &, httplib::Response & res) {
-        json models_json = json::array();
-        
-        std::lock_guard<std::mutex> lock(g_mu);
-        
-        // TODO: Query all nodes for their installed models
-        // For now, return empty array
-        
-        res.set_content(models_json.dump(), "application/json");
+        // TODO: Query all nodes for their installed models.
+        res.set_content(json::array().dump(), "application/json");
     });
-    
-    // POST /models/install - Install a model on the cluster
+
+    // POST /models/install - Start installing a model across the cluster.
     svr.Post("/models/install", [](const httplib::Request & req, httplib::Response & res) {
         json body;
         try {
@@ -705,235 +701,79 @@ int main(int argc, char ** argv) {
             res.set_content(R"({"error":"invalid json"})", "application/json");
             return;
         }
-        
+
         const std::string model_id = body.value("model", "");
         if (model_id.empty()) {
             res.status = 400;
             res.set_content(R"({"error":"model id required"})", "application/json");
             return;
         }
-        
-        // Get all required data under single mutex lock
-        const model_info * model_info_ptr = nullptr;
+
         std::string job_id;
-        std::vector<dist_node_info> online_nodes;
-        
+        size_t online_nodes = 0;
         {
             std::lock_guard<std::mutex> lock(g_mu);
-            
-            // Check if model exists in catalog
-            model_info_ptr = g_catalog.find_model(model_id);
-            if (!model_info_ptr) {
+            if (!g_catalog.find_model(model_id)) {
                 res.status = 404;
                 res.set_content(R"({"error":"model not found in catalog"})", "application/json");
                 return;
             }
-            
-            // Create installation job
+
             job_id = g_catalog.create_install_job(model_id);
-            
-            // Get all online nodes
-            for (const auto & [node_id, node] : g_nodes) {
+            for (const auto & [_, node] : g_nodes) {
                 if (node.online) {
-                    online_nodes.push_back(node);
+                    ++online_nodes;
                 }
             }
+
+            // Temporary non-blocking mock until node-side download orchestration is restored.
+            g_catalog.update_job_status(job_id, install_status::downloading, "", 0.5);
+            g_catalog.complete_job(job_id);
         }
-        
+
+        printf("Model installation mock-completed for: %s on %zu nodes\n",
+               model_id.c_str(), online_nodes);
+
         res.set_content(json({
             { "job_id", job_id },
             { "model", model_id },
             { "status", "started" }
         }).dump(), "application/json");
-        
-        
-        // Mock completion (instead of complex async logic)
-        {
-            std::lock_guard<std::mutex> lock(g_mu);
-            g_catalog.update_job_status(job_id, install_status::downloading, "", 0.5);
-            g_catalog.complete_job(job_id);
-        }
-        
-        printf("Model installation mock-completed for: %s\\n", model_id.c_str());
     });
-    
+
     // GET /models/install/{job_id} - Check installation status
     svr.Get(R"(/models/install/(.+))", [](const httplib::Request & req, httplib::Response & res) {
-        const std::string job_id = req.matches[1];
-        
-        std::lock_guard<std::mutex> lock(g_mu);
-        
-        auto * job = g_catalog.get_install_job(job_id);
-        if (!job) {
-            res.status = 404;
-            res.set_content(R"({"error":"job not found"})", "application/json");
-            return;
-        }
-        
-        std::string status_str;
-        switch (job->status) {
-            case install_status::unknown: status_str = "unknown"; break;
-            case install_status::downloading: status_str = "downloading"; break;
-            case install_status::ready: status_str = "ready"; break;
-            case install_status::error: status_str = "error"; break;
-        }
-        
-        json response = {
-            { "job_id", job->job_id },
-            { "model", job->model_id },
-            { "status", status_str },
-            { "progress", job->progress }
-        };
-        
-        if (!job->error_msg.empty()) {
-            response["error"] = job->error_msg;
-        }
-        
-        res.set_content(response.dump(), "application/json");
-    });
-        const model_info * model_info_ptr = nullptr;
-        std::string job_id;
-        std::vector<dist_node_info> online_nodes;
-        
+        install_job job;
         {
             std::lock_guard<std::mutex> lock(g_mu);
-            
-            // Check if model exists in catalog
-            model_info_ptr = g_catalog.find_model(model_id);
-            if (!model_info_ptr) {
+            auto * found = g_catalog.get_install_job(req.matches[1]);
+            if (!found) {
                 res.status = 404;
-                res.set_content(R"({"error":"model not found in catalog"})", "application/json");
+                res.set_content(R"({"error":"job not found"})", "application/json");
                 return;
             }
-            
-            // Create installation job
-            job_id = g_catalog.create_install_job(model_id);
-            
-            // Get all online nodes
-            for (const auto & [node_id, node] : g_nodes) {
-                if (node.online) {
-                    online_nodes.push_back(node);
-                }
-            }
+            job = *found;
         }
-        
-        printf("DEBUG: About to send response for job_id=%s\n", job_id.c_str());
-        
-        res.set_content(json({
-            { "job_id", job_id },
-            { "model", model_id },
-            { "status", "started" }
-        }).dump(), "application/json");
-        
-        printf("DEBUG: Response sent, doing mock work for job_id=%s\n", job_id.c_str());
-        
-        // For now, mock the installation process (async coordination was causing hangs)
-        // TODO: Implement proper async node coordination without blocking
-        {
-            std::lock_guard<std::mutex> lock(g_mu);
-            printf("DEBUG: Got mutex, updating job status\n");
-            g_catalog.update_job_status(job_id, install_status::downloading, "", 0.5);
-            printf("DEBUG: Updated job status, completing job\n");
-            g_catalog.complete_job(job_id);
-            printf("DEBUG: Job completed\n");
-        }
-        
-        printf("Model installation mock-completed for: %s on %zu nodes\n", 
-               model_id.c_str(), online_nodes.size());
-        
-        /*
-        // DISABLED: Async coordination - was causing server hangs
-        std::thread([job_id, model_id, model_info, online_nodes]() {
-            
-            if (online_nodes.empty()) {
-                std::lock_guard<std::mutex> lock(g_mu);
-                g_catalog.update_job_status(job_id, install_status::error, "No online nodes available");
-                return;
-            }
-            
-            {
-                std::lock_guard<std::mutex> lock(g_mu);
-                g_catalog.update_job_status(job_id, install_status::downloading, "", 0.1);
-            }
-            
-            // Send installation request to each node
-            int completed_nodes = 0;
-            for (const auto & node : online_nodes) {
-                httplib::Client client(node.host, node.http_port);
-                client.set_connection_timeout(5, 0); // 5 seconds
-                
-                json install_request = {
-                    { "model", model_id },
-                    { "repo", model_info->source.repo },
-                    { "file", model_info->source.file }
-                };
-                
-                auto result = client.Post("/models/install", 
-                                        install_request.dump(), 
-                                        "application/json");
-                
-                if (result && result->status == 200) {
-                    completed_nodes++;
-                    printf("Installation triggered on %s:%d\n", node.host.c_str(), node.http_port);
-                } else {
-                    printf("Failed to trigger installation on %s:%d\n", node.host.c_str(), node.http_port);
-                }
-                
-                // Update progress
-                {
-                    std::lock_guard<std::mutex> lock(g_mu);
-                    double progress = 0.1 + (0.9 * completed_nodes / static_cast<double>(online_nodes.size()));
-                    g_catalog.update_job_status(job_id, install_status::downloading, "", progress);
-                }
-            }
-            
-            // Final status update
-            std::lock_guard<std::mutex> lock(g_mu);
-            if (completed_nodes == static_cast<int>(online_nodes.size())) {
-                g_catalog.complete_job(job_id);
-                printf("Model installation completed on all %d nodes\n", completed_nodes);
-            } else {
-                g_catalog.update_job_status(job_id, install_status::error, 
-                    "Installation failed on some nodes (" + 
-                    std::to_string(completed_nodes) + "/" + 
-                    std::to_string(online_nodes.size()) + " succeeded)");
-            }
-        }).detach();
-        */
-    });
-    
-    // GET /models/install/{job_id} - Check installation status
-    svr.Get(R"(/models/install/(.+))", [](const httplib::Request & req, httplib::Response & res) {
-        const std::string job_id = req.matches[1];
-        
-        std::lock_guard<std::mutex> lock(g_mu);
-        
-        auto * job = g_catalog.get_install_job(job_id);
-        if (!job) {
-            res.status = 404;
-            res.set_content(R"({"error":"job not found"})", "application/json");
-            return;
-        }
-        
+
         std::string status_str;
-        switch (job->status) {
-            case install_status::unknown: status_str = "unknown"; break;
+        switch (job.status) {
+            case install_status::unknown:     status_str = "unknown"; break;
             case install_status::downloading: status_str = "downloading"; break;
-            case install_status::ready: status_str = "ready"; break;
-            case install_status::error: status_str = "error"; break;
+            case install_status::ready:       status_str = "ready"; break;
+            case install_status::error:       status_str = "error"; break;
         }
-        
+
         json response = {
-            { "job_id", job->job_id },
-            { "model", job->model_id },
+            { "job_id", job.job_id },
+            { "model", job.model_id },
             { "status", status_str },
-            { "progress", job->progress }
+            { "progress", job.progress }
         };
-        
-        if (!job->error_msg.empty()) {
-            response["error"] = job->error_msg;
+
+        if (!job.error_msg.empty()) {
+            response["error"] = job.error_msg;
         }
-        
+
         res.set_content(response.dump(), "application/json");
     });
 
