@@ -107,10 +107,15 @@ function(llama_build_and_test source)
     endif()
 
     add_executable(${TEST_TARGET} ${TEST_SOURCES})
+    target_include_directories(${TEST_TARGET} PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tools/distributed/transport
+        ${CMAKE_SOURCE_DIR}/tools/distributed/workers
+    )
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
-    target_link_libraries(${TEST_TARGET} PRIVATE llama-common)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common)
 
     add_test(
         NAME ${TEST_TARGET}
@@ -201,9 +206,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         set(DIST_TRANSPORT_CPP ${CMAKE_SOURCE_DIR}/tools/distributed/transport/split_tcp_wire.cpp)
         llama_build_and_test(test-partial-forward.cpp)
         llama_build_and_test(test-injection-proof.cpp)
+        
+        # Transport tests require both .cpp and .h files
         llama_build(split_sender.cpp ${DIST_TRANSPORT_CPP})
         llama_build(split_receiver.cpp ${DIST_TRANSPORT_CPP})
         llama_build_and_test(test-split-tcp.cpp ${DIST_TRANSPORT_CPP})
+        
+        # Legacy split generation tests  
         llama_build(split_gen_a.cpp ${DIST_TRANSPORT_CPP})
         llama_build(split_gen_b.cpp ${DIST_TRANSPORT_CPP})
         llama_build_and_test(test-autoregressive-split.cpp ${DIST_TRANSPORT_CPP})

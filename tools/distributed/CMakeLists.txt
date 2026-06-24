@@ -12,7 +12,7 @@ set(DIST_TRANSPORT_SOURCES
 set(DIST_COMMON_SOURCES
     ${DIST_TRANSPORT_SOURCES}
     dist_common.cpp
-    model_catalog.cpp
+    model_catalog.cpp  # RE-ENABLED FOR TESTING
     node_core.cpp
 )
 
@@ -39,13 +39,13 @@ function(dist_add_exe name main_source)
 endfunction()
 
 function(dist_add_exe_light name main_source)
-    add_executable(${name} ${main_source} dist_common.cpp model_catalog.cpp ${DIST_PLANNER_SOURCES} ${DIST_BENCHMARK_SOURCES})
+    add_executable(${name} ${main_source} dist_common.cpp ${DIST_PLANNER_SOURCES} ${DIST_BENCHMARK_SOURCES})
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
 endfunction()
 
 function(dist_add_test_exe name main_source)
-    add_executable(${name} ${main_source} dist_common.cpp model_catalog.cpp ${DIST_PLANNER_SOURCES} ${DIST_TRANSPORT_SOURCES})
+    add_executable(${name} ${main_source} dist_common.cpp ${DIST_PLANNER_SOURCES} ${DIST_TRANSPORT_SOURCES})
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
 endfunction()
