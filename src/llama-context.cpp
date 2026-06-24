@@ -10,6 +10,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+#include "llama-distributed.h"
 #include "llama.h"
 
 #include <cinttypes>

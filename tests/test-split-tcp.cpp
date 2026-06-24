@@ -5,7 +5,7 @@
 #include "llama.h"
 #include "split_tcp_wire.h"
 
-#include "../src/llama-ext.h"
+#include "llama-distributed.h"
 
 #include <cmath>
 #include <cstdio>

@@ -2,7 +2,7 @@
 
 #include "llama.h"
 
-#include "../src/llama-ext.h"
+#include "llama-distributed.h"
 
 #include <cstdio>
 #include <cstring>

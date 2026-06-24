@@ -5,7 +5,7 @@
 #include "llama.h"
 #include "split_gen_common.h"
 
-#include "../src/llama-ext.h"
+#include "llama-distributed.h"
 
 #include <cstdio>
 #include <cstring>

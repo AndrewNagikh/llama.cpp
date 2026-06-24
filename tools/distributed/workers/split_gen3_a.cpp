@@ -4,7 +4,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "split_gen_common.h"
-#include "split_tcp_wire.h"
+#include "../transport/split_tcp_wire.h"
 
 #include <cstdio>
 #include <cstring>

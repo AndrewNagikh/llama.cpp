@@ -110,6 +110,7 @@ option(LLAMA_BUILD_EXAMPLES  "llama: build examples"                            
 option(LLAMA_BUILD_SERVER    "llama: build server example"                                                       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       ON)
+option(LLAMA_DISTRIBUTED      "llama: build distributed inference runtime (orchestrator, node_agent, workers)"    ON)
 option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available (requires LLAMA_BUILD_UI=ON)" ON)
 
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
@@ -236,6 +237,11 @@ set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location o
 set(LLAMA_PUBLIC_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/include/llama.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-cpp.h)
+
+if (LLAMA_DISTRIBUTED)
+    list(APPEND LLAMA_PUBLIC_HEADERS
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-distributed.h)
+endif()
 
 set_target_properties(llama
     PROPERTIES

@@ -6,7 +6,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
-#include "../src/llama-ext.h"
+#include "../include/llama-distributed.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
