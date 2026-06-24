@@ -17,6 +17,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -731,7 +732,63 @@ int main(int argc, char ** argv) {
             { "status", "started" }
         }).dump(), "application/json");
         
-        // TODO: Trigger actual installation on nodes (async)
+        // Trigger installation on all registered nodes (async)
+        std::thread([job_id, model_id, model_info]() {
+            std::lock_guard<std::mutex> lock(g_mu);
+            
+            // Get all online nodes
+            std::vector<dist_node_info> online_nodes;
+            for (const auto & [node_id, node] : g_nodes) {
+                if (node.online) {
+                    online_nodes.push_back(node);
+                }
+            }
+            
+            if (online_nodes.empty()) {
+                g_catalog.update_job_status(job_id, install_status::error, "No online nodes available");
+                return;
+            }
+            
+            g_catalog.update_job_status(job_id, install_status::downloading, "", 0.1);
+            
+            // Send installation request to each node
+            int completed_nodes = 0;
+            for (const auto & node : online_nodes) {
+                httplib::Client client(node.host, node.http_port);
+                client.set_connection_timeout(5, 0); // 5 seconds
+                
+                json install_request = {
+                    { "model", model_id },
+                    { "repo", model_info->source.repo },
+                    { "file", model_info->source.file }
+                };
+                
+                auto result = client.Post("/models/install", 
+                                        install_request.dump(), 
+                                        "application/json");
+                
+                if (result && result->status == 200) {
+                    completed_nodes++;
+                    printf("Installation triggered on %s:%d\n", node.host.c_str(), node.http_port);
+                } else {
+                    printf("Failed to trigger installation on %s:%d\n", node.host.c_str(), node.http_port);
+                }
+                
+                // Update progress
+                double progress = 0.1 + (0.9 * completed_nodes / static_cast<double>(online_nodes.size()));
+                g_catalog.update_job_status(job_id, install_status::downloading, "", progress);
+            }
+            
+            if (completed_nodes == static_cast<int>(online_nodes.size())) {
+                g_catalog.complete_job(job_id);
+                printf("Model installation completed on all %d nodes\n", completed_nodes);
+            } else {
+                g_catalog.update_job_status(job_id, install_status::error, 
+                    "Installation failed on some nodes (" + 
+                    std::to_string(completed_nodes) + "/" + 
+                    std::to_string(online_nodes.size()) + " succeeded)");
+            }
+        }).detach();
     });
     
     // GET /models/install/{job_id} - Check installation status
