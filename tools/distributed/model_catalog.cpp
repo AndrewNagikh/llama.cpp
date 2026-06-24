@@ -1,10 +1,14 @@
 #include "model_catalog.h"
 
+#include "nlohmann/json.hpp"
+
 #include <fstream>
 #include <sstream>
 #include <chrono>
 #include <filesystem>
 #include <cstdlib>
+
+using json = nlohmann::json;
 
 // Simple JSON-like parser/writer for catalog data
 // Note: Using minimal JSON handling to avoid external dependencies
@@ -219,13 +223,31 @@ std::string model_catalog::generate_job_id() const {
 // Model Store Implementation
 
 bool model_store::load_state(const std::string & state_path) {
+    ensure_models_dir();
+
     std::ifstream file(state_path);
     if (!file.is_open()) {
         return true; // Empty state is OK
     }
-    
-    // Simple state loading (just file existence for now)
-    // TODO: Implement proper JSON parsing if needed
+
+    try {
+        json state = json::parse(file);
+        local_models_.clear();
+        for (const auto & item : state.value("models", json::array())) {
+            installed_model model;
+            model.model_id = item.value("model_id", "");
+            model.local_path = item.value("local_path", "");
+            model.size_bytes = item.value("size_bytes", static_cast<uint64_t>(0));
+            model.ready = item.value("ready", false);
+            model.installed_ms = item.value("installed_ms", static_cast<uint64_t>(0));
+            if (!model.model_id.empty() && !model.local_path.empty()) {
+                local_models_.push_back(model);
+            }
+        }
+    } catch (...) {
+        return false;
+    }
+
     return true;
 }
 

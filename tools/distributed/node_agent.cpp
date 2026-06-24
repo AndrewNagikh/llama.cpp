@@ -10,7 +10,13 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <map>
+#include <mutex>
+#include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -30,6 +36,35 @@ static int32_t g_n_embd  = 0;
 static BenchmarkResult g_benchmark{};
 static pid_t g_worker_pid = 0;
 static model_store g_model_store;
+static std::mutex g_model_store_mu;
+static std::set<std::string> g_active_downloads;
+static std::map<std::string, std::string> g_download_errors;
+static std::string g_models_state_path;
+
+static uint64_t now_ms() {
+    const auto now = std::chrono::system_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+    return static_cast<uint64_t>(ms.count());
+}
+
+static std::string shell_quote(const std::string & value) {
+    std::string quoted = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += c;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+static uint64_t file_size_or_zero(const std::string & path) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    return ec ? 0 : static_cast<uint64_t>(size);
+}
 
 static void usage(const char * prog) {
     fprintf(stderr,
@@ -68,6 +103,47 @@ static std::string exe_dir(const char * argv0) {
         return p.substr(0, pos + 1);
     }
     return "./";
+}
+
+static void start_model_download(
+        std::string model_id,
+        std::string repo,
+        std::string file,
+        std::string output_path,
+        std::string downloader_script) {
+    std::thread([model_id = std::move(model_id),
+                 repo = std::move(repo),
+                 file = std::move(file),
+                 output_path = std::move(output_path),
+                 downloader_script = std::move(downloader_script)]() {
+        const std::string progress_path = output_path + ".progress.json";
+        const std::string command =
+                "python3 " + shell_quote(downloader_script) +
+                " --repo " + shell_quote(repo) +
+                " --file " + shell_quote(file) +
+                " --output " + shell_quote(output_path) +
+                " --progress-file " + shell_quote(progress_path);
+
+        const int rc = std::system(command.c_str());
+        const bool ok = (rc == 0) && std::filesystem::exists(output_path) && file_size_or_zero(output_path) > 0;
+
+        std::lock_guard<std::mutex> lock(g_model_store_mu);
+        installed_model model;
+        model.model_id = model_id;
+        model.local_path = output_path;
+        model.size_bytes = file_size_or_zero(output_path);
+        model.ready = ok;
+        model.installed_ms = ok ? now_ms() : 0;
+        g_model_store.add_model(model);
+
+        g_active_downloads.erase(model_id);
+        if (ok) {
+            g_download_errors.erase(model_id);
+        } else {
+            g_download_errors[model_id] = "download failed";
+        }
+        g_model_store.save_state(g_models_state_path);
+    }).detach();
 }
 
 static bool load_model_metadata() {
@@ -279,9 +355,9 @@ int main(int argc, char ** argv) {
     }
 
     // Initialize model store
-    const std::string models_state_path = g_model_store.get_models_dir() + "/models.json";
-    if (!g_model_store.load_state(models_state_path)) {
-        fprintf(stderr, "node_agent: warning - failed to load model state from %s\n", models_state_path.c_str());
+    g_models_state_path = g_model_store.get_models_dir() + "/models.json";
+    if (!g_model_store.load_state(g_models_state_path)) {
+        fprintf(stderr, "node_agent: warning - failed to load model state from %s\n", g_models_state_path.c_str());
     }
 
     std::string register_host = !advertise_host.empty() ? advertise_host : bind_host;
@@ -375,23 +451,39 @@ int main(int argc, char ** argv) {
     // GET /models/local - List locally installed models
     svr.Get("/models/local", [](const httplib::Request &, httplib::Response & res) {
         json models_json = json::array();
-        
+
+        std::lock_guard<std::mutex> lock(g_model_store_mu);
         auto local_models = g_model_store.get_local_models();
         for (const auto & model : local_models) {
-            models_json.push_back({
+            std::string status = model.ready ? "ready" : "unknown";
+            const auto active_it = g_active_downloads.find(model.model_id);
+            if (active_it != g_active_downloads.end()) {
+                status = "downloading";
+            }
+            const auto error_it = g_download_errors.find(model.model_id);
+            if (error_it != g_download_errors.end()) {
+                status = "error";
+            }
+
+            json model_json = {
                 { "model_id", model.model_id },
                 { "local_path", model.local_path },
                 { "size_bytes", model.size_bytes },
                 { "ready", model.ready },
+                { "status", status },
                 { "installed_ms", model.installed_ms }
-            });
+            };
+            if (error_it != g_download_errors.end()) {
+                model_json["error"] = error_it->second;
+            }
+            models_json.push_back(model_json);
         }
         
         res.set_content(models_json.dump(), "application/json");
     });
     
     // POST /models/install - Install a model locally
-    svr.Post("/models/install", [](const httplib::Request & req, httplib::Response & res) {
+    svr.Post("/models/install", [agent_bin](const httplib::Request & req, httplib::Response & res) {
         json body;
         try {
             body = json::parse(req.body);
@@ -411,37 +503,50 @@ int main(int argc, char ** argv) {
             return;
         }
         
-        // Check if model already installed
-        const auto * existing = g_model_store.find_model(model_id);
-        if (existing && existing->ready) {
-            res.set_content(json({
-                { "model_id", model_id },
-                { "status", "already_installed" },
-                { "local_path", existing->local_path }
-            }).dump(), "application/json");
-            return;
+        const std::string expected_path = g_model_store.get_model_path(model_id);
+        const std::string downloader_script = agent_bin + "../../tools/distributed/download_model.py";
+
+        {
+            std::lock_guard<std::mutex> lock(g_model_store_mu);
+            const auto * existing = g_model_store.find_model(model_id);
+            if (existing && existing->ready && std::filesystem::exists(existing->local_path)) {
+                res.set_content(json({
+                    { "model_id", model_id },
+                    { "status", "already_installed" },
+                    { "local_path", existing->local_path }
+                }).dump(), "application/json");
+                return;
+            }
+
+            if (g_active_downloads.find(model_id) != g_active_downloads.end()) {
+                res.set_content(json({
+                    { "model_id", model_id },
+                    { "status", "download_in_progress" },
+                    { "local_path", expected_path }
+                }).dump(), "application/json");
+                return;
+            }
+
+            installed_model new_model;
+            new_model.model_id = model_id;
+            new_model.local_path = expected_path;
+            new_model.ready = false;
+            new_model.size_bytes = file_size_or_zero(expected_path);
+            new_model.installed_ms = 0;
+
+            g_model_store.add_model(new_model);
+            g_download_errors.erase(model_id);
+            g_active_downloads.insert(model_id);
+            g_model_store.save_state(g_models_state_path);
         }
-        
-        // TODO: Implement actual download logic
-        // For now, just mark as completed if the current g_model_path matches
-        std::string expected_path = g_model_store.get_model_path(model_id);
-        
-        installed_model new_model;
-        new_model.model_id = model_id;
-        new_model.local_path = expected_path;
-        new_model.ready = false; // Will be set to true after download
-        new_model.size_bytes = 0; // Will be filled after download
-        new_model.installed_ms = 0; // Will be set after download
-        
-        g_model_store.add_model(new_model);
-        
+
+        start_model_download(model_id, repo, file, expected_path, downloader_script);
+
         res.set_content(json({
             { "model_id", model_id },
             { "status", "download_started" },
             { "local_path", expected_path }
         }).dump(), "application/json");
-        
-        // TODO: Start background download
     });
 
     fprintf(stderr, "node_agent: listening on %s:%d model=%s score=%.1f\n",

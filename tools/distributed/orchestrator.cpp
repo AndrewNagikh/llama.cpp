@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -42,10 +43,182 @@ static std::map<std::string, dist_node_info> g_nodes;
 static std::map<std::string, dist_session> g_sessions;
 static std::string g_model_path;
 static model_catalog g_catalog;
+static std::map<std::string, json> g_install_node_results;
 
 static std::string make_id(const char * prefix) {
     static std::mt19937_64 rng{ std::random_device{}() };
     return std::string(prefix) + "-" + std::to_string(rng());
+}
+
+static void set_install_node_result(
+        const std::string & job_id,
+        const std::string & node_id,
+        const json & result) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_install_node_results[job_id][node_id] = result;
+}
+
+static void update_install_job(
+        const std::string & job_id,
+        install_status status,
+        const std::string & error_msg = "",
+        double progress = 0.0) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_catalog.update_job_status(job_id, status, error_msg, progress);
+}
+
+static void complete_install_job(const std::string & job_id) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_catalog.complete_job(job_id);
+}
+
+static void coordinate_model_install(
+        std::string job_id,
+        std::string model_id,
+        model_info model,
+        std::vector<dist_node_info> nodes) {
+    if (nodes.empty()) {
+        update_install_job(job_id, install_status::error, "No online nodes available");
+        return;
+    }
+
+    std::vector<dist_node_info> pending_nodes;
+    int ready_nodes = 0;
+    int error_nodes = 0;
+
+    for (const auto & node : nodes) {
+        httplib::Client client(node.host.c_str(), node.http_port);
+        client.set_connection_timeout(5, 0);
+        client.set_read_timeout(30, 0);
+        client.set_write_timeout(30, 0);
+
+        json install_request = {
+            { "model", model_id },
+            { "repo", model.source.repo },
+            { "file", model.source.file }
+        };
+
+        const auto result = client.Post("/models/install", install_request.dump(), "application/json");
+        if (!result || result->status != 200) {
+            ++error_nodes;
+            set_install_node_result(job_id, node.node_id, {
+                { "status", "error" },
+                { "error", result ? result->body : "node unreachable" }
+            });
+            continue;
+        }
+
+        json body;
+        try {
+            body = json::parse(result->body);
+        } catch (...) {
+            ++error_nodes;
+            set_install_node_result(job_id, node.node_id, {
+                { "status", "error" },
+                { "error", "invalid node response" }
+            });
+            continue;
+        }
+
+        const std::string status = body.value("status", "download_started");
+        const std::string local_path = body.value("local_path", "");
+        set_install_node_result(job_id, node.node_id, {
+            { "status", status },
+            { "local_path", local_path }
+        });
+
+        if (status == "already_installed") {
+            ++ready_nodes;
+        } else {
+            pending_nodes.push_back(node);
+        }
+    }
+
+    const int total_nodes = static_cast<int>(nodes.size());
+    if (ready_nodes + error_nodes == total_nodes) {
+        if (error_nodes == 0) {
+            complete_install_job(job_id);
+        } else {
+            update_install_job(job_id, install_status::error, "Installation failed on all available nodes");
+        }
+        return;
+    }
+
+    update_install_job(job_id, install_status::downloading, "",
+            static_cast<double>(ready_nodes) / static_cast<double>(total_nodes));
+
+    constexpr int max_attempts = 1800; // Up to 1 hour at 2 seconds per poll.
+    for (int attempt = 0; attempt < max_attempts && !pending_nodes.empty(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        std::vector<dist_node_info> still_pending;
+        for (const auto & node : pending_nodes) {
+            httplib::Client client(node.host.c_str(), node.http_port);
+            client.set_connection_timeout(5, 0);
+            client.set_read_timeout(10, 0);
+
+            const auto result = client.Get("/models/local");
+            if (!result || result->status != 200) {
+                still_pending.push_back(node);
+                continue;
+            }
+
+            bool found = false;
+            bool done = false;
+            try {
+                const json models = json::parse(result->body);
+                for (const auto & item : models) {
+                    if (item.value("model_id", "") != model_id) {
+                        continue;
+                    }
+
+                    found = true;
+                    const std::string status = item.value("status", item.value("ready", false) ? "ready" : "unknown");
+                    if (status == "ready" && item.value("ready", false)) {
+                        ++ready_nodes;
+                        done = true;
+                        set_install_node_result(job_id, node.node_id, {
+                            { "status", "ready" },
+                            { "local_path", item.value("local_path", "") },
+                            { "size_bytes", item.value("size_bytes", static_cast<uint64_t>(0)) }
+                        });
+                    } else if (status == "error") {
+                        ++error_nodes;
+                        done = true;
+                        set_install_node_result(job_id, node.node_id, {
+                            { "status", "error" },
+                            { "local_path", item.value("local_path", "") },
+                            { "error", item.value("error", "download failed") }
+                        });
+                    }
+                    break;
+                }
+            } catch (...) {
+                // Treat transient parse errors as still pending.
+            }
+
+            if (!found || !done) {
+                still_pending.push_back(node);
+            }
+        }
+
+        pending_nodes = std::move(still_pending);
+        update_install_job(job_id, install_status::downloading, "",
+                static_cast<double>(ready_nodes) / static_cast<double>(total_nodes));
+
+        if (ready_nodes + error_nodes == total_nodes) {
+            break;
+        }
+    }
+
+    if (ready_nodes == total_nodes) {
+        complete_install_job(job_id);
+    } else {
+        update_install_job(job_id, install_status::error,
+                "Installation incomplete (" + std::to_string(ready_nodes) + "/" +
+                std::to_string(total_nodes) + " nodes ready)",
+                static_cast<double>(ready_nodes) / static_cast<double>(total_nodes));
+    }
 }
 
 static bool gen3_send_recv(
@@ -710,29 +883,33 @@ int main(int argc, char ** argv) {
         }
 
         std::string job_id;
-        size_t online_nodes = 0;
+        model_info model;
+        std::vector<dist_node_info> online_nodes;
         {
             std::lock_guard<std::mutex> lock(g_mu);
-            if (!g_catalog.find_model(model_id)) {
+            const auto * found = g_catalog.find_model(model_id);
+            if (!found) {
                 res.status = 404;
                 res.set_content(R"({"error":"model not found in catalog"})", "application/json");
                 return;
             }
 
+            model = *found;
             job_id = g_catalog.create_install_job(model_id);
+            g_catalog.update_job_status(job_id, install_status::downloading, "", 0.0);
             for (const auto & [_, node] : g_nodes) {
                 if (node.online) {
-                    ++online_nodes;
+                    online_nodes.push_back(node);
+                    g_install_node_results[job_id][node.node_id] = {
+                        { "status", "pending" },
+                        { "host", node.host },
+                        { "port", node.http_port }
+                    };
                 }
             }
-
-            // Temporary non-blocking mock until node-side download orchestration is restored.
-            g_catalog.update_job_status(job_id, install_status::downloading, "", 0.5);
-            g_catalog.complete_job(job_id);
         }
 
-        printf("Model installation mock-completed for: %s on %zu nodes\n",
-               model_id.c_str(), online_nodes);
+        std::thread(coordinate_model_install, job_id, model_id, model, online_nodes).detach();
 
         res.set_content(json({
             { "job_id", job_id },
@@ -744,6 +921,7 @@ int main(int argc, char ** argv) {
     // GET /models/install/{job_id} - Check installation status
     svr.Get(R"(/models/install/(.+))", [](const httplib::Request & req, httplib::Response & res) {
         install_job job;
+        json node_results = json::object();
         {
             std::lock_guard<std::mutex> lock(g_mu);
             auto * found = g_catalog.get_install_job(req.matches[1]);
@@ -753,6 +931,10 @@ int main(int argc, char ** argv) {
                 return;
             }
             job = *found;
+            const auto node_it = g_install_node_results.find(job.job_id);
+            if (node_it != g_install_node_results.end()) {
+                node_results = node_it->second;
+            }
         }
 
         std::string status_str;
@@ -767,7 +949,8 @@ int main(int argc, char ** argv) {
             { "job_id", job.job_id },
             { "model", job.model_id },
             { "status", status_str },
-            { "progress", job.progress }
+            { "progress", job.progress },
+            { "nodes", node_results }
         };
 
         if (!job.error_msg.empty()) {
