@@ -12,6 +12,7 @@ set(DIST_TRANSPORT_SOURCES
 set(DIST_COMMON_SOURCES
     ${DIST_TRANSPORT_SOURCES}
     dist_common.cpp
+    model_catalog.cpp
     node_core.cpp
 )
 
@@ -38,13 +39,13 @@ function(dist_add_exe name main_source)
 endfunction()
 
 function(dist_add_exe_light name main_source)
-    add_executable(${name} ${main_source} dist_common.cpp ${DIST_PLANNER_SOURCES} ${DIST_BENCHMARK_SOURCES})
+    add_executable(${name} ${main_source} dist_common.cpp model_catalog.cpp ${DIST_PLANNER_SOURCES} ${DIST_BENCHMARK_SOURCES})
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
 endfunction()
 
 function(dist_add_test_exe name main_source)
-    add_executable(${name} ${main_source} dist_common.cpp ${DIST_PLANNER_SOURCES} ${DIST_TRANSPORT_SOURCES})
+    add_executable(${name} ${main_source} dist_common.cpp model_catalog.cpp ${DIST_PLANNER_SOURCES} ${DIST_TRANSPORT_SOURCES})
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
 endfunction()
@@ -66,6 +67,12 @@ if (LLAMA_BUILD_TESTS)
     add_executable(test-layer-planner test-layer-planner.cpp ${DIST_PLANNER_SOURCES})
     target_include_directories(test-layer-planner PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-layer-planner PRIVATE Threads::Threads)
+
+    add_executable(test-model-catalog test-model-catalog.cpp model_catalog.cpp)
+    target_include_directories(test-model-catalog PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-model-catalog PRIVATE Threads::Threads)
+
+    dist_add_test_exe(test-model-install test-model-install.cpp)
 
     dist_add_test_exe(test-orchestrator-3node test-orchestrator-3node.cpp)
     dist_add_test_exe(test-orchestrator-dynamic-layout test-orchestrator-dynamic-layout.cpp)

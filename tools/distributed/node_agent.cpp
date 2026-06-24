@@ -1,4 +1,5 @@
 #include "dist_common.h"
+#include "model_catalog.h"
 #include "node_benchmark.h"
 
 #include "httplib.h"
@@ -28,6 +29,7 @@ static int32_t g_n_layer = 0;
 static int32_t g_n_embd  = 0;
 static BenchmarkResult g_benchmark{};
 static pid_t g_worker_pid = 0;
+static model_store g_model_store;
 
 static void usage(const char * prog) {
     fprintf(stderr,
@@ -276,6 +278,12 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Initialize model store
+    const std::string models_state_path = g_model_store.get_models_dir() + "/models.json";
+    if (!g_model_store.load_state(models_state_path)) {
+        fprintf(stderr, "node_agent: warning - failed to load model state from %s\n", models_state_path.c_str());
+    }
+
     std::string register_host = !advertise_host.empty() ? advertise_host : bind_host;
     if (register_host == "0.0.0.0" || register_host == "*") {
         fprintf(stderr, "node_agent: set --advertise-host to a reachable IP (not 0.0.0.0)\n");
@@ -360,6 +368,80 @@ int main(int argc, char ** argv) {
         stop_worker();
 #endif
         res.set_content(R"({"ok":true})", "application/json");
+    });
+
+    // Model store API
+    
+    // GET /models/local - List locally installed models
+    svr.Get("/models/local", [](const httplib::Request &, httplib::Response & res) {
+        json models_json = json::array();
+        
+        auto local_models = g_model_store.get_local_models();
+        for (const auto & model : local_models) {
+            models_json.push_back({
+                { "model_id", model.model_id },
+                { "local_path", model.local_path },
+                { "size_bytes", model.size_bytes },
+                { "ready", model.ready },
+                { "installed_ms", model.installed_ms }
+            });
+        }
+        
+        res.set_content(models_json.dump(), "application/json");
+    });
+    
+    // POST /models/install - Install a model locally
+    svr.Post("/models/install", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        
+        const std::string model_id = body.value("model", "");
+        const std::string repo = body.value("repo", "");
+        const std::string file = body.value("file", "");
+        
+        if (model_id.empty() || repo.empty() || file.empty()) {
+            res.status = 400;
+            res.set_content(R"({"error":"model, repo, and file required"})", "application/json");
+            return;
+        }
+        
+        // Check if model already installed
+        const auto * existing = g_model_store.find_model(model_id);
+        if (existing && existing->ready) {
+            res.set_content(json({
+                { "model_id", model_id },
+                { "status", "already_installed" },
+                { "local_path", existing->local_path }
+            }).dump(), "application/json");
+            return;
+        }
+        
+        // TODO: Implement actual download logic
+        // For now, just mark as completed if the current g_model_path matches
+        std::string expected_path = g_model_store.get_model_path(model_id);
+        
+        installed_model new_model;
+        new_model.model_id = model_id;
+        new_model.local_path = expected_path;
+        new_model.ready = false; // Will be set to true after download
+        new_model.size_bytes = 0; // Will be filled after download
+        new_model.installed_ms = 0; // Will be set after download
+        
+        g_model_store.add_model(new_model);
+        
+        res.set_content(json({
+            { "model_id", model_id },
+            { "status", "download_started" },
+            { "local_path", expected_path }
+        }).dump(), "application/json");
+        
+        // TODO: Start background download
     });
 
     fprintf(stderr, "node_agent: listening on %s:%d model=%s score=%.1f\n",

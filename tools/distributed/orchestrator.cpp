@@ -1,5 +1,6 @@
 #include "dist_common.h"
 #include "layer_planner.h"
+#include "model_catalog.h"
 #include "split_gen_common.h"
 #include "split_tcp_wire.h"
 
@@ -39,6 +40,7 @@ static std::mutex g_mu;
 static std::map<std::string, dist_node_info> g_nodes;
 static std::map<std::string, dist_session> g_sessions;
 static std::string g_model_path;
+static model_catalog g_catalog;
 
 static std::string make_id(const char * prefix) {
     static std::mt19937_64 rng{ std::random_device{}() };
@@ -380,6 +382,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Initialize model catalog
+    const std::string catalog_path = "state/catalog.json";
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (!g_catalog.load_catalog(catalog_path)) {
+            fprintf(stderr, "orchestrator: warning - failed to load catalog from %s, using defaults\n", catalog_path.c_str());
+        }
+    }
+
     httplib::Server svr;
 
     svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
@@ -647,6 +658,115 @@ int main(int argc, char ** argv) {
             { "text", text },
             { "count", tokens.size() },
         }).dump(), "application/json");
+    });
+
+    // Model management API
+    
+    // GET /catalog - List available models in catalog
+    svr.Get("/catalog", [](const httplib::Request &, httplib::Response & res) {
+        json catalog_json = json::array();
+        
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto models = g_catalog.get_models();
+        
+        for (const auto & model : models) {
+            catalog_json.push_back({
+                { "id", model.id },
+                { "display_name", model.display_name },
+                { "size_gb", model.size_gb },
+                { "n_layers", model.n_layers },
+                { "n_embd", model.n_embd }
+            });
+        }
+        
+        res.set_content(catalog_json.dump(), "application/json");
+    });
+    
+    // GET /models - List installed models across cluster
+    svr.Get("/models", [](const httplib::Request &, httplib::Response & res) {
+        json models_json = json::array();
+        
+        std::lock_guard<std::mutex> lock(g_mu);
+        
+        // TODO: Query all nodes for their installed models
+        // For now, return empty array
+        
+        res.set_content(models_json.dump(), "application/json");
+    });
+    
+    // POST /models/install - Install a model on the cluster
+    svr.Post("/models/install", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        
+        const std::string model_id = body.value("model", "");
+        if (model_id.empty()) {
+            res.status = 400;
+            res.set_content(R"({"error":"model id required"})", "application/json");
+            return;
+        }
+        
+        std::lock_guard<std::mutex> lock(g_mu);
+        
+        // Check if model exists in catalog
+        const auto * model_info = g_catalog.find_model(model_id);
+        if (!model_info) {
+            res.status = 404;
+            res.set_content(R"({"error":"model not found in catalog"})", "application/json");
+            return;
+        }
+        
+        // Create installation job
+        std::string job_id = g_catalog.create_install_job(model_id);
+        
+        res.set_content(json({
+            { "job_id", job_id },
+            { "model", model_id },
+            { "status", "started" }
+        }).dump(), "application/json");
+        
+        // TODO: Trigger actual installation on nodes (async)
+    });
+    
+    // GET /models/install/{job_id} - Check installation status
+    svr.Get(R"(/models/install/(.+))", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string job_id = req.matches[1];
+        
+        std::lock_guard<std::mutex> lock(g_mu);
+        
+        auto * job = g_catalog.get_install_job(job_id);
+        if (!job) {
+            res.status = 404;
+            res.set_content(R"({"error":"job not found"})", "application/json");
+            return;
+        }
+        
+        std::string status_str;
+        switch (job->status) {
+            case install_status::unknown: status_str = "unknown"; break;
+            case install_status::downloading: status_str = "downloading"; break;
+            case install_status::ready: status_str = "ready"; break;
+            case install_status::error: status_str = "error"; break;
+        }
+        
+        json response = {
+            { "job_id", job->job_id },
+            { "model", job->model_id },
+            { "status", status_str },
+            { "progress", job->progress }
+        };
+        
+        if (!job->error_msg.empty()) {
+            response["error"] = job->error_msg;
+        }
+        
+        res.set_content(response.dump(), "application/json");
     });
 
     fprintf(stderr, "orchestrator: listening on %s:%d (dynamic layer planner)\n", bind_host.c_str(), port);
