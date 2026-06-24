@@ -10,6 +10,8 @@ import json
 import time
 from pathlib import Path
 import argparse
+import urllib.parse
+import urllib.request
 
 def download_with_hf_hub(repo_id: str, filename: str, target_path: str) -> bool:
     """Download using huggingface_hub library."""
@@ -80,6 +82,47 @@ def download_with_hf_cli(repo_id: str, filename: str, target_path: str) -> bool:
         print(f"Error downloading with hf CLI: {e}")
         return False
 
+def download_with_urllib(repo_id: str, filename: str, target_path: str, progress_cb=None) -> bool:
+    """Download directly from HuggingFace using Python stdlib."""
+    try:
+        url = f"https://huggingface.co/{repo_id}/resolve/main/{urllib.parse.quote(filename)}"
+        tmp_path = target_path + ".tmp"
+
+        print(f"Downloading {url} using urllib...")
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+        request = urllib.request.Request(url, headers={"User-Agent": "distributed-llm-node-agent"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+            downloaded = 0
+            last_progress_time = 0.0
+
+            with open(tmp_path, "wb") as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    downloaded += len(chunk)
+
+                    now = time.time()
+                    if progress_cb and total > 0 and now - last_progress_time >= 1.0:
+                        progress = min(0.99, downloaded / total)
+                        progress_cb("downloading", progress)
+                        last_progress_time = now
+
+        os.replace(tmp_path, target_path)
+        print(f"Downloaded to: {target_path}")
+        return True
+    except Exception as e:
+        print(f"Error downloading with urllib: {e}")
+        try:
+            if os.path.exists(target_path + ".tmp"):
+                os.remove(target_path + ".tmp")
+        except Exception:
+            pass
+        return False
+
 def get_file_size(path: str) -> int:
     """Get file size in bytes."""
     try:
@@ -134,6 +177,10 @@ def main():
     # Method 2: hf CLI
     if not success:
         success = download_with_hf_cli(args.repo, args.file, args.output)
+
+    # Method 3: direct HTTPS download with Python stdlib
+    if not success:
+        success = download_with_urllib(args.repo, args.file, args.output, write_progress)
     
     if success:
         file_size = get_file_size(args.output)
