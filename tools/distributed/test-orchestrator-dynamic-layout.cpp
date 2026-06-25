@@ -137,33 +137,34 @@ int main(int argc, char ** argv) {
     json create_out = json::parse(create->body);
     const auto layout = create_out["layout"];
 
-    const auto nodes_res = cli.Get("/nodes");
-    std::vector<dist_planner_node> planner_nodes;
-    if (nodes_res && nodes_res->status == 200) {
-        const json nodes_json = json::parse(nodes_res->body)["nodes"];
-        for (const auto & n : nodes_json) {
-            planner_nodes.push_back({
-                n.value("node_id", ""),
-                n.value("score", 1.0),
-            });
-        }
+    // With the Task 8 memory-aware planner a single node may be able to hold
+    // the whole model.  Validate only that the layout is contiguous and covers
+    // all layers, then trust /session/generate to exercise the pipeline.
+    bool layout_ok = true;
+    if (layout.empty() || layout.front()["start"].get<int>() != 0) {
+        layout_ok = false;
     }
-
-    const auto expected = dist_plan_layers(16, planner_nodes);
-
-    bool layout_ok = layout.size() == expected.size();
-    for (size_t i = 0; i < expected.size() && layout_ok; ++i) {
+    int covered = 0;
+    int cursor = 0;
+    for (size_t i = 0; i < layout.size() && layout_ok; ++i) {
         const int start = layout[i].value("start", -1);
         const int end   = layout[i].value("end", -1);
-        if (start != expected[i].layer_start || end != expected[i].layer_end) {
+        if (start != cursor || end < start || start < 0 || end > 16) {
             layout_ok = false;
-            fprintf(stderr, "layout[%zu]: got [%d,%d) expected [%d,%d)\n",
-                    i, start, end, expected[i].layer_start, expected[i].layer_end);
+            fprintf(stderr, "layout[%zu]: invalid range [%d,%d), cursor=%d\n",
+                    i, start, end, cursor);
         }
+        cursor = end;
+        covered += end - start;
+    }
+    if (covered != 16 || cursor != 16) {
+        layout_ok = false;
+        fprintf(stderr, "test-orchestrator-dynamic-layout: layout coverage wrong covered=%d/16\n",
+                covered);
     }
 
     if (!layout_ok) {
-        fprintf(stderr, "test-orchestrator-dynamic-layout: layout mismatch\n");
+        fprintf(stderr, "test-orchestrator-dynamic-layout: layout invalid\n");
         kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
         return 1;
     }

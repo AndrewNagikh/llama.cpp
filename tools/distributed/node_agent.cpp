@@ -215,12 +215,17 @@ static bool register_with_orchestrator(
     cli.set_connection_timeout(5, 0);
     cli.set_read_timeout(10, 0);
 
-    int64_t total_mb = 0;
-    int64_t free_mb  = 0;
-    dist_probe_memory(total_mb, free_mb);
+    const double score = g_benchmark.score;
+
+    dist_node_memory memory{};
+    dist_node_cpu cpu{};
+    const dist_node_system sys = dist_probe_node_system();
+    dist_probe_node_memory(memory);
+    dist_probe_node_cpu(cpu);
     const auto caps = dist_probe_capabilities();
 
-    const double score = g_benchmark.score;
+    const auto ram_gb  = static_cast<int>(memory.total_ram_bytes / (1024 * 1024 * 1024));
+    const auto vram_gb = static_cast<int>(memory.total_vram_bytes / (1024 * 1024 * 1024));
 
     json body = {
         { "node_id", node_id },
@@ -229,19 +234,34 @@ static bool register_with_orchestrator(
         { "n_layer", g_n_layer },
         { "n_embd", g_n_embd },
         { "score", score },
-        { "memory_total_mb", total_mb },
-        { "memory_free_mb", free_mb },
+        { "memory_total_mb", static_cast<int64_t>(memory.total_ram_bytes / (1024 * 1024)) },
+        { "memory_free_mb", static_cast<int64_t>(memory.free_ram_bytes / (1024 * 1024)) },
+        { "memory", {
+            { "total_ram", memory.total_ram_bytes },
+            { "free_ram", memory.free_ram_bytes },
+            { "total_vram", memory.total_vram_bytes },
+            { "free_vram", memory.free_vram_bytes },
+            { "has_gpu", memory.has_gpu },
+        }},
         { "hardware", {
-            { "cpu_threads", caps.cpu_threads },
-            { "ram_gb", (int) ((total_mb + 512) / 1024) },
+            { "backend", caps.gpu_backend },
             { "gpu_name", caps.gpu_name },
-            { "gpu_vram_gb", caps.gpu_memory_mb / 1024 },
+            { "cpu_name", cpu.cpu_name },
+            { "logical_cores", cpu.logical_cores },
+            { "physical_cores", cpu.physical_cores },
+            { "cpu_threads", caps.cpu_threads },
+            { "ram_gb", ram_gb },
+            { "gpu_vram_gb", vram_gb },
         }},
         { "capabilities", {
             { "gpu_backend", caps.gpu_backend },
             { "gpu_memory_mb", caps.gpu_memory_mb },
             { "cpu_threads", caps.cpu_threads },
             { "supported_arch", caps.supported_arch },
+        }},
+        { "system", {
+            { "os", sys.os },
+            { "arch", sys.arch },
         }},
         { "performance", {
             { "score", score },
@@ -418,18 +438,32 @@ int main(int argc, char ** argv) {
     });
 
     svr.Get("/capabilities", [](const httplib::Request &, httplib::Response & res) {
-        int64_t total_mb = 0;
-        int64_t free_mb  = 0;
-        dist_probe_memory(total_mb, free_mb);
+        dist_node_memory memory{};
+        dist_node_cpu cpu{};
+        const dist_node_system sys = dist_probe_node_system();
+        dist_probe_node_memory(memory);
+        dist_probe_node_cpu(cpu);
         const auto caps = dist_probe_capabilities();
 
         res.set_content(json({
             { "node_id", g_node_id },
+            { "memory", {
+                { "total_ram", memory.total_ram_bytes },
+                { "free_ram", memory.free_ram_bytes },
+                { "total_vram", memory.total_vram_bytes },
+                { "free_vram", memory.free_vram_bytes },
+                { "has_gpu", memory.has_gpu },
+            }},
             { "hardware", {
-                { "cpu_threads", caps.cpu_threads },
-                { "ram_gb", (int) ((total_mb + 512) / 1024) },
+                { "backend", caps.gpu_backend },
                 { "gpu_name", caps.gpu_name },
-                { "gpu_vram_gb", caps.gpu_memory_mb / 1024 },
+                { "cpu_name", cpu.cpu_name },
+                { "logical_cores", cpu.logical_cores },
+                { "physical_cores", cpu.physical_cores },
+            }},
+            { "system", {
+                { "os", sys.os },
+                { "arch", sys.arch },
             }},
             { "performance", {
                 { "score", g_benchmark.score },

@@ -22,6 +22,7 @@ set(DIST_BENCHMARK_SOURCES
 
 set(DIST_PLANNER_SOURCES
     layer_planner.cpp
+    memory_estimator.cpp
 )
 
 set(DIST_INCLUDE_DIRS
@@ -71,9 +72,9 @@ dist_add_test_exe(test-cluster-e2e-node-loss test-cluster-e2e-node-loss.cpp)
 dist_add_test_exe(test-cluster-e2e-orchestrator-restart test-cluster-e2e-orchestrator-restart.cpp)
 
 if (LLAMA_BUILD_TESTS)
-    add_executable(test-layer-planner test-layer-planner.cpp ${DIST_PLANNER_SOURCES})
+    add_executable(test-layer-planner test-layer-planner.cpp ${DIST_PLANNER_SOURCES} dist_common.cpp)
     target_include_directories(test-layer-planner PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-layer-planner PRIVATE Threads::Threads)
+    target_link_libraries(test-layer-planner PRIVATE llama llama-common Threads::Threads)
 
     add_executable(test-model-catalog test-model-catalog.cpp model_catalog.cpp)
     target_include_directories(test-model-catalog PRIVATE ${DIST_INCLUDE_DIRS})
@@ -89,4 +90,29 @@ if (LLAMA_BUILD_TESTS)
     target_link_libraries(test-node-benchmark PRIVATE llama llama-common Threads::Threads)
 
     dist_add_test_exe(test-registration-benchmark test-registration-benchmark.cpp)
+
+    # Task 8 unit tests
+    add_executable(test-memory-estimator test-memory-estimator.cpp memory_estimator.cpp dist_common.cpp)
+    target_include_directories(test-memory-estimator PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-memory-estimator PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-capacity-check test-capacity-check.cpp memory_estimator.cpp dist_common.cpp)
+    target_include_directories(test-capacity-check PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-capacity-check PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-memory-aware-planner test-memory-aware-planner.cpp layer_planner.cpp memory_estimator.cpp dist_common.cpp)
+    target_include_directories(test-memory-aware-planner PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-memory-aware-planner PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-planner-no-overlap test-planner-no-overlap.cpp layer_planner.cpp memory_estimator.cpp dist_common.cpp)
+    target_include_directories(test-planner-no-overlap PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-planner-no-overlap PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-planner-low-memory test-planner-low-memory.cpp layer_planner.cpp memory_estimator.cpp dist_common.cpp)
+    target_include_directories(test-planner-low-memory PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-planner-low-memory PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-capacity-api test-capacity-api.cpp memory_estimator.cpp dist_common.cpp)
+    target_include_directories(test-capacity-api PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-capacity-api PRIVATE llama llama-common cpp-httplib Threads::Threads)
 endif()

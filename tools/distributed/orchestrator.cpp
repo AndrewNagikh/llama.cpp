@@ -1,5 +1,6 @@
 #include "dist_common.h"
 #include "layer_planner.h"
+#include "memory_estimator.h"
 #include "model_catalog.h"
 #include "split_gen_common.h"
 #include "split_tcp_wire.h"
@@ -13,10 +14,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -42,6 +46,7 @@ static std::mutex g_mu;
 static std::map<std::string, dist_node_info> g_nodes;
 static std::map<std::string, dist_session> g_sessions;
 static std::string g_model_path;
+static int32_t g_n_ctx = 4096;
 static model_catalog g_catalog;
 static std::map<std::string, json> g_install_node_results;
 
@@ -314,6 +319,63 @@ static json planned_layout_json(const std::vector<dist_layer_assignment> & assig
     return layout;
 }
 
+static model_memory_requirements get_model_memory(
+        const std::string & model_id,
+        int32_t             n_ctx) {
+    // Prefer the orchestrator's local GGUF if it exists.
+    if (!g_model_path.empty() && std::filesystem::exists(g_model_path)) {
+        model_memory_requirements mem = estimate_model_memory(g_model_path, n_ctx);
+        if (mem.valid()) {
+            mem.model_id = model_id;
+            return mem;
+        }
+    }
+
+    // Otherwise fall back to the catalog entry.
+    std::lock_guard<std::mutex> lock(g_mu);
+    const auto * model = g_catalog.find_model(model_id);
+    if (model) {
+        return estimate_model_memory_from_catalog(*model, n_ctx);
+    }
+    return {};
+}
+
+static void dist_print_planner_report(
+        const std::string & model_id,
+        const model_memory_requirements & mem,
+        const std::vector<dist_node_info> & nodes,
+        const cluster_memory_fits_result & fit,
+        const std::vector<dist_layer_assignment> & layout) {
+    fprintf(stderr, "\nPlanner Report\n");
+    fprintf(stderr, "Model: %s\n", model_id.empty() ? "unknown" : model_id.c_str());
+    fprintf(stderr, "Weights: %.1f GB\n", mem.weights_gb());
+    fprintf(stderr, "Estimated KV: %.1f GB\n", mem.kv_gb());
+    fprintf(stderr, "Compute: %.1f GB\n", mem.compute_gb());
+    fprintf(stderr, "Scratch: %.1f GB\n", mem.scratch_gb());
+    fprintf(stderr, "Required: %.1f GB\n", mem.total_gb());
+    fprintf(stderr, "Cluster:\n");
+    for (const auto & n : nodes) {
+        if (!n.online) {
+            continue;
+        }
+        const char * kind = n.memory.has_gpu ? "GPU" : "CPU";
+        const char * backend = n.caps.gpu_backend.empty() ? "cpu" : n.caps.gpu_backend.c_str();
+        fprintf(stderr, "  Node %s  %s/%s  free VRAM %.1f GB  free RAM %.1f GB\n",
+                n.node_id.c_str(), backend, kind,
+                dist_bytes_to_gb(n.memory.free_vram_bytes),
+                dist_bytes_to_gb(n.memory.free_ram_bytes));
+    }
+    fprintf(stderr, "Result Fits: %s\n", fit.fits ? "YES" : "NO");
+    if (fit.fits) {
+        fprintf(stderr, "Layer layout\n");
+        for (const auto & a : layout) {
+            fprintf(stderr, "  Node %s %d-%d\n",
+                    a.node_id.c_str(), a.layer_start, a.layer_end);
+        }
+    }
+    fprintf(stderr, "\n");
+}
+
 static const dist_node_info * find_node(const std::map<std::string, dist_node_info> & nodes, const std::string & id) {
     const auto it = nodes.find(id);
     return it == nodes.end() ? nullptr : &it->second;
@@ -527,7 +589,7 @@ static bool run_generation(
 }
 
 static void usage(const char * prog) {
-    fprintf(stderr, "usage: %s --model PATH [--listen HOST:PORT]\n", prog);
+    fprintf(stderr, "usage: %s --model PATH [--listen HOST:PORT] [--ctx-size N]\n", prog);
 }
 
 int main(int argc, char ** argv) {
@@ -538,6 +600,8 @@ int main(int argc, char ** argv) {
             listen = argv[++i];
         } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             g_model_path = argv[++i];
+        } else if (strcmp(argv[i], "--ctx-size") == 0 && i + 1 < argc) {
+            g_n_ctx = std::atoi(argv[++i]);
         } else {
             usage(argv[0]);
             return 1;
@@ -601,19 +665,68 @@ int main(int argc, char ** argv) {
         node.last_seen = dist_now_unix();
         node.online = true;
 
+        // Task 8: byte-level memory profile.
+        if (body.contains("memory")) {
+            const auto & mem = body["memory"];
+            node.memory.total_ram_bytes  = mem.value("total_ram", 0);
+            node.memory.free_ram_bytes   = mem.value("free_ram", 0);
+            node.memory.total_vram_bytes = mem.value("total_vram", 0);
+            node.memory.free_vram_bytes  = mem.value("free_vram", 0);
+            node.memory.has_gpu          = mem.value("has_gpu", false);
+
+            // Mirror into the legacy capabilities block.
+            node.caps.total_ram_bytes  = node.memory.total_ram_bytes;
+            node.caps.free_ram_bytes   = node.memory.free_ram_bytes;
+            node.caps.total_vram_bytes = node.memory.total_vram_bytes;
+            node.caps.free_vram_bytes  = node.memory.free_vram_bytes;
+            node.caps.has_gpu          = node.memory.has_gpu;
+        }
+
+        if (body.contains("cpu")) {
+            const auto & cpu = body["cpu"];
+            node.cpu.cpu_name        = cpu.value("cpu_name", "");
+            node.cpu.physical_cores  = cpu.value("physical_cores", 0);
+            node.cpu.logical_cores   = cpu.value("logical_cores", 0);
+            node.cpu.cache_l3_bytes  = cpu.value("cache_l3", 0);
+        }
+
+        if (body.contains("system")) {
+            const auto & sys = body["system"];
+            node.system.os   = sys.value("os", "");
+            node.system.arch = sys.value("arch", "");
+        }
+
         if (body.contains("hardware")) {
             const auto & hw = body["hardware"];
             node.hardware.cpu_threads = hw.value("cpu_threads", 4);
             node.hardware.ram_gb      = hw.value("ram_gb", 0);
             node.hardware.gpu_name    = hw.value("gpu_name", "none");
             node.hardware.gpu_vram_gb = hw.value("gpu_vram_gb", 0);
+            node.hardware.backend     = hw.value("backend", "cpu");
+            node.hardware.cpu_name    = hw.value("cpu_name", node.hardware.cpu_name);
+
+            // New fields override legacy ones if present.
+            if (hw.contains("backend")) {
+                node.caps.gpu_backend = hw.value("backend", node.caps.gpu_backend);
+            }
+            if (hw.contains("gpu_name")) {
+                node.caps.gpu_name = hw.value("gpu_name", node.caps.gpu_name);
+            }
         }
 
         if (body.contains("capabilities")) {
             const auto & caps = body["capabilities"];
-            node.caps.gpu_backend   = caps.value("gpu_backend", "cpu");
+            node.caps.gpu_backend   = caps.value("gpu_backend", node.caps.gpu_backend);
             node.caps.gpu_memory_mb = caps.value("gpu_memory_mb", 0);
             node.caps.cpu_threads   = caps.value("cpu_threads", 4);
+            if (caps.contains("total_ram"))  node.caps.total_ram_bytes  = caps.value("total_ram", 0);
+            if (caps.contains("free_ram"))   node.caps.free_ram_bytes   = caps.value("free_ram", 0);
+            if (caps.contains("total_vram")) node.caps.total_vram_bytes = caps.value("total_vram", 0);
+            if (caps.contains("free_vram"))  node.caps.free_vram_bytes  = caps.value("free_vram", 0);
+            if (caps.contains("has_gpu"))    node.caps.has_gpu          = caps.value("has_gpu", false);
+            if (caps.contains("cpu_name"))   node.caps.cpu_name = caps.value("cpu_name", "");
+            if (caps.contains("os"))         node.caps.os       = caps.value("os", "");
+            if (caps.contains("arch"))       node.caps.arch     = caps.value("arch", "");
         }
 
         if (node.node_id.empty() || node.http_port <= 0) {
@@ -627,47 +740,99 @@ int main(int argc, char ** argv) {
             g_nodes[node.node_id] = node;
         }
 
-        fprintf(stderr, "orchestrator: registered node %s at %s:%d layers=%d score=%.1f decode=%.1f prefill=%.1f\n",
+        fprintf(stderr, "orchestrator: registered node %s at %s:%d layers=%d score=%.1f decode=%.1f prefill=%.1f "
+                "ram=%.1fGB vram=%.1fGB has_gpu=%d\n",
                 node.node_id.c_str(), node.host.c_str(), node.http_port, node.n_layer, node.score,
-                node.performance.decode_tps, node.performance.prefill_tps);
+                node.performance.decode_tps, node.performance.prefill_tps,
+                dist_bytes_to_gb(node.memory.free_ram_bytes),
+                dist_bytes_to_gb(node.memory.free_vram_bytes),
+                node.memory.has_gpu ? 1 : 0);
 
         res.set_content(json({ { "ok", true }, { "node_id", node.node_id } }).dump(), "application/json");
     });
 
-    svr.Get("/nodes", [](const httplib::Request &, httplib::Response & res) {
+    svr.Get("/nodes", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string format = req.get_param_value("format");
+        const bool brief = (format == "brief");
+
         json nodes = json::array();
         std::lock_guard<std::mutex> lock(g_mu);
         for (const auto & kv : g_nodes) {
             const auto & n = kv.second;
-            nodes.push_back({
-                { "node_id", n.node_id },
-                { "host", n.host },
-                { "port", n.http_port },
-                { "n_layer", n.n_layer },
-                { "n_embd", n.n_embd },
-                { "score", n.score },
-                { "decode_tps", n.performance.decode_tps },
-                { "prefill_tps", n.performance.prefill_tps },
-                { "load_ms", n.performance.load_ms },
-                { "online", n.online },
-                { "last_seen", n.last_seen },
-                { "gpu", n.hardware.gpu_name },
-                { "ram_gb", n.hardware.ram_gb },
-                { "hardware", {
-                    { "cpu_threads", n.hardware.cpu_threads },
-                    { "ram_gb", n.hardware.ram_gb },
-                    { "gpu_name", n.hardware.gpu_name },
-                    { "gpu_vram_gb", n.hardware.gpu_vram_gb },
-                }},
-                { "performance", {
-                    { "score", n.performance.score },
+            if (brief) {
+                nodes.push_back({
+                    { "node", n.node_id },
+                    { "score", n.score },
+                    { "backend", n.caps.gpu_backend },
+                    { "free_ram_gb", dist_bytes_to_gb(n.memory.free_ram_bytes) },
+                    { "free_vram_gb", dist_bytes_to_gb(n.memory.free_vram_bytes) },
+                    { "gpu", n.hardware.gpu_name },
+                });
+            } else {
+                nodes.push_back({
+                    { "node_id", n.node_id },
+                    { "host", n.host },
+                    { "port", n.http_port },
+                    { "n_layer", n.n_layer },
+                    { "n_embd", n.n_embd },
+                    { "score", n.score },
                     { "decode_tps", n.performance.decode_tps },
                     { "prefill_tps", n.performance.prefill_tps },
                     { "load_ms", n.performance.load_ms },
-                }},
-            });
+                    { "online", n.online },
+                    { "last_seen", n.last_seen },
+                    { "gpu", n.hardware.gpu_name },
+                    { "ram_gb", n.hardware.ram_gb },
+                    { "memory", {
+                        { "total_ram", n.memory.total_ram_bytes },
+                        { "free_ram", n.memory.free_ram_bytes },
+                        { "total_vram", n.memory.total_vram_bytes },
+                        { "free_vram", n.memory.free_vram_bytes },
+                        { "has_gpu", n.memory.has_gpu },
+                    }},
+                    { "hardware", {
+                        { "backend", n.caps.gpu_backend },
+                        { "gpu_name", n.hardware.gpu_name },
+                        { "cpu_name", n.cpu.cpu_name },
+                        { "cpu_threads", n.hardware.cpu_threads },
+                        { "ram_gb", n.hardware.ram_gb },
+                        { "gpu_vram_gb", n.hardware.gpu_vram_gb },
+                    }},
+                    { "system", {
+                        { "os", n.system.os },
+                        { "arch", n.system.arch },
+                    }},
+                    { "performance", {
+                        { "score", n.performance.score },
+                        { "decode_tps", n.performance.decode_tps },
+                        { "prefill_tps", n.performance.prefill_tps },
+                        { "load_ms", n.performance.load_ms },
+                    }},
+                });
+            }
         }
         res.set_content(json({ { "nodes", nodes } }).dump(), "application/json");
+    });
+
+    svr.Get("/capacity", [](const httplib::Request &, httplib::Response & res) {
+        double ram_gb  = 0.0;
+        double vram_gb = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            for (const auto & kv : g_nodes) {
+                if (!kv.second.online) {
+                    continue;
+                }
+                ram_gb  += dist_bytes_to_gb(kv.second.memory.total_ram_bytes);
+                vram_gb += dist_bytes_to_gb(kv.second.memory.total_vram_bytes);
+            }
+        }
+        res.set_content(json({
+            { "cluster", {
+                { "ram_gb", ram_gb },
+                { "vram_gb", vram_gb },
+            }}
+        }).dump(), "application/json");
     });
 
     svr.Post("/session/create", [](const httplib::Request & req, httplib::Response & res) {
@@ -681,6 +846,7 @@ int main(int argc, char ** argv) {
         }
 
         const std::string model = body.value("model", "llama-3.2-1b");
+        const int request_ctx = body.value("n_ctx", g_n_ctx);
 
         std::map<std::string, dist_node_info> node_map;
         int n_layers = 0;
@@ -700,20 +866,55 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        std::vector<dist_planner_node> planner_nodes;
-        planner_nodes.reserve(node_map.size());
-        for (const auto & kv : node_map) {
-            planner_nodes.push_back({ kv.second.node_id, kv.second.score });
-        }
-
-        const auto assignments = dist_plan_layers(n_layers, planner_nodes);
-        if (assignments.empty()) {
-            res.status = 500;
-            res.set_content(R"({"error":"layer planning failed"})", "application/json");
+        const model_memory_requirements mem = get_model_memory(model, request_ctx);
+        if (!mem.valid()) {
+            res.status = 503;
+            res.set_content(json({ { "error", "failed to estimate model memory" } }).dump(), "application/json");
             return;
         }
 
-        const json planned = planned_layout_json(assignments);
+        std::vector<dist_node_info> node_vec;
+        node_vec.reserve(node_map.size());
+        for (const auto & kv : node_map) {
+            node_vec.push_back(kv.second);
+        }
+        const cluster_memory_fits_result fit = dist_check_cluster_memory_fit(mem, node_vec);
+
+        if (!fit.fits) {
+            res.status = 503;
+            json err = fit.to_json();
+            err["error"] = "model does not fit in cluster memory";
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        std::vector<dist_planner_node_resources> planner_nodes;
+        planner_nodes.reserve(node_map.size());
+        for (const auto & kv : node_map) {
+            const auto & n = kv.second;
+            dist_planner_node_resources r{};
+            r.node_id        = n.node_id;
+            r.score          = n.score;
+            r.backend        = n.caps.gpu_backend;
+            r.has_gpu        = n.memory.has_gpu;
+            r.cpu_budget_bytes = n.memory.free_ram_bytes;
+            r.gpu_budget_bytes = n.memory.free_vram_bytes;
+            planner_nodes.push_back(r);
+        }
+
+        const dist_planner_result plan = dist_plan_layers_memory_aware(mem, planner_nodes);
+        if (!plan.success) {
+            res.status = 503;
+            json err = fit.to_json();
+            err["error"] = plan.error;
+            err["planning_error"] = true;
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        dist_print_planner_report(model, mem, node_vec, fit, plan.assignments);
+
+        const json planned = planned_layout_json(plan.assignments);
 
         for (const auto & kv : node_map) {
             std::string herr;
@@ -733,7 +934,7 @@ int main(int argc, char ** argv) {
         session.model_path = g_model_path;
 
         std::string err;
-        if (!setup_pipeline(session.session_id, n_layers, assignments, node_map, session, err)) {
+        if (!setup_pipeline(session.session_id, n_layers, plan.assignments, node_map, session, err)) {
             res.status = 500;
             res.set_content(json({
                 { "error", err },
@@ -753,11 +954,286 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "\n");
 
-        res.set_content(json({
+        json response = {
             { "session_id", session.session_id },
             { "layout", layout_json(session) },
             { "pipeline", pipeline_json(session) },
-        }).dump(), "application/json");
+            { "memory", {
+                { "required_gb", mem.total_gb() },
+                { "weights_gb", mem.weights_gb() },
+                { "kv_gb", mem.kv_gb() },
+                { "compute_gb", mem.compute_gb() },
+                { "scratch_gb", mem.scratch_gb() },
+            }},
+        };
+        res.set_content(response.dump(), "application/json");
+    });
+
+    svr.Post("/planner/simulate", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+
+        const std::string model = body.value("model", "");
+        const int request_ctx = body.value("n_ctx", g_n_ctx);
+
+        if (model.empty()) {
+            res.status = 400;
+            res.set_content(R"({"error":"model is required"})", "application/json");
+            return;
+        }
+
+        std::map<std::string, dist_node_info> node_map;
+        int n_layers = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            for (const auto & kv : g_nodes) {
+                if (kv.second.online && kv.second.n_layer > 0) {
+                    node_map[kv.first] = kv.second;
+                    n_layers = std::max(n_layers, kv.second.n_layer);
+                }
+            }
+        }
+
+        if (node_map.empty()) {
+            res.status = 503;
+            res.set_content(json({ { "error", "no online nodes" } }).dump(), "application/json");
+            return;
+        }
+
+        const model_memory_requirements mem = get_model_memory(model, request_ctx);
+        if (!mem.valid()) {
+            res.status = 503;
+            res.set_content(json({ { "error", "failed to estimate model memory" } }).dump(), "application/json");
+            return;
+        }
+
+        std::vector<dist_node_info> node_vec;
+        node_vec.reserve(node_map.size());
+        for (const auto & kv : node_map) {
+            node_vec.push_back(kv.second);
+        }
+        const cluster_memory_fits_result fit = dist_check_cluster_memory_fit(mem, node_vec);
+
+        json response = fit.to_json();
+        response["model"] = model;
+        response["n_ctx"] = request_ctx;
+        response["memory"] = {
+            { "weights_gb", mem.weights_gb() },
+            { "kv_gb", mem.kv_gb() },
+            { "compute_gb", mem.compute_gb() },
+            { "scratch_gb", mem.scratch_gb() },
+            { "total_gb", mem.total_gb() },
+        };
+
+        if (!fit.fits) {
+            response["layout"] = json::array();
+            res.status = 503;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        std::vector<dist_planner_node_resources> planner_nodes;
+        planner_nodes.reserve(node_map.size());
+        for (const auto & kv : node_map) {
+            const auto & n = kv.second;
+            dist_planner_node_resources r{};
+            r.node_id        = n.node_id;
+            r.score          = n.score;
+            r.backend        = n.caps.gpu_backend;
+            r.has_gpu        = n.memory.has_gpu;
+            r.cpu_budget_bytes = n.memory.free_ram_bytes;
+            r.gpu_budget_bytes = n.memory.free_vram_bytes;
+            planner_nodes.push_back(r);
+        }
+
+        const dist_planner_result plan = dist_plan_layers_memory_aware(mem, planner_nodes);
+        if (!plan.success) {
+            response["fits"] = false;
+            response["error"] = plan.error;
+            res.status = 503;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        json layout = json::array();
+        for (const auto & a : plan.assignments) {
+            layout.push_back({
+                { "node", a.node_id },
+                { "layers", { a.layer_start, a.layer_end } },
+                { "device_hint", a.device_hint },
+            });
+        }
+        response["layout"] = layout;
+        res.set_content(response.dump(), "application/json");
+    });
+
+    svr.Get("/planner/explain", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model = req.get_param_value("model");
+        if (model.empty()) {
+            res.status = 400;
+            res.set_content(R"({"error":"model query parameter is required"})", "application/json");
+            return;
+        }
+
+        int request_ctx = g_n_ctx;
+        try {
+            request_ctx = std::stoi(req.get_param_value("n_ctx"));
+            if (request_ctx <= 0) {
+                request_ctx = g_n_ctx;
+            }
+        } catch (...) {
+            request_ctx = g_n_ctx;
+        }
+
+        std::map<std::string, dist_node_info> node_map;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            for (const auto & kv : g_nodes) {
+                if (kv.second.online && kv.second.n_layer > 0) {
+                    node_map[kv.first] = kv.second;
+                }
+            }
+        }
+
+        json response;
+        response["model"] = model;
+        response["n_ctx"] = request_ctx;
+
+        if (node_map.empty()) {
+            res.status = 503;
+            response["error"] = "no online nodes";
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        const model_memory_requirements mem = get_model_memory(model, request_ctx);
+        if (!mem.valid()) {
+            res.status = 503;
+            response["error"] = "failed to estimate model memory";
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        std::vector<dist_node_info> node_vec;
+        node_vec.reserve(node_map.size());
+        for (const auto & kv : node_map) {
+            node_vec.push_back(kv.second);
+        }
+        const cluster_memory_fits_result fit = dist_check_cluster_memory_fit(mem, node_vec);
+
+        response["memory"] = {
+            { "weights_gb", mem.weights_gb() },
+            { "kv_gb", mem.kv_gb() },
+            { "compute_gb", mem.compute_gb() },
+            { "scratch_gb", mem.scratch_gb() },
+            { "total_gb", mem.total_gb() },
+        };
+        response["fits"]       = fit.fits;
+        response["required_gb"] = fit.required_gb;
+        response["available_gb"] = fit.available_gb;
+        response["missing_gb"]   = fit.missing_gb;
+
+        std::vector<dist_planner_node_resources> planner_nodes;
+        planner_nodes.reserve(node_map.size());
+        for (const auto & kv : node_map) {
+            const auto & n = kv.second;
+            dist_planner_node_resources r{};
+            r.node_id        = n.node_id;
+            r.score          = n.score;
+            r.backend        = n.caps.gpu_backend;
+            r.has_gpu        = n.memory.has_gpu;
+            r.cpu_budget_bytes = n.memory.free_ram_bytes;
+            r.gpu_budget_bytes = n.memory.free_vram_bytes;
+            planner_nodes.push_back(r);
+        }
+
+        const dist_planner_result plan = dist_plan_layers_memory_aware(mem, planner_nodes);
+
+        json nodes_json = json::array();
+        json layout_json = json::array();
+        std::ostringstream explanation;
+        explanation.precision(1);
+        explanation << std::fixed;
+
+        explanation << "Model " << model << " requires " << mem.total_gb()
+                    << " GB (weights " << mem.weights_gb()
+                    << " GB, KV " << mem.kv_gb()
+                    << " GB, compute " << mem.compute_gb()
+                    << " GB, scratch " << mem.scratch_gb()
+                    << " GB).\n";
+
+        if (!fit.fits) {
+            explanation << "The cluster is short by " << fit.missing_gb
+                        << " GB of primary execution memory.\n";
+        }
+
+        for (const auto & n : planner_nodes) {
+            const double ram_gb  = dist_bytes_to_gb(n.cpu_budget_bytes);
+            const double vram_gb = dist_bytes_to_gb(n.gpu_budget_bytes);
+            const double budget_gb = n.has_gpu ? vram_gb : ram_gb;
+            const char * budget_kind = n.has_gpu ? "VRAM" : "RAM";
+
+            int assigned_start = -1;
+            int assigned_end   = -1;
+            std::string device_hint = n.has_gpu ? "gpu" : "cpu";
+            for (const auto & a : plan.assignments) {
+                if (a.node_id == n.node_id) {
+                    assigned_start = a.layer_start;
+                    assigned_end   = a.layer_end;
+                    device_hint    = a.device_hint;
+                    break;
+                }
+            }
+
+            json nj = {
+                { "node_id", n.node_id },
+                { "score", n.score },
+                { "backend", n.backend },
+                { "free_ram_gb", ram_gb },
+                { "free_vram_gb", vram_gb },
+                { "primary_budget_gb", budget_gb },
+                { "primary_budget_kind", budget_kind },
+                { "assigned_layers_start", assigned_start },
+                { "assigned_layers_end", assigned_end },
+                { "assigned_layer_count", assigned_end >= 0 ? assigned_end - assigned_start : 0 },
+                { "assigned_device", device_hint },
+            };
+            nodes_json.push_back(nj);
+
+            explanation << "Node " << n.node_id
+                        << " (" << n.backend << ") has " << budget_gb
+                        << " GB " << budget_kind << " budget";
+            if (plan.success && assigned_end > assigned_start) {
+                explanation << " and runs layers " << assigned_start
+                            << "-" << assigned_end << " on " << device_hint;
+                layout_json.push_back({
+                    { "node", n.node_id },
+                    { "layers", { assigned_start, assigned_end } },
+                    { "device_hint", device_hint },
+                });
+            } else if (!plan.success) {
+                explanation << " but could not be assigned any layer within budget";
+            } else {
+                explanation << " and was not used";
+            }
+            explanation << ".\n";
+        }
+
+        response["nodes"] = nodes_json;
+        response["layout"] = layout_json;
+        response["explanation"] = explanation.str();
+
+        if (!plan.success) {
+            res.status = 503;
+            response["error"] = plan.error;
+        }
+        res.set_content(response.dump(), "application/json");
     });
 
     svr.Post("/session/generate", [](const httplib::Request & req, httplib::Response & res) {

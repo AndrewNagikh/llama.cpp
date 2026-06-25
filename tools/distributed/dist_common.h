@@ -11,11 +11,39 @@ enum dist_node_role : uint32_t {
     DIST_ROLE_FINAL        = 3,
 };
 
+struct dist_node_memory {
+    uint64_t total_ram_bytes  = 0;
+    uint64_t free_ram_bytes   = 0;
+    uint64_t total_vram_bytes = 0;
+    uint64_t free_vram_bytes  = 0;
+    bool     has_gpu          = false;
+};
+
+struct dist_node_cpu {
+    std::string cpu_name;
+    int         physical_cores = 0;
+    int         logical_cores  = 0;
+    uint64_t    cache_l3_bytes = 0;
+};
+
+struct dist_node_system {
+    std::string os;
+    std::string arch;
+};
+
 struct dist_node_hardware {
     int32_t     cpu_threads   = 4;
     int32_t     ram_gb        = 0;
     std::string gpu_name      = "none";
     int32_t     gpu_vram_gb   = 0;
+    std::string cpu_name;
+    std::string backend       = "cpu";
+    bool        has_gpu       = false;
+
+    // Legacy compatibility: also expose byte-level memory.
+    dist_node_memory memory;
+    dist_node_cpu    cpu;
+    dist_node_system system;
 };
 
 struct dist_node_capabilities {
@@ -24,6 +52,17 @@ struct dist_node_capabilities {
     int32_t     gpu_memory_mb = 0;
     int32_t     cpu_threads   = 4;
     std::vector<std::string> supported_arch = { "llama" };
+
+    // Byte-level memory (Task 8).
+    uint64_t total_ram_bytes  = 0;
+    uint64_t free_ram_bytes   = 0;
+    uint64_t total_vram_bytes = 0;
+    uint64_t free_vram_bytes  = 0;
+    bool     has_gpu          = false;
+
+    std::string cpu_name;
+    std::string os;
+    std::string arch;
 };
 
 struct dist_node_performance {
@@ -46,6 +85,9 @@ struct dist_node_info {
     int64_t     last_seen   = 0;
     dist_node_hardware hardware;
     dist_node_capabilities caps;
+    dist_node_memory memory;
+    dist_node_cpu    cpu;
+    dist_node_system system;
     bool online = true;
 };
 
@@ -89,6 +131,15 @@ static constexpr int DIST_MAX_NEW_TOKENS = 32;
 
 bool dist_parse_host_port(const std::string & listen, std::string & host, int & port);
 std::string dist_role_name(dist_node_role role);
+
+// Legacy probes (kept for compatibility).
 dist_node_capabilities dist_probe_capabilities();
 void dist_probe_memory(int64_t & total_mb, int64_t & free_mb);
+
+// Task 8: full node resource probe.
+void dist_probe_node_memory(dist_node_memory & out);
+void dist_probe_node_cpu(dist_node_cpu & out);
+dist_node_system dist_probe_node_system();
+double dist_bytes_to_gb(uint64_t bytes);
+
 int64_t dist_now_unix();
