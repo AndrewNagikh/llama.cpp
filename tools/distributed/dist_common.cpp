@@ -98,8 +98,23 @@ void dist_probe_node_memory(dist_node_memory & out) {
         mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
         if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
                 reinterpret_cast<host_info64_t>(&vm), &count) == KERN_SUCCESS) {
-            const int64_t free_pages = (int64_t) vm.free_count + (int64_t) vm.purgeable_count;
-            out.free_ram_bytes = static_cast<uint64_t>(free_pages * (int64_t) page_size);
+            const uint64_t ps = static_cast<uint64_t>(page_size);
+
+            // Do not use vm.free_count alone: on macOS it is only the tiny pool of
+            // completely unused pages. Most reclaimable memory lives in inactive and
+            // purgeable caches. The formula below matches macOS memory_pressure's
+            // "system-wide memory free percentage" (total minus wired/compressed).
+            const uint64_t pinned_pages = static_cast<uint64_t>(vm.wire_count) +
+                                          static_cast<uint64_t>(vm.compressor_page_count);
+            if (out.total_ram_bytes > pinned_pages * ps) {
+                out.free_ram_bytes = out.total_ram_bytes - pinned_pages * ps;
+            } else {
+                const uint64_t reclaimable_pages = static_cast<uint64_t>(vm.free_count) +
+                                                   static_cast<uint64_t>(vm.inactive_count) +
+                                                   static_cast<uint64_t>(vm.speculative_count) +
+                                                   static_cast<uint64_t>(vm.purgeable_count);
+                out.free_ram_bytes = reclaimable_pages * ps;
+            }
         }
     }
 #elif defined(_WIN32)
@@ -110,11 +125,8 @@ void dist_probe_node_memory(dist_node_memory & out) {
         out.free_ram_bytes  = status.ullAvailPhys;
     }
 #else
-    struct sysinfo info{};
-    if (sysinfo(&info) == 0) {
-        out.total_ram_bytes = static_cast<uint64_t>(info.totalram) * info.mem_unit;
-        out.free_ram_bytes  = static_cast<uint64_t>(info.freeram)  * info.mem_unit;
-    } else {
+    // Prefer MemAvailable from /proc/meminfo; it includes reclaimable cache.
+    {
         std::ifstream f("/proc/meminfo");
         if (f) {
             std::string key;
@@ -128,6 +140,13 @@ void dist_probe_node_memory(dist_node_memory & out) {
                 std::string rest;
                 std::getline(f, rest);
             }
+        }
+    }
+    if (out.total_ram_bytes == 0 || out.free_ram_bytes == 0) {
+        struct sysinfo info{};
+        if (sysinfo(&info) == 0) {
+            out.total_ram_bytes = static_cast<uint64_t>(info.totalram) * info.mem_unit;
+            out.free_ram_bytes  = static_cast<uint64_t>(info.freeram)  * info.mem_unit;
         }
     }
 #endif

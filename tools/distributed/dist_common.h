@@ -13,6 +13,7 @@ enum dist_node_role : uint32_t {
 
 struct dist_node_memory {
     uint64_t total_ram_bytes  = 0;
+    // Available RAM for budgeting (not merely "free" pages).
     uint64_t free_ram_bytes   = 0;
     uint64_t total_vram_bytes = 0;
     uint64_t free_vram_bytes  = 0;

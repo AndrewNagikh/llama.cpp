@@ -120,6 +120,10 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-capacity-api PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-capacity-api PRIVATE llama llama-common cpp-httplib Threads::Threads)
 
+    add_executable(test-probe-memory test-probe-memory.cpp dist_common.cpp)
+    target_include_directories(test-probe-memory PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-probe-memory PRIVATE llama Threads::Threads)
+
     set(MODEL_REGISTRY_SOURCES
         orchestrator/model_registry.cpp
         orchestrator/model_provider/model_provider.cpp
