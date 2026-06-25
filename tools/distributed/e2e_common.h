@@ -128,14 +128,18 @@ inline std::string model_basename(const std::string & gguf_path) {
 }
 
 inline bool register_model(const std::string & orch, const std::string & model_id,
-        const std::string & gguf_path, std::string & err) {
+        const std::string & gguf_path, std::string & err,
+        const std::string & repository = "") {
     json out;
     int status = 0;
+    const std::string repo = repository.empty()
+            ? ("hugging-quants/" + model_id + "-GGUF")
+            : repository;
     json body = {
         { "model_id", model_id },
         { "display_name", model_id },
         { "source", "huggingface" },
-        { "repository", "hugging-quants/" + model_id + "-GGUF" },
+        { "repository", repo },
         { "filename", model_basename(gguf_path) },
         { "revision", "main" },
     };
@@ -145,6 +149,36 @@ inline bool register_model(const std::string & orch, const std::string & model_i
     }
     if (out.value("status", "") != "DISCOVERED") {
         err = "unexpected status after register: " + out.value("status", "");
+        return false;
+    }
+    return true;
+}
+
+inline bool discover_model(const std::string & orch, const std::string & model_id,
+        std::string & err, int expected_files = 1) {
+    json out;
+    int status = 0;
+    if (!http_post(orch, "/models/" + model_id + "/discover", json({}), out, status, 120) || status != 200) {
+        err = "discover request failed status=" + std::to_string(status) + " body=" + out.dump();
+        return false;
+    }
+    if (out.value("status", "") != "ok") {
+        err = "unexpected discover status: " + out.dump();
+        return false;
+    }
+    if (out.value("files", 0) < expected_files) {
+        err = "discover returned too few files: " + out.dump();
+        return false;
+    }
+
+    json model;
+    int gs = 0;
+    if (!http_get(orch, "/models/" + model_id, model, gs, 15) || gs != 200) {
+        err = "get model after discovery failed status=" + std::to_string(gs);
+        return false;
+    }
+    if (model.value("status", "") != "MANIFEST_PENDING") {
+        err = "unexpected registry status after discovery: " + model.value("status", "");
         return false;
     }
     return true;

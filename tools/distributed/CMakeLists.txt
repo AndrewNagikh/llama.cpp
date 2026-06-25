@@ -14,6 +14,8 @@ set(DIST_COMMON_SOURCES
     dist_common.cpp
     model_catalog.cpp
     orchestrator/model_registry.cpp
+    orchestrator/model_provider/model_provider.cpp
+    orchestrator/model_provider/huggingface_provider.cpp
     node_core.cpp
 )
 
@@ -117,19 +119,62 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-capacity-api PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-capacity-api PRIVATE llama llama-common cpp-httplib Threads::Threads)
 
+    set(MODEL_REGISTRY_SOURCES
+        orchestrator/model_registry.cpp
+        orchestrator/model_provider/model_provider.cpp
+        orchestrator/model_provider/huggingface_provider.cpp
+    )
+    set(MODEL_REGISTRY_LINK_LIBS cpp-httplib Threads::Threads)
+
     # Task 9.1 model registry tests
-    add_executable(test-model-registry test-model-registry.cpp orchestrator/model_registry.cpp)
+    add_executable(test-model-registry test-model-registry.cpp ${MODEL_REGISTRY_SOURCES})
     target_include_directories(test-model-registry PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(test-model-registry PRIVATE cxx_std_17)
-    target_link_libraries(test-model-registry PRIVATE Threads::Threads)
+    target_link_libraries(test-model-registry PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
 
-    add_executable(test-model-status test-model-status.cpp orchestrator/model_registry.cpp)
+    add_executable(test-model-status test-model-status.cpp ${MODEL_REGISTRY_SOURCES})
     target_include_directories(test-model-status PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(test-model-status PRIVATE cxx_std_17)
-    target_link_libraries(test-model-status PRIVATE Threads::Threads)
+    target_link_libraries(test-model-status PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
 
-    add_executable(test-model-api test-model-api.cpp orchestrator/model_registry.cpp)
+    add_executable(test-model-api test-model-api.cpp ${MODEL_REGISTRY_SOURCES})
     target_include_directories(test-model-api PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(test-model-api PRIVATE cxx_std_17)
-    target_link_libraries(test-model-api PRIVATE cpp-httplib Threads::Threads)
+    target_link_libraries(test-model-api PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    # Task 9.2 remote model discovery tests
+    add_executable(test-provider-interface test-provider-interface.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-provider-interface PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-provider-interface PRIVATE cxx_std_17)
+    target_link_libraries(test-provider-interface PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-discovery-result test-discovery-result.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-discovery-result PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-discovery-result PRIVATE cxx_std_17)
+    target_link_libraries(test-discovery-result PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-registry-discovery test-registry-discovery.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-registry-discovery PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-registry-discovery PRIVATE cxx_std_17)
+    target_link_libraries(test-registry-discovery PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-huggingface-provider test-huggingface-provider.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-huggingface-provider PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-huggingface-provider PRIVATE cxx_std_17)
+    target_link_libraries(test-huggingface-provider PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-model-discovery test-model-discovery.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-model-discovery PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-model-discovery PRIVATE cxx_std_17)
+    target_link_libraries(test-model-discovery PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-discovery-errors test-discovery-errors.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-discovery-errors PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-discovery-errors PRIVATE cxx_std_17)
+    target_link_libraries(test-discovery-errors PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-discovery-update test-discovery-update.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-discovery-update PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-discovery-update PRIVATE cxx_std_17)
+    target_link_libraries(test-discovery-update PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
 endif()

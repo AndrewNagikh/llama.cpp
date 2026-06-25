@@ -19,6 +19,7 @@ int main() {
 
 int main(int argc, char ** argv) {
     const std::string model_id = "llama-3.2-1b";
+    const std::string repository = "hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF";
     const std::string dir  = e2e::exe_dir(argv[0]);
     const std::string logs = e2e::log_dir() + "/install-reuse";
     std::filesystem::create_directories(logs);
@@ -65,8 +66,21 @@ int main(int argc, char ** argv) {
     }
     e2e::wait_http_ok("http://127.0.0.1:" + std::to_string(port_a), 200);
 
-    // First install -> ready.
+    // Register and discover the model before installing.
     std::string err;
+    if (!e2e::register_model(orch_url, model_id, gguf_abs, err, repository)) {
+        fprintf(stderr, "FAIL: model registration: %s\n", err.c_str());
+        cleanup();
+        return 1;
+    }
+    std::string disc_err;
+    if (!e2e::discover_model(orch_url, model_id, disc_err, 1)) {
+        fprintf(stderr, "FAIL: model discovery: %s\n", disc_err.c_str());
+        cleanup();
+        return 1;
+    }
+
+    // First install -> ready.
     if (!e2e::install_and_wait_ready(orch_url, model_id, 1, err)) {
         fprintf(stderr, "FAIL: first install did not complete: %s\n", err.c_str());
         cleanup();

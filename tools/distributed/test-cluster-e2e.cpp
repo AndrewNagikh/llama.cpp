@@ -170,10 +170,12 @@ int main(int argc, char ** argv) {
         e2e::wait_http_ok("http://127.0.0.1:" + std::to_string(port_c), 200);
     }
 
+    const std::string repository = "hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF";
+
     // ----- Stage 2.5: Model registry registration (Task 9.1) ------------
     {
         std::string err;
-        bool ok = e2e::register_model(orch_url, model_id, gguf_abs, err);
+        bool ok = e2e::register_model(orch_url, model_id, gguf_abs, err, repository);
 
         json mout;
         int ms = 0;
@@ -183,6 +185,18 @@ int main(int argc, char ** argv) {
         add("Model registry", ok, ok ? "registered and DISCOVERED" : err);
         if (!ok) {
             fprintf(stderr, "FAIL: model registry stage (%s)\n", err.c_str());
+            kill_all();
+            return finish(false);
+        }
+    }
+
+    // ----- Stage 2.75: Remote model discovery (Task 9.2) ----------------
+    {
+        std::string err;
+        const bool ok = e2e::discover_model(orch_url, model_id, err, 1);
+        add("Remote discovery", ok, ok ? "registry MANIFEST_PENDING" : err);
+        if (!ok) {
+            fprintf(stderr, "FAIL: remote discovery stage (%s)\n", err.c_str());
             kill_all();
             return finish(false);
         }
@@ -363,8 +377,14 @@ int main(int argc, char ** argv) {
         // The registry is in-memory; after an orchestrator restart the model
         // must be registered again before Session Create can succeed.
         std::string err;
-        if (!e2e::register_model(orch_url, model_id, gguf_abs, err)) {
+        if (!e2e::register_model(orch_url, model_id, gguf_abs, err, repository)) {
             add("Restart registry", false, err);
+            kill_all();
+            return finish(false);
+        }
+
+        if (!e2e::discover_model(orch_url, model_id, err, 1)) {
+            add("Restart discovery", false, err);
             kill_all();
             return finish(false);
         }

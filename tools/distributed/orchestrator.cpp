@@ -1627,8 +1627,48 @@ int main(int argc, char ** argv) {
         res.set_content(response.dump(), "application/json");
     });
 
+    // POST /models/{model_id}/discover - Trigger remote discovery for a model.
+    svr.Post(R"(/models/([^/]+)/discover)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+
+        dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+
+        const std::string provider_name = record->source.empty() ? "huggingface" : record->source;
+        auto provider = create_model_provider(provider_name);
+        if (!provider) {
+            res.status = 400;
+            res.set_content(json({ { "error", "unknown provider: " + provider_name } }).dump(), "application/json");
+            return;
+        }
+
+        const auto result = provider->discover(*record);
+        if (!result.success) {
+            res.status = 502;
+            res.set_content(json({ { "error", result.error } }).dump(), "application/json");
+            return;
+        }
+
+        if (!g_registry.apply_discovery(model_id, result, record)) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+
+        res.set_content(json({
+            { "status", "ok" },
+            { "provider", result.provider },
+            { "files", static_cast<int>(result.files.size()) },
+            { "revision", result.revision }
+        }).dump(), "application/json");
+    });
+
     // GET /models/{model_id} - Return one registered model.
-    svr.Get(R"(/models/(.+))", [](const httplib::Request & req, httplib::Response & res) {
+    svr.Get(R"(/models/([^/]+))", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.matches[1];
         const auto * record = g_registry.find(model_id);
         if (!record) {
@@ -1640,7 +1680,7 @@ int main(int argc, char ** argv) {
     });
 
     // DELETE /models/{model_id} - Remove a registered model.
-    svr.Delete(R"(/models/(.+))", [](const httplib::Request & req, httplib::Response & res) {
+    svr.Delete(R"(/models/([^/]+))", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.matches[1];
         if (g_registry.remove(model_id)) {
             res.set_content(json({ { "ok", true } }).dump(), "application/json");

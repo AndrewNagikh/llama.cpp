@@ -168,6 +168,40 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Task 9.2: run remote discovery before creating a session.
+    const auto disc_res = cli.Post("/models/" + model_id + "/discover", "", "application/json");
+    if (!disc_res || disc_res->status != 200) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: /models/{id}/discover failed status=%d\n",
+                disc_res ? disc_res->status : 0);
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+    json disc_out = json::parse(disc_res->body);
+    if (disc_out.value("status", "") != "ok" || disc_out.value("files", 0) == 0) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: discovery failed %s\n",
+                disc_out.dump().c_str());
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+
+    const auto get2_res = cli.Get("/models/" + model_id);
+    if (!get2_res || get2_res->status != 200) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: GET /models/{id} after discovery failed\n");
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+    json get2_out = json::parse(get2_res->body);
+    if (get2_out.value("status", "") != "MANIFEST_PENDING") {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: model status is not MANIFEST_PENDING\n");
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+    if (!get2_out.contains("files") || get2_out["files"].empty()) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: registry has no files after discovery\n");
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+
     const auto create = cli.Post("/session/create",
             std::string("{\"model\":\"") + model_id + "\"}", "application/json");
     if (!create || create->status != 200) {

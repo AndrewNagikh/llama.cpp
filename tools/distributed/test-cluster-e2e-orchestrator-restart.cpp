@@ -19,6 +19,7 @@ int main() {
 
 int main(int argc, char ** argv) {
     const std::string model_id = "llama-3.2-1b";
+    const std::string repository = "hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF";
     const std::string dir  = e2e::exe_dir(argv[0]);
     const std::string logs = e2e::log_dir() + "/orch-restart";
     std::filesystem::create_directories(logs);
@@ -83,6 +84,18 @@ int main(int argc, char ** argv) {
     }
 
     std::string err;
+    if (!e2e::register_model(orch_url, model_id, gguf_abs, err, repository)) {
+        fprintf(stderr, "FAIL: model registration: %s\n", err.c_str());
+        cleanup();
+        return 1;
+    }
+    std::string disc_err;
+    if (!e2e::discover_model(orch_url, model_id, disc_err, 1)) {
+        fprintf(stderr, "FAIL: model discovery: %s\n", disc_err.c_str());
+        cleanup();
+        return 1;
+    }
+
     if (!e2e::install_and_wait_ready(orch_url, model_id, 3, err)) {
         fprintf(stderr, "FAIL: install did not complete: %s\n", err.c_str());
         cleanup();

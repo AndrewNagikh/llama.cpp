@@ -2,9 +2,30 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 
 using json = nlohmann::json;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+static std::string format_time(const std::chrono::system_clock::time_point & tp) {
+    const std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+    return oss.str();
+}
 
 // ---------------------------------------------------------------------------
 // Model status
@@ -61,16 +82,31 @@ model_manifest model_manifest::from_json(const json & /*j*/) {
 // ---------------------------------------------------------------------------
 
 json dist_model_record::to_json() const {
+    json files_json = json::array();
+    for (const auto & f : files) {
+        files_json.push_back(f.to_json());
+    }
+
     json j = {
         { "model_id",    model_id },
         { "display_name", display_name },
+        { "provider",     source },
         { "source",       source },
         { "repository",   repository },
         { "filename",     filename },
         { "revision",     revision },
         { "architecture", architecture },
         { "status",       dist_model_status_to_string(status) },
+        { "files",        files_json },
+        { "provider_revision", provider_revision },
+        { "provider_etag",     provider_etag },
     };
+
+    if (last_discovery.time_since_epoch().count() > 0) {
+        j["last_discovery"] = format_time(last_discovery);
+    } else {
+        j["last_discovery"] = nullptr;
+    }
 
     if (manifest.has_value()) {
         j["manifest"] = manifest->to_json();
@@ -99,6 +135,15 @@ dist_model_record dist_model_record_from_json(const json & j) {
     } else {
         r.manifest = std::nullopt;
     }
+
+    if (j.contains("files") && j["files"].is_array()) {
+        r.files.clear();
+        for (const auto & item : j["files"]) {
+            r.files.push_back(remote_model_file::from_json(item));
+        }
+    }
+    r.provider_revision = j.value("provider_revision", "");
+    r.provider_etag     = j.value("provider_etag", "");
 
     return r;
 }
@@ -148,4 +193,27 @@ std::vector<dist_model_record> cluster_model_registry::list() const {
         result.push_back(kv.second);
     }
     return result;
+}
+
+bool cluster_model_registry::apply_discovery(
+        const std::string & model_id,
+        const provider_discovery_result & result,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    dist_model_record & r = it->second;
+    r.files             = result.files;
+    r.provider_revision = result.revision;
+    r.provider_etag     = result.revision; // version marker
+    r.last_discovery    = std::chrono::system_clock::now();
+    r.status            = dist_model_status::manifest_pending;
+
+    if (out) {
+        *out = r;
+    }
+    return true;
 }

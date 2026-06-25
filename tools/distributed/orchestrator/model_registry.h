@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -7,6 +8,7 @@
 #include <vector>
 
 #include "nlohmann/json.hpp"
+#include "model_provider/model_provider.h"
 
 // ---------------------------------------------------------------------------
 // Cluster Model Registry – Task 9.1
@@ -50,6 +52,12 @@ struct dist_model_record {
     dist_model_status status = dist_model_status::discovered;
     std::optional<model_manifest> manifest;
 
+    // Task 9.2: remote discovery metadata
+    std::vector<remote_model_file> files;
+    std::string provider_revision;
+    std::string provider_etag;
+    std::chrono::system_clock::time_point last_discovery;
+
     nlohmann::json to_json() const;
 };
 
@@ -71,6 +79,14 @@ public:
 
     // Return all registered models.
     std::vector<dist_model_record> list() const;
+
+    // Merge a successful provider discovery result into an existing record.
+    // Sets status to MANIFEST_PENDING and updates files / provider revision.
+    // Returns false if the model_id is not known.
+    bool apply_discovery(
+            const std::string & model_id,
+            const provider_discovery_result & result,
+            dist_model_record * out = nullptr);
 
 private:
     mutable std::mutex mutex_;
