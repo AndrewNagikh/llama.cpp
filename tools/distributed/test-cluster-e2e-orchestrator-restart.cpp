@@ -95,6 +95,12 @@ int main(int argc, char ** argv) {
         cleanup();
         return 1;
     }
+    std::string manifest_err;
+    if (!e2e::build_manifest(orch_url, model_id, manifest_err)) {
+        fprintf(stderr, "FAIL: manifest build: %s\n", manifest_err.c_str());
+        cleanup();
+        return 1;
+    }
 
     if (!e2e::install_and_wait_ready(orch_url, model_id, 3, err)) {
         fprintf(stderr, "FAIL: install did not complete: %s\n", err.c_str());

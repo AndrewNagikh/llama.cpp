@@ -3,6 +3,7 @@
 #include "memory_estimator.h"
 #include "model_catalog.h"
 #include "orchestrator/model_registry.h"
+#include "orchestrator/manifest_builder/manifest_builder.h"
 #include "split_gen_common.h"
 #include "split_tcp_wire.h"
 
@@ -1665,6 +1666,58 @@ int main(int argc, char ** argv) {
             { "files", static_cast<int>(result.files.size()) },
             { "revision", result.revision }
         }).dump(), "application/json");
+    });
+
+    // POST /models/{model_id}/manifest - Build GGUF manifest (metadata only).
+    svr.Post(R"(/models/([^/]+)/manifest)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+
+        dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+
+        const auto build = build_manifest_for_record(*record, g_models_dir, g_model_path);
+        if (!build.success) {
+            res.status = 502;
+            res.set_content(json({ { "error", build.error } }).dump(), "application/json");
+            return;
+        }
+
+        if (!g_registry.apply_manifest(model_id, build.manifest, record)) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+
+        res.set_content(json({
+            { "status", "ok" },
+            { "architecture", build.manifest.architecture },
+            { "n_layer", build.manifest.n_layer },
+            { "n_ctx", build.manifest.n_ctx },
+            { "tensors", static_cast<int>(build.manifest.tensors.size()) },
+            { "layers", static_cast<int>(build.manifest.layers.size()) },
+            { "metadata_bytes_read", build.bytes_read },
+        }).dump(), "application/json");
+    });
+
+    // GET /models/{model_id}/manifest - Return the stored manifest.
+    svr.Get(R"(/models/([^/]+)/manifest)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        const auto * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (record->status != dist_model_status::manifest_ready || !record->manifest.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "manifest not ready" } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(record->manifest->to_json().dump(), "application/json");
     });
 
     // GET /models/{model_id} - Return one registered model.

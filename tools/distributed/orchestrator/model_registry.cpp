@@ -65,19 +65,6 @@ dist_model_status dist_model_status_from_string(const std::string & s) {
 }
 
 // ---------------------------------------------------------------------------
-// Manifest
-// ---------------------------------------------------------------------------
-
-json model_manifest::to_json() const {
-    return json::object();
-}
-
-model_manifest model_manifest::from_json(const json & /*j*/) {
-    // Task 9.1: manifest is intentionally empty. Parsing always succeeds.
-    return model_manifest{};
-}
-
-// ---------------------------------------------------------------------------
 // Record
 // ---------------------------------------------------------------------------
 
@@ -211,6 +198,27 @@ bool cluster_model_registry::apply_discovery(
     r.provider_etag     = result.revision; // version marker
     r.last_discovery    = std::chrono::system_clock::now();
     r.status            = dist_model_status::manifest_pending;
+
+    if (out) {
+        *out = r;
+    }
+    return true;
+}
+
+bool cluster_model_registry::apply_manifest(
+        const std::string & model_id,
+        const model_manifest & manifest,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    dist_model_record & r = it->second;
+    r.manifest     = manifest;
+    r.architecture = manifest.architecture;
+    r.status       = dist_model_status::manifest_ready;
 
     if (out) {
         *out = r;

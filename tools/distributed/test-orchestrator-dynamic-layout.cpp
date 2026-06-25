@@ -202,6 +202,35 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Task 9.3: build GGUF manifest before creating a session.
+    const auto manifest_res = cli.Post("/models/" + model_id + "/manifest", "", "application/json");
+    if (!manifest_res || manifest_res->status != 200) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: /models/{id}/manifest failed status=%d\n",
+                manifest_res ? manifest_res->status : 0);
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+    json manifest_out = json::parse(manifest_res->body);
+    if (manifest_out.value("status", "") != "ok" || manifest_out.value("n_layer", 0) == 0) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: manifest build failed %s\n",
+                manifest_out.dump().c_str());
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+
+    const auto get3_res = cli.Get("/models/" + model_id);
+    if (!get3_res || get3_res->status != 200) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: GET /models/{id} after manifest failed\n");
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+    json get3_out = json::parse(get3_res->body);
+    if (get3_out.value("status", "") != "MANIFEST_READY") {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: model status is not MANIFEST_READY\n");
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+
     const auto create = cli.Post("/session/create",
             std::string("{\"model\":\"") + model_id + "\"}", "application/json");
     if (!create || create->status != 200) {

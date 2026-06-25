@@ -202,6 +202,23 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // ----- Stage 2.8: GGUF manifest build (Task 9.3) ---------------------
+    {
+        std::string err;
+        uint64_t file_size = 0;
+        const bool ok = e2e::build_manifest(orch_url, model_id, err, &file_size);
+        std::string detail = ok ? "MANIFEST_READY, metadata only" : err;
+        if (ok && file_size > 0) {
+            detail += " (file_size=" + std::to_string(file_size) + ")";
+        }
+        add("Manifest build", ok, detail);
+        if (!ok) {
+            fprintf(stderr, "FAIL: manifest build stage (%s)\n", err.c_str());
+            kill_all();
+            return finish(false);
+        }
+    }
+
     // ----- Stage 3: Model install ----------------------------------------
     {
         std::string err;
@@ -385,6 +402,12 @@ int main(int argc, char ** argv) {
 
         if (!e2e::discover_model(orch_url, model_id, err, 1)) {
             add("Restart discovery", false, err);
+            kill_all();
+            return finish(false);
+        }
+
+        if (!e2e::build_manifest(orch_url, model_id, err)) {
+            add("Restart manifest", false, err);
             kill_all();
             return finish(false);
         }

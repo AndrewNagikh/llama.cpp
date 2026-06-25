@@ -16,6 +16,7 @@ set(DIST_COMMON_SOURCES
     orchestrator/model_registry.cpp
     orchestrator/model_provider/model_provider.cpp
     orchestrator/model_provider/huggingface_provider.cpp
+    orchestrator/manifest_builder/manifest_builder.cpp
     node_core.cpp
 )
 
@@ -123,8 +124,9 @@ if (LLAMA_BUILD_TESTS)
         orchestrator/model_registry.cpp
         orchestrator/model_provider/model_provider.cpp
         orchestrator/model_provider/huggingface_provider.cpp
+        orchestrator/manifest_builder/manifest_builder.cpp
     )
-    set(MODEL_REGISTRY_LINK_LIBS cpp-httplib Threads::Threads)
+    set(MODEL_REGISTRY_LINK_LIBS cpp-httplib llama Threads::Threads)
 
     # Task 9.1 model registry tests
     add_executable(test-model-registry test-model-registry.cpp ${MODEL_REGISTRY_SOURCES})
@@ -177,4 +179,45 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-discovery-update PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(test-discovery-update PRIVATE cxx_std_17)
     target_link_libraries(test-discovery-update PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    # Task 9.3 GGUF manifest builder tests
+    add_executable(test-gguf-header test-gguf-header.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-gguf-header PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-gguf-header PRIVATE cxx_std_17)
+    target_link_libraries(test-gguf-header PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-gguf-metadata test-gguf-metadata.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-gguf-metadata PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-gguf-metadata PRIVATE cxx_std_17)
+    target_link_libraries(test-gguf-metadata PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-tensor-directory test-tensor-directory.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-tensor-directory PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-tensor-directory PRIVATE cxx_std_17)
+    target_link_libraries(test-tensor-directory PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-layer-descriptor test-layer-descriptor.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-layer-descriptor PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-layer-descriptor PRIVATE cxx_std_17)
+    target_link_libraries(test-layer-descriptor PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-manifest-builder test-manifest-builder.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-manifest-builder PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-manifest-builder PRIVATE cxx_std_17)
+    target_link_libraries(test-manifest-builder PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-build-manifest test-build-manifest.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-build-manifest PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-build-manifest PRIVATE cxx_std_17)
+    target_link_libraries(test-build-manifest PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-manifest-refresh test-manifest-refresh.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-manifest-refresh PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-manifest-refresh PRIVATE cxx_std_17)
+    target_link_libraries(test-manifest-refresh PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-corrupted-header test-corrupted-header.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-corrupted-header PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-corrupted-header PRIVATE cxx_std_17)
+    target_link_libraries(test-corrupted-header PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
 endif()

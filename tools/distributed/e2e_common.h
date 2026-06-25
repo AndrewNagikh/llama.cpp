@@ -184,6 +184,80 @@ inline bool discover_model(const std::string & orch, const std::string & model_i
     return true;
 }
 
+inline bool build_manifest(const std::string & orch, const std::string & model_id,
+        std::string & err, uint64_t * file_size_out = nullptr) {
+    json out;
+    int status = 0;
+    if (!http_post(orch, "/models/" + model_id + "/manifest", json({}), out, status, 120) || status != 200) {
+        err = "manifest build failed status=" + std::to_string(status) + " body=" + out.dump();
+        return false;
+    }
+    if (out.value("status", "") != "ok") {
+        err = "unexpected manifest build status: " + out.dump();
+        return false;
+    }
+    if (out.value("n_layer", 0) == 0) {
+        err = "manifest has zero layers: " + out.dump();
+        return false;
+    }
+    if (out.value("layers", 0) == 0) {
+        err = "manifest has no layer descriptors: " + out.dump();
+        return false;
+    }
+
+    json model;
+    int gs = 0;
+    if (!http_get(orch, "/models/" + model_id, model, gs, 15) || gs != 200) {
+        err = "get model after manifest failed status=" + std::to_string(gs);
+        return false;
+    }
+    if (model.value("status", "") != "MANIFEST_READY") {
+        err = "unexpected registry status after manifest: " + model.value("status", "");
+        return false;
+    }
+
+    json manifest;
+    int ms = 0;
+    if (!http_get(orch, "/models/" + model_id + "/manifest", manifest, ms, 15) || ms != 200) {
+        err = "get manifest failed status=" + std::to_string(ms);
+        return false;
+    }
+    if (!manifest.contains("layers") || !manifest["layers"].is_array() || manifest["layers"].empty()) {
+        err = "manifest missing layer descriptors";
+        return false;
+    }
+    if (!manifest.contains("tensors") || !manifest["tensors"].is_array() || manifest["tensors"].empty()) {
+        err = "manifest missing tensors";
+        return false;
+    }
+
+    const uint64_t meta_read = manifest.value("metadata_bytes_read", static_cast<uint64_t>(0));
+    if (meta_read == 0) {
+        err = "metadata_bytes_read is zero";
+        return false;
+    }
+
+    uint64_t file_size = 0;
+    if (model.contains("files") && model["files"].is_array()) {
+        for (const auto & f : model["files"]) {
+            if (f.value("filename", "") == model.value("filename", "")) {
+                file_size = f.value("size_bytes", static_cast<uint64_t>(0));
+                break;
+            }
+        }
+    }
+    if (file_size > 0 && meta_read >= file_size) {
+        err = "metadata_bytes_read (" + std::to_string(meta_read) +
+              ") is not less than GGUF file size (" + std::to_string(file_size) + ")";
+        return false;
+    }
+
+    if (file_size_out) {
+        *file_size_out = file_size;
+    }
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // Process management (Unix only)
 // ----------------------------------------------------------------------------

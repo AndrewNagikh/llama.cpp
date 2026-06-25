@@ -93,6 +93,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    std::string manifest_err;
+    if (!e2e::build_manifest(orch_url, model_id, manifest_err)) {
+        fprintf(stderr, "FAIL: manifest build: %s\n", manifest_err.c_str());
+        cleanup();
+        return 1;
+    }
+
     // Kill node-b and give the orchestrator a moment.
     e2e::kill_wait(pid_b);
     pid_b = 0;

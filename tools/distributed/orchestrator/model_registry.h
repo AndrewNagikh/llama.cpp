@@ -8,14 +8,15 @@
 #include <vector>
 
 #include "nlohmann/json.hpp"
+#include "manifest_builder/manifest_builder.h"
 #include "model_provider/model_provider.h"
 
 // ---------------------------------------------------------------------------
-// Cluster Model Registry – Task 9.1
+// Cluster Model Registry - Task 9.1 / 9.2 / 9.3
 //
 // The registry is the single source of truth about which models are known
-// to the cluster. It stores metadata only; this task performs no downloads and
-// does not parse GGUF files.
+// to the cluster. It stores metadata and GGUF manifests but never downloads
+// or stores tensor weights.
 // ---------------------------------------------------------------------------
 
 enum class dist_model_status {
@@ -31,15 +32,6 @@ enum class dist_model_status {
 
 std::string dist_model_status_to_string(dist_model_status s);
 dist_model_status dist_model_status_from_string(const std::string & s);
-
-// Placeholder for future per-model manifest data (layer sizes, tokenizer,
-// quantization info, etc.) Task 9.1 intentionally keeps it empty.
-struct model_manifest {
-    bool empty() const { return true; }
-
-    nlohmann::json to_json() const;
-    static model_manifest from_json(const nlohmann::json & j);
-};
 
 struct dist_model_record {
     std::string model_id;
@@ -86,6 +78,14 @@ public:
     bool apply_discovery(
             const std::string & model_id,
             const provider_discovery_result & result,
+            dist_model_record * out = nullptr);
+
+    // Merge a built manifest into an existing record.
+    // Sets status to MANIFEST_READY and updates architecture.
+    // Returns false if the model_id is not known.
+    bool apply_manifest(
+            const std::string & model_id,
+            const model_manifest & manifest,
             dist_model_record * out = nullptr);
 
 private:
