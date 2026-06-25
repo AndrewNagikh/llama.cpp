@@ -270,6 +270,33 @@ int main(int argc, char ** argv) {
         }
     }
 
+    const auto install = cli.Post("/models/install",
+            std::string("{\"model\":\"") + model_id + "\"}", "application/json");
+    if (!install || install->status != 200) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: install failed status=%d\n",
+                install ? install->status : 0);
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+
+    bool coverage_ready = false;
+    for (int attempt = 0; attempt < 120; ++attempt) {
+        const auto cov = cli.Post("/models/" + model_id + "/coverage/refresh", "", "application/json");
+        if (cov && cov->status == 200) {
+            json cov_out = json::parse(cov->body);
+            if (cov_out["coverage"].value("state", "") == "READY") {
+                coverage_ready = true;
+                break;
+            }
+        }
+        usleep(500000);
+    }
+    if (!coverage_ready) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: coverage did not reach READY\n");
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+
     const auto create = cli.Post("/session/create",
             std::string("{\"model\":\"") + model_id + "\"}", "application/json");
     if (!create || create->status != 200) {

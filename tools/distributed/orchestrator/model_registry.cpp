@@ -5,6 +5,7 @@
 #include <chrono>
 #include <ctime>
 #include <iomanip>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -107,6 +108,18 @@ json dist_model_record::to_json() const {
         j["layout"] = nullptr;
     }
 
+    if (actual.has_value()) {
+        j["actual"] = actual->to_json();
+    } else {
+        j["actual"] = nullptr;
+    }
+
+    if (coverage.has_value()) {
+        j["coverage"] = coverage->to_json();
+    } else {
+        j["coverage"] = nullptr;
+    }
+
     return j;
 }
 
@@ -133,6 +146,18 @@ dist_model_record dist_model_record_from_json(const json & j) {
         r.layout = model_layout::from_json(j["layout"]);
     } else {
         r.layout = std::nullopt;
+    }
+
+    if (j.contains("actual") && j["actual"].is_object()) {
+        r.actual = actual_model_layout::from_json(j["actual"]);
+    } else {
+        r.actual = std::nullopt;
+    }
+
+    if (j.contains("coverage") && j["coverage"].is_object()) {
+        r.coverage = coverage_report::from_json(j["coverage"]);
+    } else {
+        r.coverage = std::nullopt;
     }
 
     if (j.contains("files") && j["files"].is_array()) {
@@ -252,6 +277,75 @@ bool cluster_model_registry::apply_layout(
     model_layout ml;
     ml.desired = layout;
     r.layout = ml;
+
+    if (out) {
+        *out = r;
+    }
+    return true;
+}
+
+bool cluster_model_registry::apply_actual(
+        const std::string & model_id,
+        const actual_model_layout & actual_layout,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    dist_model_record & r = it->second;
+    r.actual = actual_layout;
+
+    if (out) {
+        *out = r;
+    }
+    return true;
+}
+
+bool cluster_model_registry::apply_coverage(
+        const std::string & model_id,
+        const coverage_report & report,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    dist_model_record & r = it->second;
+    r.coverage = report;
+
+    if (out) {
+        *out = r;
+    }
+    return true;
+}
+
+bool cluster_model_registry::refresh_coverage(
+        const std::string & model_id,
+        const std::set<std::string> & online_nodes,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    dist_model_record & r = it->second;
+    if (!r.layout.has_value()) {
+        return false;
+    }
+
+    actual_model_layout actual{};
+    actual.model_id = model_id;
+    if (r.actual.has_value()) {
+        actual = *r.actual;
+    }
+
+    const coverage_report report = compute_coverage(
+            r.layout->desired, actual, online_nodes);
+    r.coverage = report;
 
     if (out) {
         *out = r;

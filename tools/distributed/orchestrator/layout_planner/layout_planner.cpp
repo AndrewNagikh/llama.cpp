@@ -105,28 +105,7 @@ layout_node_input layout_node_from_dist(const dist_node_info & node) {
 }
 
 std::string layout_normalize_device(const layout_node_input & node) {
-    if (!node.has_gpu) {
-        return "cpu";
-    }
-    std::string b;
-    b.reserve(node.backend.size());
-    for (char c : node.backend) {
-        b += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    if (b.find("metal") != std::string::npos) {
-        return "metal";
-    }
-    if (b.find("cuda") != std::string::npos ||
-        b.find("vulkan") != std::string::npos ||
-        b.find("hip") != std::string::npos ||
-        b.find("rocm") != std::string::npos ||
-        b.find("musa") != std::string::npos) {
-        return "cuda";
-    }
-    if (b.find("gpu") != std::string::npos) {
-        return "cuda";
-    }
-    return "cpu";
+    return dist_normalize_device(node.backend, node.has_gpu);
 }
 
 model_memory_requirements memory_requirements_from_manifest(

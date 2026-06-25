@@ -4,12 +4,14 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "nlohmann/json.hpp"
 #include "manifest_builder/manifest_builder.h"
 #include "layout_planner/layout_planner.h"
+#include "coverage/coverage.h"
 #include "model_provider/model_provider.h"
 
 // ---------------------------------------------------------------------------
@@ -45,6 +47,8 @@ struct dist_model_record {
     dist_model_status status = dist_model_status::discovered;
     std::optional<model_manifest> manifest;
     std::optional<model_layout>   layout;
+    std::optional<actual_model_layout> actual;
+    std::optional<coverage_report>   coverage;
 
     // Task 9.2: remote discovery metadata
     std::vector<remote_model_file> files;
@@ -94,6 +98,24 @@ public:
     bool apply_layout(
             const std::string & model_id,
             const desired_model_layout & layout,
+            dist_model_record * out = nullptr);
+
+    // Store actual installed layers reported by nodes.
+    bool apply_actual(
+            const std::string & model_id,
+            const actual_model_layout & actual,
+            dist_model_record * out = nullptr);
+
+    // Store a computed coverage report.
+    bool apply_coverage(
+            const std::string & model_id,
+            const coverage_report & coverage,
+            dist_model_record * out = nullptr);
+
+    // Recompute coverage from desired + actual and store the result.
+    bool refresh_coverage(
+            const std::string & model_id,
+            const std::set<std::string> & online_nodes = {},
             dist_model_record * out = nullptr);
 
 private:

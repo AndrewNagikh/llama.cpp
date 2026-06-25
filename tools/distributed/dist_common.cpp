@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -350,6 +351,31 @@ dist_node_capabilities dist_probe_capabilities() {
     caps.arch = dist_probe_node_system().arch;
 
     return caps;
+}
+
+std::string dist_normalize_device(const std::string & backend, bool has_gpu) {
+    if (!has_gpu) {
+        return "cpu";
+    }
+    std::string b;
+    b.reserve(backend.size());
+    for (char c : backend) {
+        b += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (b.find("metal") != std::string::npos) {
+        return "metal";
+    }
+    if (b.find("cuda") != std::string::npos ||
+        b.find("vulkan") != std::string::npos ||
+        b.find("hip") != std::string::npos ||
+        b.find("rocm") != std::string::npos ||
+        b.find("musa") != std::string::npos) {
+        return "cuda";
+    }
+    if (b.find("gpu") != std::string::npos) {
+        return "cuda";
+    }
+    return "cpu";
 }
 
 int64_t dist_now_unix() {

@@ -9,6 +9,7 @@
 #include "ggml-backend.h"
 
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -554,7 +555,46 @@ int main(int argc, char ** argv) {
         
         res.set_content(models_json.dump(), "application/json");
     });
-    
+
+    // GET /installed-layers - Report per-layer install state for a model (Task 9.5).
+    svr.Get("/installed-layers", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.get_param_value("model");
+        json layers_json = json::array();
+
+        if (!model_id.empty() && g_n_layer > 0) {
+            std::lock_guard<std::mutex> lock(g_model_store_mu);
+            const auto * model = g_model_store.find_model(model_id);
+            if (model && model->ready && std::filesystem::exists(model->local_path)) {
+                const dist_node_capabilities caps = dist_probe_capabilities();
+                const std::string device = dist_normalize_device(caps.gpu_backend, caps.has_gpu);
+
+                const uint64_t file_size = model->size_bytes > 0
+                        ? model->size_bytes
+                        : file_size_or_zero(model->local_path);
+                const uint64_t per_layer = g_n_layer > 0
+                        ? file_size / static_cast<uint64_t>(g_n_layer)
+                        : file_size;
+
+                for (int32_t i = 0; i < g_n_layer; ++i) {
+                    layers_json.push_back({
+                        { "layer", i },
+                        { "node", g_node_id },
+                        { "node_id", g_node_id },
+                        { "device", device },
+                        { "size_bytes", per_layer },
+                        { "checksum", std::string("stub:") + model_id + ":layer:" + std::to_string(i) },
+                        { "state", "READY" },
+                    });
+                }
+            }
+        }
+
+        res.set_content(json({
+            { "model", model_id },
+            { "layers", layers_json },
+        }).dump(), "application/json");
+    });
+
     // POST /models/install - Install a model locally
     svr.Post("/models/install", [agent_bin](const httplib::Request & req, httplib::Response & res) {
         json body;

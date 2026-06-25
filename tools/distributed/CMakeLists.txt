@@ -18,6 +18,7 @@ set(DIST_COMMON_SOURCES
     orchestrator/model_provider/huggingface_provider.cpp
     orchestrator/manifest_builder/manifest_builder.cpp
     orchestrator/layout_planner/layout_planner.cpp
+    orchestrator/coverage/coverage.cpp
     node_core.cpp
 )
 
@@ -133,6 +134,7 @@ if (LLAMA_BUILD_TESTS)
         orchestrator/model_provider/huggingface_provider.cpp
         orchestrator/manifest_builder/manifest_builder.cpp
         orchestrator/layout_planner/layout_planner.cpp
+        orchestrator/coverage/coverage.cpp
         memory_estimator.cpp
         dist_common.cpp
     )
@@ -276,4 +278,55 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-layout-node-loss PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(test-layout-node-loss PRIVATE cxx_std_17)
     target_link_libraries(test-layout-node-loss PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    # Task 9.5 cluster coverage tests
+    add_executable(test-coverage test-coverage.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-coverage PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-coverage PRIVATE cxx_std_17)
+    target_link_libraries(test-coverage PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-reconcile test-reconcile.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-reconcile PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-reconcile PRIVATE cxx_std_17)
+    target_link_libraries(test-reconcile PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-checksum test-checksum.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-checksum PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-checksum PRIVATE cxx_std_17)
+    target_link_libraries(test-checksum PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-empty-cluster test-empty-cluster.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-empty-cluster PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-empty-cluster PRIVATE cxx_std_17)
+    target_link_libraries(test-empty-cluster PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-partial-coverage test-partial-coverage.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-partial-coverage PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-partial-coverage PRIVATE cxx_std_17)
+    target_link_libraries(test-partial-coverage PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-ready-coverage test-ready-coverage.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-ready-coverage PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-ready-coverage PRIVATE cxx_std_17)
+    target_link_libraries(test-ready-coverage PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-degraded-coverage test-degraded-coverage.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-degraded-coverage PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-degraded-coverage PRIVATE cxx_std_17)
+    target_link_libraries(test-degraded-coverage PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-node-report test-node-report.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-node-report PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-node-report PRIVATE cxx_std_17)
+    target_link_libraries(test-node-report PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-coverage-refresh test-coverage-refresh.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-coverage-refresh PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-coverage-refresh PRIVATE cxx_std_17)
+    target_link_libraries(test-coverage-refresh PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-reconcile-after-node-loss test-reconcile-after-node-loss.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-reconcile-after-node-loss PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-reconcile-after-node-loss PRIVATE cxx_std_17)
+    target_link_libraries(test-reconcile-after-node-loss PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
 endif()

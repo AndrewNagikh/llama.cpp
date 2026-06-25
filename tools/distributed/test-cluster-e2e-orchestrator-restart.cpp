@@ -114,6 +114,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    std::string coverage_err;
+    if (!e2e::refresh_coverage(orch_url, model_id, coverage_err, "READY")) {
+        fprintf(stderr, "FAIL: coverage refresh: %s\n", coverage_err.c_str());
+        cleanup();
+        return 1;
+    }
+
     // Capture catalog before restart.
     json cat_before; int cs = 0;
     const bool cat_ok_before = e2e::http_get(orch_url, "/catalog", cat_before, cs) && cs == 200 &&

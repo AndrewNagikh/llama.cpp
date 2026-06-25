@@ -106,10 +106,37 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    std::string install_err;
+    if (!e2e::install_and_wait_ready(orch_url, model_id, 3, install_err)) {
+        fprintf(stderr, "FAIL: model install: %s\n", install_err.c_str());
+        cleanup();
+        return 1;
+    }
+
+    std::string coverage_err;
+    if (!e2e::refresh_coverage(orch_url, model_id, coverage_err, "READY")) {
+        fprintf(stderr, "FAIL: coverage refresh: %s\n", coverage_err.c_str());
+        cleanup();
+        return 1;
+    }
+
     // Kill node-b and give the orchestrator a moment.
     e2e::kill_wait(pid_b);
     pid_b = 0;
     sleep(1);
+
+    std::string reconcile_err;
+    size_t missing_count = 0;
+    if (!e2e::reconcile_coverage(orch_url, model_id, reconcile_err, "DEGRADED", &missing_count)) {
+        fprintf(stderr, "FAIL: reconcile after node loss: %s\n", reconcile_err.c_str());
+        cleanup();
+        return 1;
+    }
+    if (missing_count == 0) {
+        fprintf(stderr, "FAIL: reconcile returned no missing layers after node loss\n");
+        cleanup();
+        return 1;
+    }
 
     json out; int status = 0;
     e2e::http_post(orch_url, "/session/create", json({ { "model", model_id } }), out, status, 30);
@@ -118,7 +145,7 @@ int main(int argc, char ** argv) {
     cleanup();
 
     if (status == 503 && !error.empty()) {
-        printf("test-cluster-e2e-node-loss: PASS (503 with error: %s)\n", error.c_str());
+        printf("test-cluster-e2e-node-loss: PASS (503, reconcile missing=%zu)\n", missing_count);
         return 0;
     }
     fprintf(stderr, "test-cluster-e2e-node-loss: FAIL (expected 503 with message, got status=%d error='%s')\n",

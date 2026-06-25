@@ -5,6 +5,7 @@
 #include "orchestrator/model_registry.h"
 #include "orchestrator/manifest_builder/manifest_builder.h"
 #include "orchestrator/layout_planner/layout_planner.h"
+#include "orchestrator/coverage/coverage.h"
 #include "split_gen_common.h"
 #include "split_tcp_wire.h"
 
@@ -23,6 +24,7 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -414,6 +416,47 @@ static void dist_print_planner_report(
 static const dist_node_info * find_node(const std::map<std::string, dist_node_info> & nodes, const std::string & id) {
     const auto it = nodes.find(id);
     return it == nodes.end() ? nullptr : &it->second;
+}
+
+static bool poll_installed_layers_from_nodes(
+        const std::string & model_id,
+        actual_model_layout & out,
+        std::set<std::string> & online_nodes) {
+    std::vector<actual_model_layout> reports;
+    online_nodes.clear();
+
+    std::map<std::string, dist_node_info> nodes_copy;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        nodes_copy = g_nodes;
+    }
+
+    for (const auto & kv : nodes_copy) {
+        if (!kv.second.online) {
+            continue;
+        }
+
+        httplib::Client client(kv.second.host.c_str(), kv.second.http_port);
+        client.set_connection_timeout(3, 0);
+        client.set_read_timeout(10, 0);
+
+        const std::string path = "/installed-layers?model=" + model_id;
+        const auto result = client.Get(path.c_str());
+        if (!result || result->status != 200) {
+            continue;
+        }
+
+        try {
+            const json body = json::parse(result->body);
+            reports.push_back(actual_layout_from_node_response(kv.second.node_id, body));
+            online_nodes.insert(kv.second.node_id);
+        } catch (...) {
+            continue;
+        }
+    }
+
+    out = merge_node_layer_reports(model_id, reports);
+    return true;
 }
 
 static bool setup_pipeline(
@@ -1799,6 +1842,96 @@ int main(int argc, char ** argv) {
             return;
         }
         res.set_content(record->layout->to_json().dump(), "application/json");
+    });
+
+    // POST /models/{model_id}/coverage/refresh - Poll nodes and recompute coverage.
+    svr.Post(R"(/models/([^/]+)/coverage/refresh)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+
+        dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (!record->layout.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "layout not ready" } }).dump(), "application/json");
+            return;
+        }
+
+        actual_model_layout actual;
+        std::set<std::string> online_nodes;
+        poll_installed_layers_from_nodes(model_id, actual, online_nodes);
+
+        if (!g_registry.apply_actual(model_id, actual, record)) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (!g_registry.refresh_coverage(model_id, online_nodes, record)) {
+            res.status = 500;
+            res.set_content(json({ { "error", "coverage refresh failed" } }).dump(), "application/json");
+            return;
+        }
+
+        res.set_content(json({
+            { "status", "ok" },
+            { "coverage", record->coverage->to_json() },
+        }).dump(), "application/json");
+    });
+
+    // GET /models/{model_id}/coverage - Return stored coverage report.
+    svr.Get(R"(/models/([^/]+)/coverage)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        const auto * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (!record->coverage.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "coverage not ready" } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(record->coverage->to_json().dump(), "application/json");
+    });
+
+    // POST /models/{model_id}/reconcile - Refresh actual state and return differences.
+    svr.Post(R"(/models/([^/]+)/reconcile)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+
+        dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (!record->layout.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "layout not ready" } }).dump(), "application/json");
+            return;
+        }
+
+        actual_model_layout actual;
+        std::set<std::string> online_nodes;
+        poll_installed_layers_from_nodes(model_id, actual, online_nodes);
+
+        if (!g_registry.apply_actual(model_id, actual, record)) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        g_registry.refresh_coverage(model_id, online_nodes, record);
+
+        const reconciliation_result result = reconcile_layers(
+                record->layout->desired, actual, online_nodes);
+        g_registry.apply_coverage(model_id,
+                compute_coverage(record->layout->desired, actual, online_nodes),
+                record);
+
+        res.set_content(result.to_json().dump(), "application/json");
     });
 
     // GET /models/{model_id} - Return one registered model.

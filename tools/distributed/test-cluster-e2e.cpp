@@ -242,6 +242,18 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // ----- Stage 3.1: Cluster coverage (Task 9.5) --------------------------
+    {
+        std::string err;
+        const bool ok = e2e::refresh_coverage(orch_url, model_id, err, "READY");
+        add("Cluster coverage", ok, ok ? "coverage READY" : err);
+        if (!ok) {
+            fprintf(stderr, "FAIL: coverage refresh stage (%s)\n", err.c_str());
+            kill_all();
+            return finish(false);
+        }
+    }
+
     // ----- Stage 4: Session create ---------------------------------------
     const int n_layer = e2e::model_n_layer(gguf_abs.c_str());
     std::string session_id;
@@ -426,6 +438,12 @@ int main(int argc, char ** argv) {
 
         if (!e2e::build_layout(orch_url, model_id, err)) {
             add("Restart layout", false, err);
+            kill_all();
+            return finish(false);
+        }
+
+        if (!e2e::refresh_coverage(orch_url, model_id, err, "READY")) {
+            add("Restart coverage", false, err);
             kill_all();
             return finish(false);
         }

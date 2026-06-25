@@ -355,6 +355,66 @@ inline bool build_layout(const std::string & orch, const std::string & model_id,
     return true;
 }
 
+// Refresh cluster coverage from node layer reports (Task 9.5).
+inline bool refresh_coverage(const std::string & orch, const std::string & model_id,
+        std::string & err, const std::string & expected_state = "READY") {
+    json out;
+    int status = 0;
+    if (!http_post(orch, "/models/" + model_id + "/coverage/refresh", json({}), out, status, 60) ||
+            status != 200) {
+        err = "coverage refresh failed status=" + std::to_string(status) + " body=" + out.dump();
+        return false;
+    }
+    if (out.value("status", "") != "ok" || !out.contains("coverage")) {
+        err = "unexpected coverage refresh response: " + out.dump();
+        return false;
+    }
+
+    const std::string state = out["coverage"].value("state", "");
+    if (!expected_state.empty() && state != expected_state) {
+        err = "expected coverage state " + expected_state + ", got " + state +
+              " body=" + out["coverage"].dump();
+        return false;
+    }
+
+    json stored;
+    int gs = 0;
+    if (!http_get(orch, "/models/" + model_id + "/coverage", stored, gs, 15) || gs != 200) {
+        err = "get coverage failed status=" + std::to_string(gs);
+        return false;
+    }
+    if (stored.value("state", "") != state) {
+        err = "stored coverage state mismatch";
+        return false;
+    }
+    return true;
+}
+
+// Run reconciliation and optionally validate expected coverage state.
+inline bool reconcile_coverage(const std::string & orch, const std::string & model_id,
+        std::string & err, const std::string & expected_state = "",
+        size_t * missing_out = nullptr) {
+    json out;
+    int status = 0;
+    if (!http_post(orch, "/models/" + model_id + "/reconcile", json({}), out, status, 60) ||
+            status != 200) {
+        err = "reconcile failed status=" + std::to_string(status) + " body=" + out.dump();
+        return false;
+    }
+
+    const std::string state = out.value("state", "");
+    if (!expected_state.empty() && state != expected_state) {
+        err = "expected reconcile state " + expected_state + ", got " + state;
+        return false;
+    }
+    if (missing_out) {
+        *missing_out = out.contains("missing") && out["missing"].is_array()
+                ? out["missing"].size()
+                : 0;
+    }
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // Process management (Unix only)
 // ----------------------------------------------------------------------------

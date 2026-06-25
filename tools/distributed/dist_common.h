@@ -143,4 +143,7 @@ void dist_probe_node_cpu(dist_node_cpu & out);
 dist_node_system dist_probe_node_system();
 double dist_bytes_to_gb(uint64_t bytes);
 
+// Normalize backend name to planner device id: cpu / cuda / metal.
+std::string dist_normalize_device(const std::string & backend, bool has_gpu);
+
 int64_t dist_now_unix();
