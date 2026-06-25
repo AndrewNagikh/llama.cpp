@@ -123,6 +123,33 @@ inline bool http_post(const std::string & base, const std::string & path, const 
     return true;
 }
 
+inline std::string model_basename(const std::string & gguf_path) {
+    return std::filesystem::path(gguf_path).filename().string();
+}
+
+inline bool register_model(const std::string & orch, const std::string & model_id,
+        const std::string & gguf_path, std::string & err) {
+    json out;
+    int status = 0;
+    json body = {
+        { "model_id", model_id },
+        { "display_name", model_id },
+        { "source", "huggingface" },
+        { "repository", "hugging-quants/" + model_id + "-GGUF" },
+        { "filename", model_basename(gguf_path) },
+        { "revision", "main" },
+    };
+    if (!http_post(orch, "/models/register", body, out, status, 15) || status != 200) {
+        err = "register request failed status=" + std::to_string(status);
+        return false;
+    }
+    if (out.value("status", "") != "DISCOVERED") {
+        err = "unexpected status after register: " + out.value("status", "");
+        return false;
+    }
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // Process management (Unix only)
 // ----------------------------------------------------------------------------
@@ -233,7 +260,7 @@ inline bool wait_nodes_registered(const std::string & orch, int expected, int re
 inline bool models_ready(const std::string & orch, const std::string & model, int expected_nodes) {
     json out;
     int status = 0;
-    if (!http_get(orch, "/models", out, status, 15) || status != 200 || !out.is_array()) {
+    if (!http_get(orch, "/models/installed", out, status, 15) || status != 200 || !out.is_array()) {
         return false;
     }
     for (const auto & m : out) {

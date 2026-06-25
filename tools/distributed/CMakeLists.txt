@@ -13,6 +13,7 @@ set(DIST_COMMON_SOURCES
     ${DIST_TRANSPORT_SOURCES}
     dist_common.cpp
     model_catalog.cpp
+    orchestrator/model_registry.cpp
     node_core.cpp
 )
 
@@ -115,4 +116,20 @@ if (LLAMA_BUILD_TESTS)
     add_executable(test-capacity-api test-capacity-api.cpp memory_estimator.cpp dist_common.cpp)
     target_include_directories(test-capacity-api PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-capacity-api PRIVATE llama llama-common cpp-httplib Threads::Threads)
+
+    # Task 9.1 model registry tests
+    add_executable(test-model-registry test-model-registry.cpp orchestrator/model_registry.cpp)
+    target_include_directories(test-model-registry PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-model-registry PRIVATE cxx_std_17)
+    target_link_libraries(test-model-registry PRIVATE Threads::Threads)
+
+    add_executable(test-model-status test-model-status.cpp orchestrator/model_registry.cpp)
+    target_include_directories(test-model-status PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-model-status PRIVATE cxx_std_17)
+    target_link_libraries(test-model-status PRIVATE Threads::Threads)
+
+    add_executable(test-model-api test-model-api.cpp orchestrator/model_registry.cpp)
+    target_include_directories(test-model-api PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-model-api PRIVATE cxx_std_17)
+    target_link_libraries(test-model-api PRIVATE cpp-httplib Threads::Threads)
 endif()

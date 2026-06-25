@@ -1,0 +1,78 @@
+#pragma once
+
+#include <map>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "nlohmann/json.hpp"
+
+// ---------------------------------------------------------------------------
+// Cluster Model Registry – Task 9.1
+//
+// The registry is the single source of truth about which models are known
+// to the cluster. It stores metadata only; this task performs no downloads and
+// does not parse GGUF files.
+// ---------------------------------------------------------------------------
+
+enum class dist_model_status {
+    discovered,
+    manifest_pending,
+    manifest_ready,
+    installing,
+    partially_available,
+    available,
+    degraded,
+    unavailable
+};
+
+std::string dist_model_status_to_string(dist_model_status s);
+dist_model_status dist_model_status_from_string(const std::string & s);
+
+// Placeholder for future per-model manifest data (layer sizes, tokenizer,
+// quantization info, etc.) Task 9.1 intentionally keeps it empty.
+struct model_manifest {
+    bool empty() const { return true; }
+
+    nlohmann::json to_json() const;
+    static model_manifest from_json(const nlohmann::json & j);
+};
+
+struct dist_model_record {
+    std::string model_id;
+    std::string display_name;
+    std::string source;
+    std::string repository;
+    std::string filename;
+    std::string revision;
+    std::string architecture;
+    dist_model_status status = dist_model_status::discovered;
+    std::optional<model_manifest> manifest;
+
+    nlohmann::json to_json() const;
+};
+
+// Parse a POST /models/register payload into a record.
+// Missing fields are left empty; status is forced to DISCOVERED.
+dist_model_record dist_model_record_from_json(const nlohmann::json & j);
+
+class cluster_model_registry {
+public:
+    // Add a new model or update an existing one (matched by model_id).
+    void add_or_update(const dist_model_record & record);
+
+    // Remove a model record. Returns true if it existed.
+    bool remove(const std::string & model_id);
+
+    // Find one record. nullptr if not found.
+    const dist_model_record * find(const std::string & model_id) const;
+    dist_model_record * find(const std::string & model_id);
+
+    // Return all registered models.
+    std::vector<dist_model_record> list() const;
+
+private:
+    mutable std::mutex mutex_;
+    std::map<std::string, dist_model_record> records_;
+};

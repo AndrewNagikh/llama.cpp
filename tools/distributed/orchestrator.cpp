@@ -2,6 +2,7 @@
 #include "layer_planner.h"
 #include "memory_estimator.h"
 #include "model_catalog.h"
+#include "orchestrator/model_registry.h"
 #include "split_gen_common.h"
 #include "split_tcp_wire.h"
 
@@ -46,8 +47,10 @@ static std::mutex g_mu;
 static std::map<std::string, dist_node_info> g_nodes;
 static std::map<std::string, dist_session> g_sessions;
 static std::string g_model_path;
+static std::string g_models_dir;
 static int32_t g_n_ctx = 4096;
 static model_catalog g_catalog;
+static cluster_model_registry g_registry;
 static std::map<std::string, json> g_install_node_results;
 
 static std::string make_id(const char * prefix) {
@@ -319,24 +322,54 @@ static json planned_layout_json(const std::vector<dist_layer_assignment> & assig
     return layout;
 }
 
-static model_memory_requirements get_model_memory(
-        const std::string & model_id,
-        int32_t             n_ctx) {
-    // Prefer the orchestrator's local GGUF if it exists.
+static std::string resolve_model_path(const dist_model_record & record) {
+    if (!record.filename.empty()) {
+        if (!g_model_path.empty() &&
+            std::filesystem::path(g_model_path).filename() == record.filename &&
+            std::filesystem::exists(g_model_path)) {
+            return g_model_path;
+        }
+        if (!g_models_dir.empty()) {
+            const std::string candidate =
+                (std::filesystem::path(g_models_dir) / record.filename).string();
+            if (std::filesystem::exists(candidate)) {
+                return candidate;
+            }
+        }
+    }
+
+    // Last resort: if the orchestrator was started with a single model file
+    // and it exists, use it regardless of filename.
     if (!g_model_path.empty() && std::filesystem::exists(g_model_path)) {
-        model_memory_requirements mem = estimate_model_memory(g_model_path, n_ctx);
+        return g_model_path;
+    }
+
+    return {};
+}
+
+static model_memory_requirements get_model_memory_for_record(
+        const dist_model_record & record,
+        int32_t                   n_ctx) {
+    // Prefer a local GGUF matching the registry filename.
+    const std::string path = resolve_model_path(record);
+    if (!path.empty()) {
+        model_memory_requirements mem = estimate_model_memory(path, n_ctx);
         if (mem.valid()) {
-            mem.model_id = model_id;
+            mem.model_id = record.model_id;
             return mem;
         }
     }
 
-    // Otherwise fall back to the catalog entry.
-    std::lock_guard<std::mutex> lock(g_mu);
-    const auto * model = g_catalog.find_model(model_id);
-    if (model) {
-        return estimate_model_memory_from_catalog(*model, n_ctx);
+    // Otherwise fall back to the legacy catalog entry until manifests carry
+    // enough architecture data for memory estimation.
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        const auto * model = g_catalog.find_model(record.model_id);
+        if (model) {
+            return estimate_model_memory_from_catalog(*model, n_ctx);
+        }
     }
+
     return {};
 }
 
@@ -589,7 +622,7 @@ static bool run_generation(
 }
 
 static void usage(const char * prog) {
-    fprintf(stderr, "usage: %s --model PATH [--listen HOST:PORT] [--ctx-size N]\n", prog);
+    fprintf(stderr, "usage: %s --model PATH [--listen HOST:PORT] [--ctx-size N] [--models-dir DIR]\n", prog);
 }
 
 int main(int argc, char ** argv) {
@@ -600,12 +633,18 @@ int main(int argc, char ** argv) {
             listen = argv[++i];
         } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             g_model_path = argv[++i];
+        } else if (strcmp(argv[i], "--models-dir") == 0 && i + 1 < argc) {
+            g_models_dir = argv[++i];
         } else if (strcmp(argv[i], "--ctx-size") == 0 && i + 1 < argc) {
             g_n_ctx = std::atoi(argv[++i]);
         } else {
             usage(argv[0]);
             return 1;
         }
+    }
+
+    if (g_models_dir.empty() && !g_model_path.empty()) {
+        g_models_dir = std::filesystem::path(g_model_path).parent_path().string();
     }
 
     if (g_model_path.empty()) {
@@ -845,8 +884,21 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        const std::string model = body.value("model", "llama-3.2-1b");
+        const std::string model_id = body.value("model", "");
         const int request_ctx = body.value("n_ctx", g_n_ctx);
+
+        if (model_id.empty()) {
+            res.status = 400;
+            res.set_content(json({ { "error", "model id required" } }).dump(), "application/json");
+            return;
+        }
+
+        const dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
 
         std::map<std::string, dist_node_info> node_map;
         int n_layers = 0;
@@ -866,7 +918,7 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        const model_memory_requirements mem = get_model_memory(model, request_ctx);
+        const model_memory_requirements mem = get_model_memory_for_record(*record, request_ctx);
         if (!mem.valid()) {
             res.status = 503;
             res.set_content(json({ { "error", "failed to estimate model memory" } }).dump(), "application/json");
@@ -912,7 +964,7 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        dist_print_planner_report(model, mem, node_vec, fit, plan.assignments);
+        dist_print_planner_report(record->model_id, mem, node_vec, fit, plan.assignments);
 
         const json planned = planned_layout_json(plan.assignments);
 
@@ -930,8 +982,8 @@ int main(int argc, char ** argv) {
 
         dist_session session{};
         session.session_id = make_id("sess");
-        session.model      = model;
-        session.model_path = g_model_path;
+        session.model      = record->model_id;
+        session.model_path = resolve_model_path(*record);
 
         std::string err;
         if (!setup_pipeline(session.session_id, n_layers, plan.assignments, node_map, session, err)) {
@@ -979,12 +1031,19 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        const std::string model = body.value("model", "");
+        const std::string model_id = body.value("model", "");
         const int request_ctx = body.value("n_ctx", g_n_ctx);
 
-        if (model.empty()) {
+        if (model_id.empty()) {
             res.status = 400;
             res.set_content(R"({"error":"model is required"})", "application/json");
+            return;
+        }
+
+        const dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
             return;
         }
 
@@ -1006,7 +1065,7 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        const model_memory_requirements mem = get_model_memory(model, request_ctx);
+        const model_memory_requirements mem = get_model_memory_for_record(*record, request_ctx);
         if (!mem.valid()) {
             res.status = 503;
             res.set_content(json({ { "error", "failed to estimate model memory" } }).dump(), "application/json");
@@ -1021,7 +1080,7 @@ int main(int argc, char ** argv) {
         const cluster_memory_fits_result fit = dist_check_cluster_memory_fit(mem, node_vec);
 
         json response = fit.to_json();
-        response["model"] = model;
+        response["model"] = record->model_id;
         response["n_ctx"] = request_ctx;
         response["memory"] = {
             { "weights_gb", mem.weights_gb() },
@@ -1074,8 +1133,8 @@ int main(int argc, char ** argv) {
     });
 
     svr.Get("/planner/explain", [](const httplib::Request & req, httplib::Response & res) {
-        const std::string model = req.get_param_value("model");
-        if (model.empty()) {
+        const std::string model_id = req.get_param_value("model");
+        if (model_id.empty()) {
             res.status = 400;
             res.set_content(R"({"error":"model query parameter is required"})", "application/json");
             return;
@@ -1091,6 +1150,15 @@ int main(int argc, char ** argv) {
             request_ctx = g_n_ctx;
         }
 
+        const dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            json err;
+            err["error"] = "model not registered";
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
         std::map<std::string, dist_node_info> node_map;
         {
             std::lock_guard<std::mutex> lock(g_mu);
@@ -1102,7 +1170,7 @@ int main(int argc, char ** argv) {
         }
 
         json response;
-        response["model"] = model;
+        response["model"] = record->model_id;
         response["n_ctx"] = request_ctx;
 
         if (node_map.empty()) {
@@ -1112,7 +1180,7 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        const model_memory_requirements mem = get_model_memory(model, request_ctx);
+        const model_memory_requirements mem = get_model_memory_for_record(*record, request_ctx);
         if (!mem.valid()) {
             res.status = 503;
             response["error"] = "failed to estimate model memory";
@@ -1161,7 +1229,7 @@ int main(int argc, char ** argv) {
         explanation.precision(1);
         explanation << std::fixed;
 
-        explanation << "Model " << model << " requires " << mem.total_gb()
+        explanation << "Model " << record->model_id << " requires " << mem.total_gb()
                     << " GB (weights " << mem.weights_gb()
                     << " GB, KV " << mem.kv_gb()
                     << " GB, compute " << mem.compute_gb()
@@ -1334,8 +1402,46 @@ int main(int argc, char ** argv) {
         res.set_content(catalog_json.dump(), "application/json");
     });
 
-    // GET /models - List installed models across cluster (aggregated from nodes)
+    // -----------------------------------------------------------------------
+    // Cluster Model Registry (Task 9.1)
+    // -----------------------------------------------------------------------
+
+    // POST /models/register - Register (or update) a model in the cluster.
+    svr.Post("/models/register", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+
+        if (!body.contains("model_id") || body.value("model_id", "").empty()) {
+            res.status = 400;
+            res.set_content(json({ { "error", "model_id is required" } }).dump(), "application/json");
+            return;
+        }
+
+        dist_model_record record = dist_model_record_from_json(body);
+        record.status = dist_model_status::discovered;
+        g_registry.add_or_update(record);
+
+        res.set_content(record.to_json().dump(), "application/json");
+    });
+
+    // GET /models - List all registered models.
     svr.Get("/models", [](const httplib::Request &, httplib::Response & res) {
+        const auto records = g_registry.list();
+        json out = json::array();
+        for (const auto & r : records) {
+            out.push_back(r.to_json());
+        }
+        res.set_content(out.dump(), "application/json");
+    });
+
+    // GET /models/installed - List installed models across cluster (aggregated from nodes)
+    svr.Get("/models/installed", [](const httplib::Request &, httplib::Response & res) {
         std::vector<dist_node_info> nodes;
         {
             std::lock_guard<std::mutex> lock(g_mu);
@@ -1439,14 +1545,23 @@ int main(int argc, char ** argv) {
         std::vector<dist_node_info> online_nodes;
         {
             std::lock_guard<std::mutex> lock(g_mu);
-            const auto * found = g_catalog.find_model(model_id);
-            if (!found) {
-                res.status = 404;
-                res.set_content(R"({"error":"model not found in catalog"})", "application/json");
-                return;
+
+            const dist_model_record * reg = g_registry.find(model_id);
+            if (reg) {
+                model.id           = reg->model_id;
+                model.display_name = reg->display_name;
+                model.source.repo  = reg->repository;
+                model.source.file  = reg->filename;
+            } else {
+                const auto * found = g_catalog.find_model(model_id);
+                if (!found) {
+                    res.status = 404;
+                    res.set_content(R"({"error":"model not found in catalog"})", "application/json");
+                    return;
+                }
+                model = *found;
             }
 
-            model = *found;
             job_id = g_catalog.create_install_job(model_id);
             g_catalog.update_job_status(job_id, install_status::downloading, "", 0.0);
             for (const auto & [_, node] : g_nodes) {
@@ -1510,6 +1625,29 @@ int main(int argc, char ** argv) {
         }
 
         res.set_content(response.dump(), "application/json");
+    });
+
+    // GET /models/{model_id} - Return one registered model.
+    svr.Get(R"(/models/(.+))", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        const auto * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(record->to_json().dump(), "application/json");
+    });
+
+    // DELETE /models/{model_id} - Remove a registered model.
+    svr.Delete(R"(/models/(.+))", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        if (g_registry.remove(model_id)) {
+            res.set_content(json({ { "ok", true } }).dump(), "application/json");
+            return;
+        }
+        res.status = 404;
+        res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
     });
 
     fprintf(stderr, "orchestrator: listening on %s:%d (dynamic layer planner)\n", bind_host.c_str(), port);

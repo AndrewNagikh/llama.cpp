@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -126,8 +127,49 @@ int main(int argc, char ** argv) {
     httplib::Client cli(orch_url.c_str());
     cli.set_read_timeout(60, 0);
 
+    // Task 9.1: model must be registered in the cluster registry before any
+    // session can be created.
+    const std::string model_id = "llama-3.2-1b";
+    const std::string filename = std::filesystem::path(model_path).filename().string();
+    json reg_body = {
+        { "model_id", model_id },
+        { "display_name", "Llama 3.2 1B Q4_K_M" },
+        { "source", "huggingface" },
+        { "repository", "hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF" },
+        { "filename", filename },
+        { "revision", "main" }
+    };
+
+    const auto reg_res = cli.Post("/models/register", reg_body.dump(), "application/json");
+    if (!reg_res || reg_res->status != 200) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: /models/register failed status=%d\n",
+                reg_res ? reg_res->status : 0);
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+    json reg_out = json::parse(reg_res->body);
+    if (reg_out.value("status", "") != "DISCOVERED") {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: unexpected status %s\n",
+                reg_out.value("status", "").c_str());
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+
+    const auto get_res = cli.Get("/models/" + model_id);
+    if (!get_res || get_res->status != 200) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: GET /models/{id} failed\n");
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+    json get_out = json::parse(get_res->body);
+    if (get_out.value("status", "") != "DISCOVERED") {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: model status is not DISCOVERED\n");
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+
     const auto create = cli.Post("/session/create",
-            R"({"model":"llama-3.2-1b"})", "application/json");
+            std::string("{\"model\":\"") + model_id + "\"}", "application/json");
     if (!create || create->status != 200) {
         fprintf(stderr, "session/create failed status=%d\n", create ? create->status : 0);
         kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);

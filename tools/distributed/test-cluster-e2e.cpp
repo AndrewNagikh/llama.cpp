@@ -170,6 +170,24 @@ int main(int argc, char ** argv) {
         e2e::wait_http_ok("http://127.0.0.1:" + std::to_string(port_c), 200);
     }
 
+    // ----- Stage 2.5: Model registry registration (Task 9.1) ------------
+    {
+        std::string err;
+        bool ok = e2e::register_model(orch_url, model_id, gguf_abs, err);
+
+        json mout;
+        int ms = 0;
+        ok = ok && e2e::http_get(orch_url, "/models/" + model_id, mout, ms, 5) &&
+                  ms == 200 && mout.value("status", "") == "DISCOVERED";
+
+        add("Model registry", ok, ok ? "registered and DISCOVERED" : err);
+        if (!ok) {
+            fprintf(stderr, "FAIL: model registry stage (%s)\n", err.c_str());
+            kill_all();
+            return finish(false);
+        }
+    }
+
     // ----- Stage 3: Model install ----------------------------------------
     {
         std::string err;
@@ -342,6 +360,15 @@ int main(int argc, char ** argv) {
 
     // ----- Stage 9: Recreate session + generate --------------------------
     {
+        // The registry is in-memory; after an orchestrator restart the model
+        // must be registered again before Session Create can succeed.
+        std::string err;
+        if (!e2e::register_model(orch_url, model_id, gguf_abs, err)) {
+            add("Restart registry", false, err);
+            kill_all();
+            return finish(false);
+        }
+
         json create_out;
         int cs = 0;
         bool ok = e2e::http_post(orch_url, "/session/create", json({ { "model", model_id } }),

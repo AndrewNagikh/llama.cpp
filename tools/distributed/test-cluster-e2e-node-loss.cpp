@@ -76,6 +76,14 @@ int main(int argc, char ** argv) {
     }
     e2e::wait_http_ok("http://127.0.0.1:" + std::to_string(port_b), 200);
 
+    // Task 9.1: session creation now requires the model to be registered.
+    std::string reg_err;
+    if (!e2e::register_model(orch_url, model_id, gguf_abs, reg_err)) {
+        fprintf(stderr, "FAIL: model registration: %s\n", reg_err.c_str());
+        cleanup();
+        return 1;
+    }
+
     // Kill node-b and give the orchestrator a moment.
     e2e::kill_wait(pid_b);
     pid_b = 0;
