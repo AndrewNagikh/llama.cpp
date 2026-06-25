@@ -9,6 +9,7 @@
 
 #include "nlohmann/json.hpp"
 #include "manifest_builder/manifest_builder.h"
+#include "layout_planner/layout_planner.h"
 #include "model_provider/model_provider.h"
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,7 @@ struct dist_model_record {
     std::string architecture;
     dist_model_status status = dist_model_status::discovered;
     std::optional<model_manifest> manifest;
+    std::optional<model_layout>   layout;
 
     // Task 9.2: remote discovery metadata
     std::vector<remote_model_file> files;
@@ -86,6 +88,12 @@ public:
     bool apply_manifest(
             const std::string & model_id,
             const model_manifest & manifest,
+            dist_model_record * out = nullptr);
+
+    // Store a desired cluster layout for a model with MANIFEST_READY.
+    bool apply_layout(
+            const std::string & model_id,
+            const desired_model_layout & layout,
             dist_model_record * out = nullptr);
 
 private:

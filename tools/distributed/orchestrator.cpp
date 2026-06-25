@@ -4,6 +4,7 @@
 #include "model_catalog.h"
 #include "orchestrator/model_registry.h"
 #include "orchestrator/manifest_builder/manifest_builder.h"
+#include "orchestrator/layout_planner/layout_planner.h"
 #include "split_gen_common.h"
 #include "split_tcp_wire.h"
 
@@ -1718,6 +1719,86 @@ int main(int argc, char ** argv) {
             return;
         }
         res.set_content(record->manifest->to_json().dump(), "application/json");
+    });
+
+    // POST /models/{model_id}/layout - Build desired cluster layout.
+    svr.Post(R"(/models/([^/]+)/layout)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+
+        dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (record->status != dist_model_status::manifest_ready || !record->manifest.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "manifest not ready" } }).dump(), "application/json");
+            return;
+        }
+
+        std::vector<layout_node_input> nodes;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            for (const auto & kv : g_nodes) {
+                if (kv.second.online) {
+                    nodes.push_back(layout_node_from_dist(kv.second));
+                }
+            }
+        }
+
+        int request_ctx = g_n_ctx;
+        try {
+            if (!req.body.empty()) {
+                const json body = json::parse(req.body);
+                if (body.contains("n_ctx")) {
+                    request_ctx = body.value("n_ctx", g_n_ctx);
+                }
+            }
+        } catch (...) {}
+
+        const auto built = build_desired_layout(model_id, *record->manifest, nodes, request_ctx);
+        if (!built.success) {
+            res.status = 502;
+            res.set_content(json({
+                { "error", built.error },
+                { "fits_cluster", built.layout.fits_cluster },
+                { "warnings", built.layout.warnings },
+            }).dump(), "application/json");
+            return;
+        }
+
+        if (!g_registry.apply_layout(model_id, built.layout, record)) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+
+        res.set_content(json({
+            { "status", "ok" },
+            { "model", model_id },
+            { "fits_cluster", built.layout.fits_cluster },
+            { "placements", static_cast<int>(built.layout.placements.size()) },
+            { "total_weight_bytes", built.layout.total_weight_bytes },
+            { "total_required_memory", built.layout.total_required_memory },
+        }).dump(), "application/json");
+    });
+
+    // GET /models/{model_id}/layout - Return stored desired layout.
+    svr.Get(R"(/models/([^/]+)/layout)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        const auto * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (!record->layout.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "layout not ready" } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(record->layout->to_json().dump(), "application/json");
     });
 
     // GET /models/{model_id} - Return one registered model.

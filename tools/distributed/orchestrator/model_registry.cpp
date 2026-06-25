@@ -101,6 +101,12 @@ json dist_model_record::to_json() const {
         j["manifest"] = nullptr;
     }
 
+    if (layout.has_value()) {
+        j["layout"] = layout->to_json();
+    } else {
+        j["layout"] = nullptr;
+    }
+
     return j;
 }
 
@@ -121,6 +127,12 @@ dist_model_record dist_model_record_from_json(const json & j) {
         r.manifest = model_manifest::from_json(j["manifest"]);
     } else {
         r.manifest = std::nullopt;
+    }
+
+    if (j.contains("layout") && j["layout"].is_object()) {
+        r.layout = model_layout::from_json(j["layout"]);
+    } else {
+        r.layout = std::nullopt;
     }
 
     if (j.contains("files") && j["files"].is_array()) {
@@ -219,6 +231,27 @@ bool cluster_model_registry::apply_manifest(
     r.manifest     = manifest;
     r.architecture = manifest.architecture;
     r.status       = dist_model_status::manifest_ready;
+
+    if (out) {
+        *out = r;
+    }
+    return true;
+}
+
+bool cluster_model_registry::apply_layout(
+        const std::string & model_id,
+        const desired_model_layout & layout,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    dist_model_record & r = it->second;
+    model_layout ml;
+    ml.desired = layout;
+    r.layout = ml;
 
     if (out) {
         *out = r;

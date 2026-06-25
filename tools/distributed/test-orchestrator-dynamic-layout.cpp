@@ -231,6 +231,45 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const auto layout_build = cli.Post("/models/" + model_id + "/layout", "", "application/json");
+    if (!layout_build || layout_build->status != 200) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: /models/{id}/layout failed status=%d\n",
+                layout_build ? layout_build->status : 0);
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+    json layout_build_out = json::parse(layout_build->body);
+    if (!layout_build_out.value("fits_cluster", false)) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: layout fits_cluster=false\n");
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+
+    const auto layout_get = cli.Get("/models/" + model_id + "/layout");
+    if (!layout_get || layout_get->status != 200) {
+        fprintf(stderr, "test-orchestrator-dynamic-layout: GET /models/{id}/layout failed\n");
+        kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+        return 1;
+    }
+    json desired_layout = json::parse(layout_get->body);
+    std::vector<bool> seen(16, false);
+    for (const auto & p : desired_layout["placements"]) {
+        const int layer = p.value("layer", -1);
+        if (layer < 0 || layer >= 16 || seen[static_cast<size_t>(layer)]) {
+            fprintf(stderr, "test-orchestrator-dynamic-layout: invalid desired layout placement\n");
+            kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+            return 1;
+        }
+        seen[static_cast<size_t>(layer)] = true;
+    }
+    for (bool s : seen) {
+        if (!s) {
+            fprintf(stderr, "test-orchestrator-dynamic-layout: desired layout missing layers\n");
+            kill(pid_a, SIGTERM); kill(pid_b, SIGTERM); kill(pid_c, SIGTERM); kill(pid_orch, SIGTERM);
+            return 1;
+        }
+    }
+
     const auto create = cli.Post("/session/create",
             std::string("{\"model\":\"") + model_id + "\"}", "application/json");
     if (!create || create->status != 200) {

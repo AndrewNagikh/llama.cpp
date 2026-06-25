@@ -85,6 +85,12 @@ int main(int argc, char ** argv) {
         cleanup();
         return 1;
     }
+    std::string layout_err;
+    if (!e2e::build_layout(orch_url, model_id, layout_err)) {
+        fprintf(stderr, "FAIL: layout build: %s\n", layout_err.c_str());
+        cleanup();
+        return 1;
+    }
 
     // First install -> ready.
     if (!e2e::install_and_wait_ready(orch_url, model_id, 1, err)) {

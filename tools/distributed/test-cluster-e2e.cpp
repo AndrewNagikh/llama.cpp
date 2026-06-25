@@ -219,6 +219,18 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // ----- Stage 2.9: Desired cluster layout (Task 9.4) ------------------
+    {
+        std::string err;
+        const bool ok = e2e::build_layout(orch_url, model_id, err);
+        add("Desired layout", ok, ok ? "fits_cluster, full layer coverage" : err);
+        if (!ok) {
+            fprintf(stderr, "FAIL: layout build stage (%s)\n", err.c_str());
+            kill_all();
+            return finish(false);
+        }
+    }
+
     // ----- Stage 3: Model install ----------------------------------------
     {
         std::string err;
@@ -408,6 +420,12 @@ int main(int argc, char ** argv) {
 
         if (!e2e::build_manifest(orch_url, model_id, err)) {
             add("Restart manifest", false, err);
+            kill_all();
+            return finish(false);
+        }
+
+        if (!e2e::build_layout(orch_url, model_id, err)) {
+            add("Restart layout", false, err);
             kill_all();
             return finish(false);
         }

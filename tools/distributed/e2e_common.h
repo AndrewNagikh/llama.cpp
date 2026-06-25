@@ -258,6 +258,103 @@ inline bool build_manifest(const std::string & orch, const std::string & model_i
     return true;
 }
 
+// Build desired cluster layout (Task 9.4) and validate stored placements.
+inline bool build_layout(const std::string & orch, const std::string & model_id, std::string & err) {
+    json model;
+    int gs = 0;
+    if (!http_get(orch, "/models/" + model_id, model, gs, 15) || gs != 200) {
+        err = "get model before layout failed status=" + std::to_string(gs);
+        return false;
+    }
+    if (model.value("status", "") != "MANIFEST_READY") {
+        err = "model not MANIFEST_READY before layout: " + model.value("status", "");
+        return false;
+    }
+
+    json manifest;
+    int ms = 0;
+    if (!http_get(orch, "/models/" + model_id + "/manifest", manifest, ms, 15) || ms != 200) {
+        err = "get manifest before layout failed status=" + std::to_string(ms);
+        return false;
+    }
+    const int32_t n_layer = manifest.value("n_layer", 0);
+    if (n_layer <= 0) {
+        err = "manifest has zero n_layer";
+        return false;
+    }
+
+    json out;
+    int status = 0;
+    if (!http_post(orch, "/models/" + model_id + "/layout", json({}), out, status, 60) || status != 200) {
+        err = "layout build failed status=" + std::to_string(status) + " body=" + out.dump();
+        return false;
+    }
+    if (out.value("status", "") != "ok") {
+        err = "unexpected layout build status: " + out.dump();
+        return false;
+    }
+    if (!out.value("fits_cluster", false)) {
+        err = "layout fits_cluster=false: " + out.dump();
+        return false;
+    }
+
+    json layout;
+    int ls = 0;
+    if (!http_get(orch, "/models/" + model_id + "/layout", layout, ls, 15) || ls != 200) {
+        err = "get layout failed status=" + std::to_string(ls);
+        return false;
+    }
+    if (!layout.value("fits_cluster", false)) {
+        err = "stored layout fits_cluster=false";
+        return false;
+    }
+    if (!layout.contains("placements") || !layout["placements"].is_array()) {
+        err = "layout missing placements array";
+        return false;
+    }
+
+    std::vector<bool> seen(static_cast<size_t>(n_layer), false);
+    for (const auto & p : layout["placements"]) {
+        const int layer = p.value("layer", -1);
+        if (layer < 0 || layer >= n_layer) {
+            err = "placement layer out of range: " + std::to_string(layer);
+            return false;
+        }
+        if (seen[static_cast<size_t>(layer)]) {
+            err = "duplicate layer in placements: " + std::to_string(layer);
+            return false;
+        }
+        seen[static_cast<size_t>(layer)] = true;
+        if (p.value("node", "").empty()) {
+            err = "placement missing node";
+            return false;
+        }
+        if (p.value("device", "").empty()) {
+            err = "placement missing device";
+            return false;
+        }
+    }
+    for (int i = 0; i < n_layer; ++i) {
+        if (!seen[static_cast<size_t>(i)]) {
+            err = "missing layer in placements: " + std::to_string(i);
+            return false;
+        }
+    }
+
+    json model_after;
+    int gas = 0;
+    if (!http_get(orch, "/models/" + model_id, model_after, gas, 15) || gas != 200) {
+        err = "get model after layout failed status=" + std::to_string(gas);
+        return false;
+    }
+    if (!model_after.contains("layout") || model_after["layout"].is_null()) {
+        err = "registry record missing layout after build";
+        return false;
+    }
+
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // Process management (Unix only)
 // ----------------------------------------------------------------------------

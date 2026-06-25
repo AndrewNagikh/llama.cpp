@@ -99,6 +99,12 @@ int main(int argc, char ** argv) {
         cleanup();
         return 1;
     }
+    std::string layout_err;
+    if (!e2e::build_layout(orch_url, model_id, layout_err)) {
+        fprintf(stderr, "FAIL: layout build: %s\n", layout_err.c_str());
+        cleanup();
+        return 1;
+    }
 
     // Kill node-b and give the orchestrator a moment.
     e2e::kill_wait(pid_b);

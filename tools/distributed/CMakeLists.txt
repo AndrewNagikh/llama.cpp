@@ -17,6 +17,7 @@ set(DIST_COMMON_SOURCES
     orchestrator/model_provider/model_provider.cpp
     orchestrator/model_provider/huggingface_provider.cpp
     orchestrator/manifest_builder/manifest_builder.cpp
+    orchestrator/layout_planner/layout_planner.cpp
     node_core.cpp
 )
 
@@ -31,6 +32,8 @@ set(DIST_PLANNER_SOURCES
 
 set(DIST_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/orchestrator
     ${DIST_TRANSPORT_DIR}
     ${DIST_WORKERS_DIR}
     ${CMAKE_SOURCE_DIR}/vendor
@@ -129,6 +132,9 @@ if (LLAMA_BUILD_TESTS)
         orchestrator/model_provider/model_provider.cpp
         orchestrator/model_provider/huggingface_provider.cpp
         orchestrator/manifest_builder/manifest_builder.cpp
+        orchestrator/layout_planner/layout_planner.cpp
+        memory_estimator.cpp
+        dist_common.cpp
     )
     set(MODEL_REGISTRY_LINK_LIBS cpp-httplib llama Threads::Threads)
 
@@ -224,4 +230,50 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-corrupted-header PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(test-corrupted-header PRIVATE cxx_std_17)
     target_link_libraries(test-corrupted-header PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    # Task 9.4 desired cluster layout planner tests
+    add_executable(test-layout-planner test-layout-planner.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-layout-planner PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-layout-planner PRIVATE cxx_std_17)
+    target_link_libraries(test-layout-planner PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-layer-placement test-layer-placement.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-layer-placement PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-layer-placement PRIVATE cxx_std_17)
+    target_link_libraries(test-layer-placement PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-memory-fit test-memory-fit.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-memory-fit PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-memory-fit PRIVATE cxx_std_17)
+    target_link_libraries(test-memory-fit PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-no-overlap test-no-overlap.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-no-overlap PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-no-overlap PRIVATE cxx_std_17)
+    target_link_libraries(test-no-overlap PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-full-coverage test-full-coverage.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-full-coverage PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-full-coverage PRIVATE cxx_std_17)
+    target_link_libraries(test-full-coverage PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-gpu-priority test-gpu-priority.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-gpu-priority PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-gpu-priority PRIVATE cxx_std_17)
+    target_link_libraries(test-gpu-priority PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-build-layout test-build-layout.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-build-layout PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-build-layout PRIVATE cxx_std_17)
+    target_link_libraries(test-build-layout PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-layout-update test-layout-update.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-layout-update PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-layout-update PRIVATE cxx_std_17)
+    target_link_libraries(test-layout-update PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-layout-node-loss test-layout-node-loss.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-layout-node-loss PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-layout-node-loss PRIVATE cxx_std_17)
+    target_link_libraries(test-layout-node-loss PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
 endif()
