@@ -1090,13 +1090,11 @@ static bool setup_pipeline(
     }
 
     const int pipe_base = 9100 + (int) (getpid() % 500) + 10;
-    const size_t n_stages = assignments.size();
 
     std::vector<dist_pipeline_stage> stages;
-    stages.reserve(n_stages);
+    stages.reserve(assignments.size() < 2 ? 2 : assignments.size());
 
-    for (size_t i = 0; i < n_stages; ++i) {
-        const auto & assign = assignments[i];
+    auto push_stage = [&](const dist_layer_assignment & assign, const size_t i, const size_t n) {
         const dist_node_info * node = find_node(node_map, assign.node_id);
         if (!node) {
             err = "unknown node in plan: " + assign.node_id;
@@ -1114,7 +1112,7 @@ static bool setup_pipeline(
         if (i == 0) {
             stage.role      = DIST_ROLE_ENTRY;
             stage.ctrl_port = pipe_base + 1;
-        } else if (i + 1 == n_stages) {
+        } else if (i + 1 == n) {
             stage.role      = DIST_ROLE_FINAL;
             stage.peer_port = pipe_base + (int) i + 1;
         } else {
@@ -1123,7 +1121,26 @@ static bool setup_pipeline(
         }
 
         stages.push_back(stage);
+        return true;
+    };
+
+    if (assignments.size() == 1) {
+        // One node holds all layers: run entry + final workers on the same host.
+        if (!push_stage(assignments[0], 0, 2)) {
+            return false;
+        }
+        if (!push_stage(assignments[0], 1, 2)) {
+            return false;
+        }
+    } else {
+        for (size_t i = 0; i < assignments.size(); ++i) {
+            if (!push_stage(assignments[i], i, assignments.size())) {
+                return false;
+            }
+        }
     }
+
+    const size_t n_stages = stages.size();
 
     for (const auto & stage : stages) {
         const dist_node_info * node = find_node(node_map, stage.node_id);
@@ -1167,12 +1184,12 @@ static bool setup_pipeline(
             cfg["next_host"] = next.host;
             cfg["next_port"] = next.peer_port;
         } else {
-            const auto & next = stages[1];
+            const auto & next = stages[(size_t) ri + 1];
             cfg["role"] = "entry";
             cfg["ctrl_port"] = stage.ctrl_port;
             cfg["next_host"] = next.host;
             cfg["next_port"] = next.peer_port;
-            cfg["next_is_final"] = (n_stages == 2 && next.role == DIST_ROLE_FINAL);
+            cfg["next_is_final"] = (next.role == DIST_ROLE_FINAL);
         }
 
         if (!configure_node(*node, cfg, err)) {

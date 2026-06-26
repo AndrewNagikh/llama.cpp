@@ -121,7 +121,27 @@ void add_semantic_blob_downloads(
 
         for (const std::string & node_id : desired_nodes) {
             for (const semantic_tensor_slot & slot : blob.tensors) {
-                if (ready_blobs.count(blob_download_key(node_id, storage_id, slot.name))) {
+                const std::string key = blob_download_key(node_id, storage_id, slot.name);
+                if (ready_blobs.count(key)) {
+                    continue;
+                }
+                bool ready_on_node = false;
+                for (const auto & layer : actual.layers) {
+                    if (layer.node_id != node_id) {
+                        continue;
+                    }
+                    if (layer.blob_id != storage_id && layer.blob_id != blob.id) {
+                        continue;
+                    }
+                    if (layer.tensor_name != slot.name) {
+                        continue;
+                    }
+                    if (layer.state == install_state::ready) {
+                        ready_on_node = true;
+                        break;
+                    }
+                }
+                if (ready_on_node) {
                     continue;
                 }
                 add_blob_download(operations, seen, node_id, storage_id, slot, source_url);

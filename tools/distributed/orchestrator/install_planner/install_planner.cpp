@@ -166,6 +166,9 @@ json install_operation::to_json() const {
         j["source_url"]    = download.source_url;
         j["checksum"]      = download.checksum;
         j["download"]      = download.to_json();
+    } else if (action == install_action::delete_op &&
+            (!download.blob_id.empty() || !download.tensor_name.empty())) {
+        j["download"] = download.to_json();
     }
     return j;
 }
