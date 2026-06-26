@@ -1125,11 +1125,25 @@ static bool setup_pipeline(
     };
 
     if (assignments.size() == 1) {
-        // One node holds all layers: run entry + final workers on the same host.
-        if (!push_stage(assignments[0], 0, 2)) {
+        // One node holds all layers: split into entry + final stages on the same host.
+        const dist_layer_assignment & full = assignments[0];
+        const int total = full.layer_end - full.layer_start;
+        if (total < 2) {
+            err = "model too small for 2-stage pipeline";
             return false;
         }
-        if (!push_stage(assignments[0], 1, 2)) {
+        const int split = full.layer_start + total / 2;
+
+        dist_layer_assignment entry = full;
+        entry.layer_end = split;
+
+        dist_layer_assignment final = full;
+        final.layer_start = split;
+
+        if (!push_stage(entry, 0, 2)) {
+            return false;
+        }
+        if (!push_stage(final, 1, 2)) {
             return false;
         }
     } else {
