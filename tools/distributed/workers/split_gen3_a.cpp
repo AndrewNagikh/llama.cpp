@@ -18,8 +18,8 @@ static void usage(const char * prog) {
     fprintf(stderr, "usage: %s MODEL --ctrl-port PORT --b-port PORT [--layer-end N]\n", prog);
 }
 
-static bool forward_to_b(
-        int b_fd,
+static bool forward_to_peer(
+        int peer_fd,
         llama_context * ctx,
         int32_t n_tokens,
         int32_t n_embd,
@@ -28,6 +28,7 @@ static bool forward_to_b(
         bool include_logits,
         int32_t n_vocab,
         double ms_a,
+        bool next_is_final,
         split_gen3_a_resp & resp,
         std::vector<float> & logits_out) {
     const float * hidden = llama_get_embeddings(ctx);
@@ -37,31 +38,46 @@ static bool forward_to_b(
     }
 
     const int64_t t0 = ggml_time_us();
-    if (!split_ab_send_hidden(b_fd, n_tokens, n_embd, layer_end, pos_start,
+    if (!split_ab_send_hidden(peer_fd, n_tokens, n_embd, layer_end, pos_start,
             include_logits ? 1 : 0, hidden)) {
         fprintf(stderr, "gen3_a: send hidden failed\n");
         return false;
     }
     const int64_t t1 = ggml_time_us();
 
-    split_gen3_mid_resp mid{};
-    if (!split_gen3_recv_mid_resp(b_fd, mid)) {
-        fprintf(stderr, "gen3_a: recv mid resp failed\n");
-        return false;
-    }
-
     resp.magic          = SPLIT_GEN_MAGIC;
     resp.version        = SPLIT_GEN3_VERSION;
-    resp.token_id       = mid.token_id;
     resp.include_logits = include_logits ? 1 : 0;
     resp.n_vocab        = n_vocab;
     resp.ms_a_compute   = ms_a;
     resp.ms_ab_xfer     = (t1 - t0) / 1000.0;
-    resp.ms_b_compute   = mid.ms_b_compute;
-    resp.ms_bc_xfer     = mid.ms_bc_xfer;
-    resp.ms_c_compute   = mid.ms_c_compute;
-    resp.ms_c_sample    = mid.ms_c_sample;
     logits_out.clear();
+
+    if (next_is_final) {
+        split_gen3_c_resp cresp{};
+        if (!split_gen3_recv_c_resp(peer_fd, cresp)) {
+            fprintf(stderr, "gen3_a: recv final resp failed\n");
+            return false;
+        }
+        resp.token_id     = cresp.token_id;
+        resp.ms_b_compute = 0.0;
+        resp.ms_bc_xfer   = 0.0;
+        resp.ms_c_compute = cresp.ms_compute;
+        resp.ms_c_sample  = cresp.ms_sample;
+        return true;
+    }
+
+    split_gen3_mid_resp mid{};
+    if (!split_gen3_recv_mid_resp(peer_fd, mid)) {
+        fprintf(stderr, "gen3_a: recv mid resp failed\n");
+        return false;
+    }
+
+    resp.token_id     = mid.token_id;
+    resp.ms_b_compute = mid.ms_b_compute;
+    resp.ms_bc_xfer   = mid.ms_bc_xfer;
+    resp.ms_c_compute = mid.ms_c_compute;
+    resp.ms_c_sample  = mid.ms_c_sample;
     return true;
 }
 
@@ -75,6 +91,7 @@ int main(int argc, char ** argv) {
     int ctrl_port = -1;
     int b_port    = -1;
     int layer_end = 5;
+    bool next_is_final = false;
     const char * b_host = "127.0.0.1";
     const char * bind_host = "0.0.0.0";
 
@@ -89,6 +106,8 @@ int main(int argc, char ** argv) {
             bind_host = argv[++i];
         } else if (strcmp(argv[i], "--layer-end") == 0 && i + 1 < argc) {
             layer_end = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--next-final") == 0) {
+            next_is_final = true;
         } else {
             usage(argv[0]);
             return 1;
@@ -202,8 +221,8 @@ int main(int argc, char ** argv) {
 
         split_gen3_a_resp resp{};
         std::vector<float> logits;
-        if (!forward_to_b(b_fd, ctx, n_out, n_embd, le, req.pos_start,
-                req.include_logits != 0, n_vocab, ms_a, resp, logits)) {
+        if (!forward_to_peer(b_fd, ctx, n_out, n_embd, le, req.pos_start,
+                req.include_logits != 0, n_vocab, ms_a, next_is_final, resp, logits)) {
             break;
         }
 

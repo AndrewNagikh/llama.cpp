@@ -117,6 +117,7 @@ struct dist_configure_req {
     std::string    next_host;
     int            next_port   = 0;
     std::string    peer_bind   = "0.0.0.0";
+    bool           next_is_final = false;
 };
 
 struct dist_gen_resp {

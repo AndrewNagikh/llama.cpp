@@ -1083,6 +1083,7 @@ static bool setup_pipeline(
             cfg["ctrl_port"] = stage.ctrl_port;
             cfg["next_host"] = next.host;
             cfg["next_port"] = next.peer_port;
+            cfg["next_is_final"] = (n_stages == 2 && next.role == DIST_ROLE_FINAL);
         }
 
         if (!configure_node(*node, cfg, err)) {

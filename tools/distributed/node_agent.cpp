@@ -225,6 +225,7 @@ static dist_configure_req parse_configure(const json & body) {
     req.next_host   = body.value("next_host", "127.0.0.1");
     req.next_port   = body.value("next_port", 0);
     req.peer_bind   = body.value("peer_bind", "0.0.0.0");
+    req.next_is_final = body.value("next_is_final", false);
     return req;
 }
 
@@ -424,6 +425,9 @@ static bool start_worker(
             "--layer-end", std::to_string(cfg.layer_end),
             "--bind", cfg.peer_bind,
         };
+        if (cfg.next_is_final) {
+            args.push_back("--next-final");
+        }
     } else if (cfg.role == DIST_ROLE_MIDDLE) {
         bin = dir + "split_gen3_b";
         args = {
