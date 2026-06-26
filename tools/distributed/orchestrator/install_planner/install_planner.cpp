@@ -388,6 +388,27 @@ install_plan_build_result build_install_plan(
     std::vector<install_operation> operations;
     std::set<std::tuple<int, std::string, int32_t>> seen;
 
+    std::set<std::string> nodes_with_blob_tensors;
+    for (const auto & layer : actual.layers) {
+        if (!layer.blob_id.empty() && !layer.tensor_name.empty()) {
+            nodes_with_blob_tensors.insert(layer.node_id);
+        }
+    }
+    for (const auto & layer : actual.layers) {
+        if (!layer.blob_id.empty() || !layer.tensor_name.empty()) {
+            continue;
+        }
+        if (layer.layer_index != layer_special::embedding &&
+                layer.layer_index != layer_special::output) {
+            continue;
+        }
+        if (!nodes_with_blob_tensors.count(layer.node_id)) {
+            continue;
+        }
+        add_operation(operations, seen, install_action::delete_op,
+                layer.node_id, layer.layer_index);
+    }
+
     for (const auto & placement : desired.placements) {
         const std::string desired_key = layer_node_key(placement.layer_index, placement.node_id);
         const auto desired_it = actual_by_key.find(desired_key);
