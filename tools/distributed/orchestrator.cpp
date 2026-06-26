@@ -451,13 +451,6 @@ static std::string resolve_model_source_url(const dist_model_record & record) {
         }
     }
 
-    if (source_url.empty() && !g_model_path.empty()) {
-        std::error_code ec;
-        if (std::filesystem::exists(g_model_path, ec)) {
-            source_url = "file://" + g_model_path;
-        }
-    }
-
     return source_url;
 }
 
@@ -807,12 +800,6 @@ static std::string resolve_model_path(const dist_model_record & record) {
                 return candidate;
             }
         }
-    }
-
-    // Last resort: if the orchestrator was started with a single model file
-    // and it exists, use it regardless of filename.
-    if (!g_model_path.empty() && std::filesystem::exists(g_model_path)) {
-        return g_model_path;
     }
 
     return {};
