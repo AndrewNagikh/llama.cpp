@@ -38,6 +38,9 @@ set(DIST_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/orchestrator
+    ${CMAKE_CURRENT_SOURCE_DIR}/verification
+    ${CMAKE_CURRENT_SOURCE_DIR}/verification/deps/sha256
+    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps
     ${CMAKE_CURRENT_SOURCE_DIR}/node_agent
     ${CMAKE_CURRENT_SOURCE_DIR}/node_agent/synchronization
     ${DIST_TRANSPORT_DIR}
@@ -56,6 +59,29 @@ set(NODE_AGENT_SOURCES
     orchestrator/install_planner/install_planner.cpp
     orchestrator/manifest_builder/manifest_builder.cpp
 )
+
+set(VERIFICATION_SOURCES
+    verification/deps/sha256/sha256.c
+    verification/verification_common.cpp
+    verification/gguf_inspector.cpp
+    verification/gguf_diff.cpp
+    verification/tensor_verify.cpp
+    verification/layer_verify.cpp
+    verification/metadata_verify.cpp
+    verification/alignment_verify.cpp
+    verification/parity_verify.cpp
+    verification/materialization_verify.cpp
+    verification/verification_pipeline.cpp
+    verification/layer_store_populate.cpp
+    verification/worker_verify.cpp
+)
+
+function(dist_add_verify_exe name main_source)
+    add_executable(${name} ${main_source} ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES} dist_common.cpp memory_estimator.cpp)
+    target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(${name} PRIVATE cxx_std_17)
+    target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
+endfunction()
 
 function(dist_add_exe name main_source)
     add_executable(${name} ${main_source} ${DIST_COMMON_SOURCES} ${DIST_PLANNER_SOURCES})
@@ -82,13 +108,19 @@ function(dist_add_worker name main_source)
 endfunction()
 
 dist_add_exe_light(node_agent node_agent.cpp)
-target_sources(node_agent PRIVATE ${DIST_TRANSPORT_SOURCES})
+target_sources(node_agent PRIVATE ${DIST_TRANSPORT_SOURCES} verification/worker_verify.cpp verification/verification_common.cpp verification/deps/sha256/sha256.c)
 dist_add_exe(orchestrator orchestrator.cpp)
 target_sources(orchestrator PRIVATE
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
     node_agent/layer_store/layer_gguf_assembler.cpp
+    ${VERIFICATION_SOURCES}
 )
+
+dist_add_verify_exe(gguf_inspect gguf_inspect.cpp)
+dist_add_verify_exe(gguf_diff gguf_diff.cpp)
+dist_add_verify_exe(tensor_verify tensor_verify.cpp)
+dist_add_verify_exe(layer_verify layer_verify.cpp)
 
 dist_add_worker(split_gen3_a ${DIST_WORKERS_DIR}/split_gen3_a.cpp)
 dist_add_worker(split_gen3_b ${DIST_WORKERS_DIR}/split_gen3_b.cpp)
@@ -102,6 +134,7 @@ dist_add_test_exe(test-cluster-e2e-node-loss test-cluster-e2e-node-loss.cpp)
 dist_add_test_exe(test-cluster-e2e-orchestrator-restart test-cluster-e2e-orchestrator-restart.cpp)
 dist_add_test_exe(test-cluster-e2e-optimizer-api test-cluster-e2e-optimizer-api.cpp)
 dist_add_test_exe(test-cluster-e2e-optimizer-join test-cluster-e2e-optimizer-join.cpp)
+dist_add_test_exe(test-cluster-e2e-verification test-cluster-e2e-verification.cpp)
 
 if (LLAMA_BUILD_TESTS)
     add_executable(test-layer-planner test-layer-planner.cpp ${DIST_PLANNER_SOURCES} dist_common.cpp)
@@ -492,4 +525,23 @@ if (LLAMA_BUILD_TESTS)
     dist_add_optimizer_test(test-slow-node)
     dist_add_optimizer_test(test-node-loss)
     dist_add_optimizer_test(test-memory-change)
+
+    macro(dist_add_verify_test name)
+        add_executable(${name} ${name}.cpp ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES} dist_common.cpp memory_estimator.cpp)
+        target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
+        target_compile_features(${name} PRIVATE cxx_std_17)
+        target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
+    endmacro()
+
+    dist_add_verify_test(test-gguf-inspector)
+    dist_add_verify_test(test-gguf-diff)
+    dist_add_verify_test(test-tensor-checksum)
+    dist_add_verify_test(test-layer-checksum)
+    dist_add_verify_test(test-alignment)
+    dist_add_verify_test(test-materialization-repeatability)
+    dist_add_verify_test(test-materialized-load)
+    dist_add_verify_test(test-logit-parity)
+    dist_add_verify_test(test-sampling-parity)
+    dist_add_verify_test(test-layer-store-verification)
+    dist_add_verify_test(test-verification-multi-model)
 endif()

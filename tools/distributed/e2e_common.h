@@ -561,6 +561,45 @@ inline bool sync_model_layers(const std::string & orch, const std::string & mode
     return refresh_coverage(orch, model_id, err, "READY");
 }
 
+inline bool run_model_verification(const std::string & orch, const std::string & model_id,
+        std::string & err, json * report = nullptr, const bool expect_pass = true) {
+    json out;
+    int status = 0;
+    if (!http_post(orch, "/models/" + model_id + "/verify", json({}), out, status, 600)) {
+        err = "verify POST failed status=" + std::to_string(status);
+        return false;
+    }
+
+    if (report) {
+        *report = out;
+    }
+
+    const bool passed = out.value("passed", false);
+    if (expect_pass && !passed) {
+        err = "verification failed: " + out.dump();
+        return false;
+    }
+    if (!expect_pass && passed) {
+        err = "expected verification failure but passed";
+        return false;
+    }
+    if (!expect_pass && status != 422) {
+        err = "expected HTTP 422 on verification failure, got " + std::to_string(status);
+        return false;
+    }
+    return true;
+}
+
+inline bool get_model_verification_report(const std::string & orch, const std::string & model_id,
+        json & out, std::string & err) {
+    int status = 0;
+    if (!http_get(orch, "/models/" + model_id + "/verify", out, status, 60) || status != 200) {
+        err = "verify GET failed status=" + std::to_string(status);
+        return false;
+    }
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // Process management (Unix only)
 // ----------------------------------------------------------------------------

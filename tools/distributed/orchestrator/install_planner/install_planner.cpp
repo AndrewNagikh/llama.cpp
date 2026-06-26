@@ -313,6 +313,41 @@ layer_byte_range manifest_role_byte_range(
     return range;
 }
 
+layer_byte_range manifest_global_preamble_range(const model_manifest & manifest) {
+    layer_byte_range range{};
+    uint64_t min_offset = UINT64_MAX;
+    uint64_t max_end    = 0;
+
+    int32_t first_layer = INT32_MAX;
+    for (const auto & ld : manifest.layers) {
+        first_layer = std::min(first_layer, ld.layer_index);
+    }
+    if (first_layer == INT32_MAX && manifest.n_layer > 0) {
+        first_layer = 0;
+    }
+
+    for (const auto & t : manifest.tensors) {
+        if (t.layer >= first_layer) {
+            continue;
+        }
+        if (t.role == tensor_role::output_norm || t.role == tensor_role::lm_head) {
+            continue;
+        }
+        if (t.offset > 0 || t.size_bytes > 0) {
+            min_offset = std::min(min_offset, t.offset);
+            max_end    = std::max(max_end, t.offset + t.size_bytes);
+        }
+    }
+
+    if (min_offset != UINT64_MAX && max_end > min_offset) {
+        range.offset     = min_offset;
+        range.length     = max_end - min_offset;
+        range.size_bytes = range.length;
+        range.checksum   = "manifest:role:preamble";
+    }
+    return range;
+}
+
 // ---------------------------------------------------------------------------
 // Planner
 // ---------------------------------------------------------------------------
@@ -413,7 +448,10 @@ install_plan_build_result build_install_plan(
         }
 
         if (!entry_node.empty()) {
-            const layer_byte_range emb = manifest_role_byte_range(manifest, tensor_role::embedding);
+            layer_byte_range emb = manifest_global_preamble_range(manifest);
+            if (emb.length == 0) {
+                emb = manifest_role_byte_range(manifest, tensor_role::embedding);
+            }
             if (emb.length > 0) {
                 download_operation dl = make_download_op(
                         layer_special::embedding, entry_node, emb, source_url);

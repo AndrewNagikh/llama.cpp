@@ -79,6 +79,11 @@ static bool tensor_included(
     if (t.role == tensor_role::embedding && include_embedding) {
         return true;
     }
+    if (include_embedding && t.layer < layer_start &&
+            t.role != tensor_role::output_norm &&
+            t.role != tensor_role::lm_head) {
+        return true;
+    }
     if (include_output &&
             (t.role == tensor_role::output_norm || t.role == tensor_role::lm_head)) {
         return true;

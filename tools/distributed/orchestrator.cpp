@@ -10,6 +10,8 @@
 #include "orchestrator/optimizer/cluster_optimizer.h"
 #include "node_agent/layer_store/layer_store.h"
 #include "node_agent/layer_store/layer_gguf_assembler.h"
+#include "verification/verification_pipeline.h"
+#include "verification/worker_verify.h"
 #include "split_gen_common.h"
 #include "split_tcp_wire.h"
 
@@ -72,6 +74,7 @@ struct cluster_sync_job {
 };
 
 static std::map<std::string, cluster_sync_job> g_sync_jobs;
+static std::map<std::string, nlohmann::json> g_verify_reports;
 
 static std::string make_id(const char * prefix) {
     static std::mt19937_64 rng{ std::random_device{}() };
@@ -2708,6 +2711,56 @@ int main(int argc, char ** argv) {
             { "status", "started" },
             { "operation_count", record->stored_install_plan->operation_count },
         }).dump(), "application/json");
+    });
+
+    // POST /models/{model_id}/verify - Run GGUF materialization verification pipeline.
+    svr.Post(R"(/models/([^/]+)/verify)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        const dist_model_record * record = g_registry.find(model_id);
+        if (!record || !record->manifest.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not found or manifest missing" } }).dump(), "application/json");
+            return;
+        }
+
+        const std::string original = resolve_model_path(*record);
+        if (original.empty()) {
+            res.status = 503;
+            res.set_content(json({
+                { "error", "original GGUF not available locally; set --models-dir or register with local file" },
+            }).dump(), "application/json");
+            return;
+        }
+
+        layer_store store(g_models_dir.empty() ? std::filesystem::path(original).parent_path().string() : g_models_dir,
+                model_id);
+        const std::string work_dir = (store.model_root() / "verify").string();
+        const verification_report report = run_verification_pipeline(
+                model_id, original, store, *record->manifest, work_dir);
+
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            g_verify_reports[model_id] = report.to_json();
+        }
+
+        res.set_content(report.summary_json().dump(), "application/json");
+        if (!report.passed) {
+            res.status = 422;
+        }
+    });
+
+    // GET /models/{model_id}/verify - Return last verification report.
+    svr.Get(R"(/models/([^/]+)/verify)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        std::lock_guard<std::mutex> lock(g_mu);
+        const auto it = g_verify_reports.find(model_id);
+        if (it == g_verify_reports.end()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "no verification report; POST /verify first" } }).dump(),
+                    "application/json");
+            return;
+        }
+        res.set_content(it->second.dump(), "application/json");
     });
 
     // GET /jobs/{job_id} - Cluster synchronization job progress.

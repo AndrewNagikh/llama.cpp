@@ -3,6 +3,7 @@
 #include "node_benchmark.h"
 #include "node_agent/layer_store/layer_store.h"
 #include "node_agent/layer_store/layer_gguf_assembler.h"
+#include "verification/worker_verify.h"
 #include "node_agent/synchronization/synchronization_engine.h"
 #include "orchestrator/install_planner/install_planner.h"
 #include "orchestrator/coverage/coverage.h"
@@ -51,6 +52,7 @@ static std::set<std::string> g_active_downloads;
 static std::map<std::string, std::string> g_download_errors;
 static std::string g_models_state_path;
 static std::string g_models_dir;
+static bool g_verify_materialization = false;
 static synchronization_engine g_sync_engine;
 static std::mutex g_layer_store_mu;
 
@@ -88,7 +90,7 @@ static uint64_t file_size_or_zero(const std::string & path) {
 static void usage(const char * prog) {
     fprintf(stderr,
             "usage: %s --listen HOST:PORT --orchestrator URL "
-            "[--model PATH] [--node-id ID] [--advertise-host IP] [--models-dir DIR] [--rebenchmark]\n"
+            "[--model PATH] [--node-id ID] [--advertise-host IP] [--models-dir DIR] [--verify-materialization] [--rebenchmark]\n"
             "  Layer-first mode: omit --model; workers load GGUF assembled from synced layers.\n"
             "example: %s --listen 0.0.0.0:9001 --orchestrator http://10.0.0.1:9000 --advertise-host 10.0.0.2\n",
             prog, prog);
@@ -109,6 +111,8 @@ static bool parse_args(int argc, char ** argv, std::string & listen, std::string
             advertise_host = argv[++i];
         } else if (strcmp(argv[i], "--models-dir") == 0 && i + 1 < argc) {
             g_models_dir = argv[++i];
+        } else if (strcmp(argv[i], "--verify-materialization") == 0) {
+            g_verify_materialization = true;
         } else if (strcmp(argv[i], "--rebenchmark") == 0) {
             rebenchmark = true;
         } else {
@@ -494,6 +498,22 @@ static std::string materialize_worker_gguf(
     const bool include_embedding = (cfg.role == DIST_ROLE_ENTRY);
     const bool include_output    = (cfg.role == DIST_ROLE_FINAL);
     const std::string role_name  = dist_role_name(cfg.role);
+
+    if (g_verify_materialization) {
+        std::string verr;
+        if (!verify_worker_materialization(
+                    store,
+                    *manifest,
+                    cfg.layer_start,
+                    cfg.layer_end,
+                    include_embedding,
+                    include_output,
+                    verr)) {
+            err = "materialization verification failed: " + verr;
+            return {};
+        }
+    }
+
     const std::string out_path =
             (store.model_root() / ("worker_" + role_name + ".gguf")).string();
 

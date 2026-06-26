@@ -94,6 +94,9 @@ layer_byte_range manifest_role_byte_range(
         const model_manifest & manifest,
         tensor_role role);
 
+// All global tensors before the first transformer layer (rope, embedding, norms).
+layer_byte_range manifest_global_preamble_range(const model_manifest & manifest);
+
 // Build install plan from registry state inputs.
 install_plan_build_result build_install_plan(
         const model_manifest & manifest,
