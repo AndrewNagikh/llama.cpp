@@ -43,7 +43,9 @@ static std::string g_node_id;
 static int32_t g_n_layer = 0;
 static int32_t g_n_embd  = 0;
 static BenchmarkResult g_benchmark{};
-static pid_t g_worker_pid = 0;
+static pid_t g_entry_worker_pid  = 0;
+static pid_t g_middle_worker_pid = 0;
+static pid_t g_final_worker_pid  = 0;
 static int g_pipeline_ctrl_port = 0;
 static int g_pipeline_layer_end = 0;
 static model_store g_model_store;
@@ -318,14 +320,33 @@ static bool register_with_orchestrator(
 
 #if !defined(_WIN32)
 
-static void stop_worker() {
-    if (g_worker_pid > 0) {
-        kill(g_worker_pid, SIGTERM);
-        waitpid(g_worker_pid, nullptr, 0);
-        g_worker_pid = 0;
+static pid_t * worker_pid_slot(const dist_node_role role) {
+    switch (role) {
+        case DIST_ROLE_ENTRY:  return &g_entry_worker_pid;
+        case DIST_ROLE_MIDDLE: return &g_middle_worker_pid;
+        case DIST_ROLE_FINAL:  return &g_final_worker_pid;
+        default:               return nullptr;
     }
-    g_pipeline_ctrl_port = 0;
-    g_pipeline_layer_end = 0;
+}
+
+static void stop_worker_for_role(const dist_node_role role) {
+    pid_t * slot = worker_pid_slot(role);
+    if (!slot || *slot <= 0) {
+        return;
+    }
+    kill(*slot, SIGTERM);
+    waitpid(*slot, nullptr, 0);
+    *slot = 0;
+    if (role == DIST_ROLE_ENTRY) {
+        g_pipeline_ctrl_port = 0;
+        g_pipeline_layer_end = 0;
+    }
+}
+
+static void stop_all_workers() {
+    stop_worker_for_role(DIST_ROLE_ENTRY);
+    stop_worker_for_role(DIST_ROLE_MIDDLE);
+    stop_worker_for_role(DIST_ROLE_FINAL);
 }
 
 static bool pipeline_gen3_send_recv(
@@ -409,7 +430,7 @@ static bool start_worker(
         const dist_configure_req & cfg,
         const std::string & model_path,
         std::string & err) {
-    stop_worker();
+    stop_worker_for_role(cfg.role);
 
     if (model_path.empty()) {
         err = "no model path for worker";
@@ -474,7 +495,9 @@ static bool start_worker(
         _exit(127);
     }
 
-    g_worker_pid = pid;
+    if (pid_t * slot = worker_pid_slot(cfg.role)) {
+        *slot = pid;
+    }
     usleep(300000);
     return true;
 }
@@ -666,7 +689,12 @@ int main(int argc, char ** argv) {
     svr.Get("/status", [](const httplib::Request &, httplib::Response & res) {
         res.set_content(json({
             { "node_id", g_node_id },
-            { "worker_pid", (int) g_worker_pid },
+            { "worker_pid", (int) g_entry_worker_pid },
+            { "workers", {
+                { "entry", (int) g_entry_worker_pid },
+                { "middle", (int) g_middle_worker_pid },
+                { "final", (int) g_final_worker_pid },
+            }},
         }).dump(), "application/json");
     });
 
@@ -720,7 +748,7 @@ int main(int argc, char ** argv) {
         res.set_content(json({
             { "ok", true },
             { "role", dist_role_name(cfg.role) },
-            { "worker_pid", (int) g_worker_pid },
+            { "worker_pid", (int) (worker_pid_slot(cfg.role) ? *worker_pid_slot(cfg.role) : 0) },
         }).dump(), "application/json");
 #endif
     });
@@ -780,7 +808,7 @@ int main(int argc, char ** argv) {
 
     svr.Post("/shutdown", [](const httplib::Request &, httplib::Response & res) {
 #if !defined(_WIN32)
-        stop_worker();
+        stop_all_workers();
 #endif
         res.set_content(R"({"ok":true})", "application/json");
     });
@@ -1041,13 +1069,13 @@ int main(int argc, char ** argv) {
     if (!svr.listen(bind_host.c_str(), http_port)) {
         fprintf(stderr, "node_agent: failed to bind %s:%d\n", bind_host.c_str(), http_port);
 #if !defined(_WIN32)
-        stop_worker();
+        stop_all_workers();
 #endif
         return 1;
     }
 
 #if !defined(_WIN32)
-    stop_worker();
+    stop_all_workers();
 #endif
     return 0;
 }
