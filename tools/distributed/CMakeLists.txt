@@ -158,6 +158,8 @@ if (LLAMA_BUILD_TESTS)
 
     dist_add_test_exe(test-orchestrator-3node test-orchestrator-3node.cpp)
     dist_add_test_exe(test-orchestrator-dynamic-layout test-orchestrator-dynamic-layout.cpp)
+    dist_add_test_exe(test-split-materialized-2stage test-split-materialized-2stage.cpp)
+    target_sources(test-split-materialized-2stage PRIVATE ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES})
 
     add_executable(test-node-benchmark test-node-benchmark.cpp ${DIST_BENCHMARK_SOURCES})
     target_include_directories(test-node-benchmark PRIVATE ${DIST_INCLUDE_DIRS})

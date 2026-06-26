@@ -34,7 +34,8 @@ bool gguf_tensor_included(
         int32_t layer_start,
         int32_t layer_end,
         bool include_embedding,
-        bool include_output);
+        bool include_output,
+        const model_manifest * manifest = nullptr);
 
 std::vector<std::string> list_tensors_for_worker(
         const model_manifest & manifest,

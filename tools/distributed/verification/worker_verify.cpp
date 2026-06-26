@@ -40,6 +40,18 @@ bool verify_worker_materialization(
     }
 
     if (include_output) {
+        const bool tied_lm_head = manifest.special_tensors.count("lm_head") == 0;
+        if (tied_lm_head && !include_embedding) {
+            if (!store.has_layer(layer_special::embedding)) {
+                err = "missing tied lm_head embedding blob";
+                return false;
+            }
+            if (!store.verify_layer(layer_special::embedding, "manifest:role:preamble") &&
+                    !store.verify_layer(layer_special::embedding, "manifest:role:embedding")) {
+                err = "tied lm_head embedding checksum failed";
+                return false;
+            }
+        }
         if (!store.has_layer(layer_special::output)) {
             err = "missing output layer blob";
             return false;

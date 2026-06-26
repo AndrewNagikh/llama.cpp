@@ -160,6 +160,12 @@ bool layer_store_materialize_gguf(
     }
 
     if (include_output) {
+        const bool tied_lm_head = manifest.special_tensors.count("lm_head") == 0;
+        if (tied_lm_head && !include_embedding) {
+            if (!write_blob(layer_special::embedding)) {
+                return false;
+            }
+        }
         if (!write_blob(layer_special::output)) {
             return false;
         }

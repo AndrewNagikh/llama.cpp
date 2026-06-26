@@ -51,8 +51,15 @@ bool gguf_tensor_included(
         const int32_t layer_start,
         const int32_t layer_end,
         const bool include_embedding,
-        const bool include_output) {
+        const bool include_output,
+        const model_manifest * manifest) {
     if (t.role == tensor_role::embedding && include_embedding) {
+        return true;
+    }
+    // Tied lm_head models reuse token_embd.weight at the final stage.
+    if (include_output && manifest != nullptr &&
+            manifest->special_tensors.count("lm_head") == 0 &&
+            t.role == tensor_role::embedding) {
         return true;
     }
     if (include_embedding && t.layer < layer_start &&
@@ -77,7 +84,8 @@ std::vector<std::string> list_tensors_for_worker(
                     plan.layer_start,
                     plan.layer_end,
                     plan.include_embedding,
-                    plan.include_output)) {
+                    plan.include_output,
+                    &manifest)) {
             names.push_back(t.name);
         }
     }
@@ -165,7 +173,8 @@ verify_check_result verify_worker_tensor_plan(
                 plan.layer_start,
                 plan.layer_end,
                 plan.include_embedding,
-                plan.include_output);
+                plan.include_output,
+                &manifest);
         if (!required) {
             continue;
         }
@@ -261,12 +270,18 @@ verify_check_result verify_worker_store_assignment(
             issues.push_back("missing layer " + std::to_string(layer));
         }
     }
-    if (plan.include_output && !store.has_layer(layer_special::output)) {
-        issues.push_back("missing output blob (-2)");
+    if (plan.include_output) {
+        if (manifest.special_tensors.count("lm_head") == 0 && !store.has_layer(layer_special::embedding)) {
+            issues.push_back("missing tied lm_head embedding blob (-1)");
+        }
+        if (!store.has_layer(layer_special::output)) {
+            issues.push_back("missing output blob (-2)");
+        }
     }
 
     std::vector<std::string> special;
-    if (plan.include_embedding) {
+    if (plan.include_embedding ||
+            (plan.include_output && manifest.special_tensors.count("lm_head") == 0)) {
         special.push_back("token_embd.weight");
     }
     if (plan.include_output) {

@@ -48,7 +48,8 @@ static tensor_verify_result tensor_verify_impl(
                         plan->layer_start,
                         plan->layer_end,
                         plan->include_embedding,
-                        plan->include_output)) {
+                        plan->include_output,
+                        manifest)) {
                 result.skipped.push_back(name);
                 continue;
             }
