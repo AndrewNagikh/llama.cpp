@@ -23,6 +23,13 @@ static std::string layer_key(int32_t layer_index, const std::string & node_id) {
     return std::to_string(layer_index) + "@" + node_id;
 }
 
+static std::string actual_layer_key(const installed_layer & layer) {
+    if (!layer.blob_id.empty() && !layer.tensor_name.empty()) {
+        return layer.node_id + ":blob:" + layer.blob_id + ":" + layer.tensor_name;
+    }
+    return layer_key(layer.layer_index, layer.node_id);
+}
+
 static std::map<std::string, installed_layer> index_actual_layers(
         const actual_model_layout & actual) {
     std::map<std::string, installed_layer> indexed;
@@ -96,7 +103,7 @@ coverage_state coverage_state_from_string(const std::string & s) {
 // ---------------------------------------------------------------------------
 
 json installed_layer::to_json() const {
-    return {
+    json j = {
         { "layer", layer_index },
         { "layer_index", layer_index },
         { "node", node_id },
@@ -106,6 +113,13 @@ json installed_layer::to_json() const {
         { "checksum", checksum },
         { "state", install_state_to_string(state) },
     };
+    if (!blob_id.empty()) {
+        j["blob_id"] = blob_id;
+    }
+    if (!tensor_name.empty()) {
+        j["tensor_name"] = tensor_name;
+    }
+    return j;
 }
 
 installed_layer installed_layer::from_json(const json & j) {
@@ -116,6 +130,8 @@ installed_layer installed_layer::from_json(const json & j) {
     layer.size_bytes  = j.value("size_bytes", static_cast<uint64_t>(0));
     layer.checksum    = j.value("checksum", "");
     layer.state       = install_state_from_string(j.value("state", "MISSING"));
+    layer.blob_id     = j.value("blob_id", "");
+    layer.tensor_name = j.value("tensor_name", "");
     layer.updated_at  = std::chrono::system_clock::now();
     return layer;
 }
@@ -320,7 +336,7 @@ actual_model_layout merge_node_layer_reports(
     std::set<std::string> seen;
     for (const auto & report : node_reports) {
         for (const auto & layer : report.layers) {
-            const std::string key = layer_key(layer.layer_index, layer.node_id);
+            const std::string key = actual_layer_key(layer);
             if (!seen.insert(key).second) {
                 continue;
             }

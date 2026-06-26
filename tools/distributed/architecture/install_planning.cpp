@@ -10,7 +10,7 @@ static std::string blob_download_key(
         const std::string & node_id,
         const std::string & blob_id,
         const std::string & tensor_name) {
-    return node_id + ":" + blob_id + ":" + tensor_name;
+    return blob_install_key(node_id, blob_id, tensor_name);
 }
 
 static download_operation make_tensor_download(
@@ -59,7 +59,8 @@ void add_semantic_blob_downloads(
         const std::string & entry_node,
         const std::string & final_node,
         const std::vector<std::string> & all_nodes,
-        const std::string & source_url) {
+        const std::string & source_url,
+        const std::set<std::string> & ready_blobs) {
     (void) manifest;
 
     for (const semantic_blob & blob : desc.blobs) {
@@ -75,6 +76,9 @@ void add_semantic_blob_downloads(
 
         for (const std::string & node_id : nodes) {
             for (const semantic_tensor_slot & slot : blob.tensors) {
+                if (ready_blobs.count(blob_download_key(node_id, storage_id, slot.name))) {
+                    continue;
+                }
                 add_blob_download(operations, seen, node_id, storage_id, slot, source_url);
             }
         }

@@ -838,6 +838,29 @@ int main(int argc, char ** argv) {
                     { "state", state },
                 });
             }
+
+            for (const layer_store::blob_tensor_info & blob : store.list_blob_tensors()) {
+                std::string state = "READY";
+                const std::string checksum = blob.checksum.empty()
+                        ? ("manifest:tensor:" + blob.tensor_name)
+                        : blob.checksum;
+                if (!store.verify_blob_tensor(blob.blob_id, blob.tensor_name, checksum)) {
+                    state = "CORRUPTED";
+                }
+
+                layers_json.push_back({
+                    { "layer", -1 },
+                    { "layer_index", -1 },
+                    { "blob_id", blob.blob_id },
+                    { "tensor_name", blob.tensor_name },
+                    { "node", g_node_id },
+                    { "node_id", g_node_id },
+                    { "device", device },
+                    { "size_bytes", blob.size_bytes },
+                    { "checksum", checksum },
+                    { "state", state },
+                });
+            }
         }
 
         res.set_content(json({

@@ -36,6 +36,9 @@ struct installed_layer {
     std::string checksum;
     install_state state     = install_state::missing;
     std::chrono::system_clock::time_point updated_at{};
+    // Semantic blob tensor (Task 9.8.3); empty for transformer layers.
+    std::string blob_id;
+    std::string tensor_name;
 
     nlohmann::json to_json() const;
     static installed_layer from_json(const nlohmann::json & j);

@@ -264,6 +264,36 @@ std::vector<layer_blob> layer_store::list_layers() const {
     return layers;
 }
 
+std::vector<layer_store::blob_tensor_info> layer_store::list_blob_tensors() const {
+    std::vector<blob_tensor_info> blobs;
+    const json checksums = load_checksums();
+    if (!checksums.is_object()) {
+        return blobs;
+    }
+
+    for (auto it = checksums.begin(); it != checksums.end(); ++it) {
+        if (!it.value().is_object()) {
+            continue;
+        }
+        const std::string blob_id     = it.value().value("blob_id", "");
+        const std::string tensor_name = it.value().value("tensor_name", "");
+        if (blob_id.empty() || tensor_name.empty()) {
+            continue;
+        }
+        if (!has_blob_tensor(blob_id, tensor_name)) {
+            continue;
+        }
+        blob_tensor_info info;
+        info.blob_id     = blob_id;
+        info.tensor_name = tensor_name;
+        info.size_bytes  = it.value().value("size_bytes", static_cast<uint64_t>(0));
+        info.checksum    = it.value().value("checksum", "");
+        blobs.push_back(std::move(info));
+    }
+
+    return blobs;
+}
+
 bool layer_store::has_layer(const int32_t layer_index) const {
     std::error_code ec;
     return std::filesystem::exists(layer_path(layer_index), ec);

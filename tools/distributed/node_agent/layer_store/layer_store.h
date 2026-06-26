@@ -76,6 +76,14 @@ public:
             const std::string & expected_checksum) const;
     bool remove_blob_tensor(const std::string & blob_id, const std::string & tensor_name);
 
+    struct blob_tensor_info {
+        std::string blob_id;
+        std::string tensor_name;
+        uint64_t    size_bytes = 0;
+        std::string checksum;
+    };
+    std::vector<blob_tensor_info> list_blob_tensors() const;
+
     bool save_metadata_blob(const std::vector<uint8_t> & data);
     std::optional<std::vector<uint8_t>> load_metadata_blob() const;
     std::optional<uint64_t> metadata_bytes() const;

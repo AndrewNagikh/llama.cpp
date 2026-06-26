@@ -469,6 +469,18 @@ install_plan_build_result build_install_plan(
             std::vector<std::string> node_list(all_nodes.begin(), all_nodes.end());
 
             std::set<std::string> blob_seen;
+            std::set<std::string> ready_blobs;
+            for (const auto & layer : actual.layers) {
+                if (layer.blob_id.empty() || layer.tensor_name.empty()) {
+                    continue;
+                }
+                if (layer.state != install_state::ready) {
+                    continue;
+                }
+                ready_blobs.insert(blob_install_key(
+                        layer.node_id, layer.blob_id, layer.tensor_name));
+            }
+
             add_semantic_blob_downloads(
                     operations,
                     blob_seen,
@@ -477,7 +489,8 @@ install_plan_build_result build_install_plan(
                     entry_node,
                     final_node,
                     node_list,
-                    source_url);
+                    source_url,
+                    ready_blobs);
         }
     }
 
