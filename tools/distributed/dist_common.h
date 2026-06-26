@@ -1,5 +1,7 @@
 #pragma once
 
+#include "nlohmann/json.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -143,6 +145,9 @@ void dist_probe_node_memory(dist_node_memory & out);
 void dist_probe_node_cpu(dist_node_cpu & out);
 dist_node_system dist_probe_node_system();
 double dist_bytes_to_gb(uint64_t bytes);
+
+// Parse byte counts from JSON without int32 overflow (>2GB RAM/VRAM).
+uint64_t dist_json_u64(const nlohmann::json & j, const char * key, uint64_t def = 0);
 
 // Normalize backend name to planner device id: cpu / cuda / metal.
 std::string dist_normalize_device(const std::string & backend, bool has_gpu);

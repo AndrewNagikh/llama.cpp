@@ -1207,8 +1207,8 @@ int main(int argc, char ** argv) {
         node.http_port = body.value("port", 0);
         node.n_layer = body.value("n_layer", 0);
         node.n_embd  = body.value("n_embd", 0);
-        node.memory_total_mb = body.value("memory_total_mb", 0);
-        node.memory_free_mb  = body.value("memory_free_mb", 0);
+        node.memory_total_mb = body.value("memory_total_mb", static_cast<int64_t>(0));
+        node.memory_free_mb  = body.value("memory_free_mb", static_cast<int64_t>(0));
         node.score = body.value("score", 1.0);
         if (body.contains("performance")) {
             const auto & perf = body["performance"];
@@ -1224,10 +1224,10 @@ int main(int argc, char ** argv) {
         // Task 8: byte-level memory profile.
         if (body.contains("memory")) {
             const auto & mem = body["memory"];
-            node.memory.total_ram_bytes  = mem.value("total_ram", 0);
-            node.memory.free_ram_bytes   = mem.value("free_ram", 0);
-            node.memory.total_vram_bytes = mem.value("total_vram", 0);
-            node.memory.free_vram_bytes  = mem.value("free_vram", 0);
+            node.memory.total_ram_bytes  = dist_json_u64(mem, "total_ram");
+            node.memory.free_ram_bytes   = dist_json_u64(mem, "free_ram");
+            node.memory.total_vram_bytes = dist_json_u64(mem, "total_vram");
+            node.memory.free_vram_bytes  = dist_json_u64(mem, "free_vram");
             node.memory.has_gpu          = mem.value("has_gpu", false);
 
             // Mirror into the legacy capabilities block.
@@ -1275,10 +1275,10 @@ int main(int argc, char ** argv) {
             node.caps.gpu_backend   = caps.value("gpu_backend", node.caps.gpu_backend);
             node.caps.gpu_memory_mb = caps.value("gpu_memory_mb", 0);
             node.caps.cpu_threads   = caps.value("cpu_threads", 4);
-            if (caps.contains("total_ram"))  node.caps.total_ram_bytes  = caps.value("total_ram", 0);
-            if (caps.contains("free_ram"))   node.caps.free_ram_bytes   = caps.value("free_ram", 0);
-            if (caps.contains("total_vram")) node.caps.total_vram_bytes = caps.value("total_vram", 0);
-            if (caps.contains("free_vram"))  node.caps.free_vram_bytes  = caps.value("free_vram", 0);
+            if (caps.contains("total_ram"))  node.caps.total_ram_bytes  = dist_json_u64(caps, "total_ram");
+            if (caps.contains("free_ram"))   node.caps.free_ram_bytes   = dist_json_u64(caps, "free_ram");
+            if (caps.contains("total_vram")) node.caps.total_vram_bytes = dist_json_u64(caps, "total_vram");
+            if (caps.contains("free_vram"))  node.caps.free_vram_bytes  = dist_json_u64(caps, "free_vram");
             if (caps.contains("has_gpu"))    node.caps.has_gpu          = caps.value("has_gpu", false);
             if (caps.contains("cpu_name"))   node.caps.cpu_name = caps.value("cpu_name", "");
             if (caps.contains("os"))         node.caps.os       = caps.value("os", "");
@@ -1321,10 +1321,12 @@ int main(int argc, char ** argv) {
         }
 
         fprintf(stderr, "orchestrator: registered node %s at %s:%d layers=%d score=%.1f decode=%.1f prefill=%.1f "
-                "ram=%.1fGB vram=%.1fGB has_gpu=%d\n",
+                "ram=%dGB free_ram=%.1fGB vram=%dGB free_vram=%.1fGB has_gpu=%d\n",
                 node.node_id.c_str(), node.host.c_str(), node.http_port, node.n_layer, node.score,
                 node.performance.decode_tps, node.performance.prefill_tps,
+                node.hardware.ram_gb,
                 dist_bytes_to_gb(node.memory.free_ram_bytes),
+                node.hardware.gpu_vram_gb,
                 dist_bytes_to_gb(node.memory.free_vram_bytes),
                 node.memory.has_gpu ? 1 : 0);
 

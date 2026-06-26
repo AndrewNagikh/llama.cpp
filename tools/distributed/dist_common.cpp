@@ -1,6 +1,7 @@
 #include "dist_common.h"
 
 #include "ggml-backend.h"
+#include "nlohmann/json.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -77,6 +78,20 @@ std::string dist_role_name(dist_node_role role) {
 
 double dist_bytes_to_gb(const uint64_t bytes) {
     return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+}
+
+uint64_t dist_json_u64(const nlohmann::json & j, const char * key, const uint64_t def) {
+    if (!j.contains(key) || j[key].is_null()) {
+        return def;
+    }
+    const auto & v = j[key];
+    if (v.is_number_unsigned()) {
+        return v.get<uint64_t>();
+    }
+    if (v.is_number_integer()) {
+        return static_cast<uint64_t>(v.get<int64_t>());
+    }
+    return def;
 }
 
 void dist_probe_node_memory(dist_node_memory & out) {
