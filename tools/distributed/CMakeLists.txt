@@ -82,6 +82,7 @@ function(dist_add_worker name main_source)
 endfunction()
 
 dist_add_exe_light(node_agent node_agent.cpp)
+target_sources(node_agent PRIVATE ${DIST_TRANSPORT_SOURCES})
 dist_add_exe(orchestrator orchestrator.cpp)
 target_sources(orchestrator PRIVATE
     node_agent/layer_store/layer_store.cpp

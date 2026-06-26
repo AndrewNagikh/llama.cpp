@@ -13,6 +13,7 @@
 #include "llama.h"
 
 #include "ggml-backend.h"
+#include "transport/split_tcp_wire.h"
 
 #include <chrono>
 #include <cctype>
@@ -42,6 +43,8 @@ static int32_t g_n_layer = 0;
 static int32_t g_n_embd  = 0;
 static BenchmarkResult g_benchmark{};
 static pid_t g_worker_pid = 0;
+static int g_pipeline_ctrl_port = 0;
+static int g_pipeline_layer_end = 0;
 static model_store g_model_store;
 static std::mutex g_model_store_mu;
 static std::set<std::string> g_active_downloads;
@@ -315,6 +318,84 @@ static void stop_worker() {
         waitpid(g_worker_pid, nullptr, 0);
         g_worker_pid = 0;
     }
+    g_pipeline_ctrl_port = 0;
+    g_pipeline_layer_end = 0;
+}
+
+static bool pipeline_gen3_send_recv(
+        int ctrl_fd,
+        split_gen_cmd cmd,
+        int32_t n_tokens,
+        int32_t pos_start,
+        int32_t layer_end,
+        const int32_t * tokens,
+        split_gen3_a_resp & resp) {
+    if (!split_gen_send_req(ctrl_fd, cmd, n_tokens, pos_start, layer_end, 0, tokens)) {
+        return false;
+    }
+    return split_gen3_recv_a_resp(ctrl_fd, resp, nullptr);
+}
+
+static bool run_local_pipeline_generate(
+        const std::vector<int32_t> & prompt_tokens,
+        int max_new,
+        int layer_end,
+        std::vector<int32_t> & out_tokens,
+        std::string & err) {
+    if (g_pipeline_ctrl_port <= 0) {
+        err = "pipeline not configured";
+        return false;
+    }
+
+    int ctrl_fd = split_tcp_connect_retry("127.0.0.1", g_pipeline_ctrl_port, 300, 100);
+    if (ctrl_fd < 0) {
+        err = "failed to connect to local pipeline ctrl port";
+        return false;
+    }
+
+    split_gen3_a_resp resp{};
+    if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_RESET, 0, 0, layer_end, nullptr, resp)) {
+        err = "reset failed";
+        close(ctrl_fd);
+        return false;
+    }
+
+    if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_PREFILL, (int32_t) prompt_tokens.size(), 0,
+            layer_end, prompt_tokens.data(), resp)) {
+        err = "prefill failed";
+        close(ctrl_fd);
+        return false;
+    }
+
+    if (resp.token_id < 0) {
+        err = "prefill returned error from pipeline";
+        close(ctrl_fd);
+        return false;
+    }
+
+    out_tokens.push_back(resp.token_id);
+    int32_t cur = resp.token_id;
+
+    const int n_prompt = (int) prompt_tokens.size();
+    for (int step = 1; step < max_new; ++step) {
+        const int32_t pos = n_prompt + step - 1;
+        if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur, resp)) {
+            err = "decode failed at step " + std::to_string(step);
+            close(ctrl_fd);
+            return false;
+        }
+        if (resp.token_id < 0) {
+            err = "pipeline error at step " + std::to_string(step);
+            close(ctrl_fd);
+            return false;
+        }
+        cur = resp.token_id;
+        out_tokens.push_back(cur);
+    }
+
+    pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_SHUTDOWN, 0, 0, layer_end, nullptr, resp);
+    close(ctrl_fd);
+    return true;
 }
 
 static bool start_worker(
@@ -598,11 +679,69 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        if (cfg.role == DIST_ROLE_ENTRY) {
+            g_pipeline_ctrl_port = cfg.ctrl_port;
+            g_pipeline_layer_end   = cfg.layer_end;
+        }
+
         res.set_content(json({
             { "ok", true },
             { "role", dist_role_name(cfg.role) },
             { "worker_pid", (int) g_worker_pid },
         }).dump(), "application/json");
+#endif
+    });
+
+    svr.Post("/pipeline/generate", [](const httplib::Request & req, httplib::Response & res) {
+#if defined(_WIN32)
+        res.status = 501;
+        res.set_content(R"({"ok":false,"error":"pipeline generate unsupported on Windows"})", "application/json");
+        return;
+#else
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"invalid json"})", "application/json");
+            return;
+        }
+
+        const int max_tokens = body.value("max_tokens", 16);
+        const int layer_end  = body.value("layer_end", g_pipeline_layer_end);
+
+        std::vector<int32_t> prompt_tokens;
+        if (body.contains("prompt_tokens") && body["prompt_tokens"].is_array()) {
+            for (const auto & t : body["prompt_tokens"]) {
+                prompt_tokens.push_back(t.get<int32_t>());
+            }
+        }
+
+        if (prompt_tokens.empty()) {
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"prompt_tokens required"})", "application/json");
+            return;
+        }
+        if (layer_end <= 0) {
+            res.status = 503;
+            res.set_content(R"({"ok":false,"error":"pipeline not configured"})", "application/json");
+            return;
+        }
+
+        std::vector<int32_t> out_tokens;
+        std::string err;
+        if (!run_local_pipeline_generate(prompt_tokens, max_tokens, layer_end, out_tokens, err)) {
+            res.status = 500;
+            res.set_content(json({ { "ok", false }, { "error", err }, { "tokens", json::array() } }).dump(),
+                    "application/json");
+            return;
+        }
+
+        json tokens_json = json::array();
+        for (const int32_t t : out_tokens) {
+            tokens_json.push_back(t);
+        }
+        res.set_content(json({ { "ok", true }, { "tokens", tokens_json } }).dump(), "application/json");
 #endif
     });
 

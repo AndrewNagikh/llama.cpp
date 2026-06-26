@@ -1087,65 +1087,60 @@ static bool run_generation(
         int max_new,
         std::vector<llama_token> & out_tokens,
         std::string & err) {
-    int ctrl_fd = split_tcp_connect_retry(session.entry_host.c_str(), session.entry_ctrl_port, 300, 100);
-    if (ctrl_fd < 0) {
-        err = "failed to connect to entry node ctrl port";
+    if (session.pipeline.empty()) {
+        err = "empty pipeline";
         return false;
     }
 
-    split_gen3_a_resp resp{};
-
-    if (!gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_RESET, 0, 0, session.entry_layer_end, nullptr, resp)) {
-        err = "reset failed";
-        close(ctrl_fd);
+    const auto & entry = session.pipeline.front();
+    if (entry.http_port <= 0) {
+        err = "entry node missing http_port";
         return false;
     }
 
-    std::vector<int32_t> ptoks(prompt.size());
-    for (size_t i = 0; i < prompt.size(); ++i) {
-        ptoks[i] = (int32_t) prompt[i];
+    json body = {
+        { "prompt_tokens", json::array() },
+        { "max_tokens", max_new },
+        { "layer_end", session.entry_layer_end },
+    };
+    for (const auto t : prompt) {
+        body["prompt_tokens"].push_back((int32_t) t);
     }
 
-    if (!gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_PREFILL, (int32_t) prompt.size(), 0,
-            session.entry_layer_end, ptoks.data(), resp)) {
-        err = "prefill failed";
-        close(ctrl_fd);
+    httplib::Client cli(entry.host.c_str(), entry.http_port);
+    cli.set_connection_timeout(10, 0);
+    cli.set_read_timeout(600, 0);
+
+    const auto res = cli.Post("/pipeline/generate", body.dump(), "application/json");
+    if (!res) {
+        err = "no response from entry node " + entry.node_id + " at " + entry.host + ":" +
+              std::to_string(entry.http_port);
+        return false;
+    }
+    if (res->status != 200) {
+        try {
+            const json j = json::parse(res->body);
+            err = j.value("error", "entry node generate failed");
+        } catch (...) {
+            err = entry.node_id + " generate HTTP " + std::to_string(res->status);
+        }
         return false;
     }
 
-    if (resp.token_id < 0) {
-        err = "prefill returned error from pipeline";
-        close(ctrl_fd);
-        return false;
-    }
-
-    out_tokens.push_back((llama_token) resp.token_id);
-    llama_token cur = (llama_token) resp.token_id;
-
-    const int n_prompt = (int) prompt.size();
-    for (int step = 1; step < max_new; ++step) {
-        const int32_t tok_i32 = (int32_t) cur;
-        const int32_t pos     = n_prompt + step - 1;
-
-        if (!gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, session.entry_layer_end, &tok_i32, resp)) {
-            err = "decode failed at step " + std::to_string(step);
-            close(ctrl_fd);
+    try {
+        const json j = json::parse(res->body);
+        if (!j.value("ok", false)) {
+            err = j.value("error", "generate failed");
             return false;
         }
-
-        if (resp.token_id < 0) {
-            err = "pipeline error at step " + std::to_string(step);
-            close(ctrl_fd);
-            return false;
+        for (const auto & t : j.at("tokens")) {
+            out_tokens.push_back((llama_token) t.get<int>());
         }
-
-        cur = (llama_token) resp.token_id;
-        out_tokens.push_back(cur);
+        return true;
+    } catch (...) {
+        err = "invalid generate response from entry node";
+        return false;
     }
-
-    gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_SHUTDOWN, 0, 0, session.entry_layer_end, nullptr, resp);
-    close(ctrl_fd);
-    return true;
 }
 
 static void usage(const char * prog) {
