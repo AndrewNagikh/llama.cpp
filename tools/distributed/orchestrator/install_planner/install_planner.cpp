@@ -386,16 +386,29 @@ install_plan_build_result build_install_plan(
     if (!source_url.empty() && !desired.placements.empty()) {
         std::string entry_node;
         std::string final_node;
-        int32_t min_layer = INT32_MAX;
-        int32_t max_layer = -1;
+        const int32_t last_layer = static_cast<int32_t>(manifest.n_layer) - 1;
+
         for (const auto & placement : desired.placements) {
-            if (placement.layer_index < min_layer) {
-                min_layer  = placement.layer_index;
+            if (placement.layer_index == 0) {
                 entry_node = placement.node_id;
             }
-            if (placement.layer_index > max_layer) {
-                max_layer  = placement.layer_index;
+            if (placement.layer_index == last_layer) {
                 final_node = placement.node_id;
+            }
+        }
+
+        if (entry_node.empty() || final_node.empty()) {
+            int32_t min_layer = INT32_MAX;
+            int32_t max_layer = -1;
+            for (const auto & placement : desired.placements) {
+                if (placement.layer_index < min_layer) {
+                    min_layer  = placement.layer_index;
+                    entry_node = placement.node_id;
+                }
+                if (placement.layer_index > max_layer) {
+                    max_layer  = placement.layer_index;
+                    final_node = placement.node_id;
+                }
             }
         }
 

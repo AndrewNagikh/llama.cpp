@@ -470,11 +470,22 @@ static const desired_model_layout * planning_target_layout(const dist_model_reco
 
 static bool build_and_store_install_plan(
         const std::string & model_id,
-        dist_model_record * record) {
+        dist_model_record * record,
+        const desired_model_layout * layout_override = nullptr) {
     if (!record || !record->manifest.has_value()) {
         return false;
     }
-    const desired_model_layout * target = planning_target_layout(*record);
+
+    const desired_model_layout * target = layout_override;
+    if (!target) {
+        // Use committed layout for normal installs. Optimizer pending_layout is
+        // only applied during an explicit rebalance pipeline.
+        if (record->layout.has_value()) {
+            target = &record->layout->desired;
+        } else if (record->pending_layout.has_value()) {
+            target = &record->pending_layout->desired;
+        }
+    }
     if (!target) {
         return false;
     }
@@ -565,7 +576,7 @@ static void coordinate_rebalance_pipeline(const std::string model_id) {
         return;
     }
 
-    if (!build_and_store_install_plan(model_id, record)) {
+    if (!build_and_store_install_plan(model_id, record, &record->pending_layout->desired)) {
         g_registry.discard_pending_layout(model_id);
         return;
     }
