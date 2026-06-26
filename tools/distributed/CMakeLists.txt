@@ -37,6 +37,7 @@ set(DIST_COMMON_SOURCES
     orchestrator/optimizer/cluster_optimizer.cpp
     orchestrator/coverage/coverage.cpp
     orchestrator/install_planner/install_planner.cpp
+    orchestrator/registry_persistence.cpp
     node_core.cpp
 )
 

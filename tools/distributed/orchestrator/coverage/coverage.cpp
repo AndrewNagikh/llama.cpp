@@ -388,3 +388,59 @@ bool coverage_has_no_extra_layers(
     }
     return true;
 }
+
+std::optional<desired_model_layout> desired_layout_from_actual(
+        const std::string & model_id,
+        const actual_model_layout & actual,
+        const int32_t n_layer) {
+    if (n_layer <= 0) {
+        return std::nullopt;
+    }
+
+    std::map<int32_t, installed_layer> ready_by_layer;
+    for (const auto & layer : actual.layers) {
+        if (layer.layer_index < 0 || layer.layer_index >= n_layer) {
+            continue;
+        }
+        if (!layer.blob_id.empty() || !layer.tensor_name.empty()) {
+            continue;
+        }
+        if (layer.state != install_state::ready) {
+            continue;
+        }
+        if (layer.node_id.empty()) {
+            continue;
+        }
+        ready_by_layer[layer.layer_index] = layer;
+    }
+
+    if (static_cast<int32_t>(ready_by_layer.size()) != n_layer) {
+        return std::nullopt;
+    }
+
+    desired_model_layout layout;
+    layout.model_id     = model_id;
+    layout.fits_cluster = true;
+    layout.placements.reserve(static_cast<size_t>(n_layer));
+
+    for (int32_t i = 0; i < n_layer; ++i) {
+        const auto it = ready_by_layer.find(i);
+        if (it == ready_by_layer.end()) {
+            return std::nullopt;
+        }
+        layer_placement p;
+        p.layer_index = i;
+        p.node_id     = it->second.node_id;
+        p.device      = it->second.device;
+        p.size_bytes  = it->second.size_bytes;
+        p.required    = true;
+        layout.total_weight_bytes += p.size_bytes;
+        layout.placements.push_back(std::move(p));
+    }
+
+    std::sort(layout.placements.begin(), layout.placements.end(),
+            [](const layer_placement & a, const layer_placement & b) {
+                return a.layer_index < b.layer_index;
+            });
+    return layout;
+}

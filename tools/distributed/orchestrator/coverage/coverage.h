@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -115,3 +116,9 @@ bool coverage_has_no_extra_layers(
         const desired_model_layout & desired,
         const actual_model_layout & actual,
         std::string & error);
+
+// Infer committed layout from installed transformer layers (bootstrap after restart).
+std::optional<desired_model_layout> desired_layout_from_actual(
+        const std::string & model_id,
+        const actual_model_layout & actual,
+        int32_t n_layer);

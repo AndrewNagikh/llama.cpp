@@ -3,6 +3,7 @@
 #include "memory_estimator.h"
 #include "model_catalog.h"
 #include "orchestrator/model_registry.h"
+#include "orchestrator/registry_persistence.h"
 #include "orchestrator/manifest_builder/manifest_builder.h"
 #include "orchestrator/layout_planner/layout_planner.h"
 #include "orchestrator/coverage/coverage.h"
@@ -75,6 +76,10 @@ struct cluster_sync_job {
 
 static std::map<std::string, cluster_sync_job> g_sync_jobs;
 static std::map<std::string, nlohmann::json> g_verify_reports;
+
+static void persist_registry();
+static void sync_model_state_from_cluster(const std::string & model_id, bool try_infer_layout);
+static void bootstrap_all_models_from_cluster();
 
 static std::string make_id(const char * prefix) {
     static std::mt19937_64 rng{ std::random_device{}() };
@@ -518,7 +523,11 @@ static bool build_and_store_install_plan(
         return false;
     }
 
-    return g_registry.apply_install_plan(model_id, built.plan, record);
+    const bool applied = g_registry.apply_install_plan(model_id, built.plan, record);
+    if (applied) {
+        persist_registry();
+    }
+    return applied;
 }
 
 static optimization_result optimize_registered_model(
@@ -627,11 +636,90 @@ static void coordinate_rebalance_pipeline(const std::string model_id) {
     g_registry.commit_pending_layout(model_id);
 }
 
+static void persist_registry() {
+    if (g_models_dir.empty()) {
+        return;
+    }
+    registry_persistence_save(g_models_dir, g_registry);
+}
+
+static void sync_model_state_from_cluster(
+        const std::string & model_id,
+        const bool try_infer_layout) {
+    dist_model_record * record = g_registry.find(model_id);
+    if (!record || !record->manifest.has_value()) {
+        return;
+    }
+
+    actual_model_layout actual;
+    std::set<std::string> online_nodes;
+    poll_installed_layers_from_nodes(model_id, actual, online_nodes);
+    g_registry.apply_actual(model_id, actual, record);
+
+    record = g_registry.find(model_id);
+    if (!record) {
+        return;
+    }
+
+    const int32_t n_layer = static_cast<int32_t>(record->manifest->n_layer);
+    const bool needs_layout = !record->layout.has_value() ||
+            record->layout->desired.placements.empty();
+
+    if (try_infer_layout && needs_layout && n_layer > 0) {
+        if (const auto inferred = desired_layout_from_actual(model_id, actual, n_layer)) {
+            g_registry.apply_layout(model_id, *inferred, record);
+            record = g_registry.find(model_id);
+            fprintf(stderr,
+                    "orchestrator: inferred layout for %s from installed layers (%d placements)\n",
+                    model_id.c_str(),
+                    static_cast<int>(inferred->placements.size()));
+        }
+    }
+
+    if (record && record->layout.has_value() && !record->layout->desired.placements.empty()) {
+        g_registry.refresh_coverage(model_id, online_nodes, record);
+        record = g_registry.find(model_id);
+
+        // Saved layout may be stale after restart; adopt on-disk placement when fully installed.
+        if (try_infer_layout && record && record->coverage.has_value() &&
+                record->coverage->state != coverage_state::ready && n_layer > 0) {
+            if (const auto inferred = desired_layout_from_actual(model_id, actual, n_layer)) {
+                if (!layouts_placement_equal(record->layout->desired, *inferred)) {
+                    g_registry.apply_layout(model_id, *inferred, record);
+                    record = g_registry.find(model_id);
+                    fprintf(stderr,
+                            "orchestrator: adopted actual layout for %s (%d placements, saved layout mismatch)\n",
+                            model_id.c_str(),
+                            static_cast<int>(inferred->placements.size()));
+                    if (record) {
+                        g_registry.refresh_coverage(model_id, online_nodes, record);
+                    }
+                }
+            }
+        }
+    } else if (record && record->layout.has_value()) {
+        g_registry.refresh_coverage(model_id, online_nodes, record);
+    }
+}
+
+static void bootstrap_all_models_from_cluster() {
+    for (const auto & model : g_registry.list()) {
+        if (model.manifest.has_value()) {
+            sync_model_state_from_cluster(model.model_id, true);
+        }
+    }
+    persist_registry();
+}
+
 static void trigger_cluster_optimization_async() {
     std::thread([]() {
         const auto models = g_registry.list();
         for (const auto & model : models) {
             if (!model.manifest.has_value()) {
+                continue;
+            }
+            if (model.coverage.has_value() &&
+                    model.coverage->state == coverage_state::ready) {
                 continue;
             }
             const optimization_result result = optimize_registered_model(model.model_id);
@@ -1219,6 +1307,11 @@ int main(int argc, char ** argv) {
         g_models_dir = default_models_dir();
     }
 
+    if (registry_persistence_load(g_models_dir, g_registry)) {
+        fprintf(stderr, "orchestrator: restored registry from %s/.orchestrator/registry.json\n",
+                g_models_dir.c_str());
+    }
+
     std::string bind_host;
     int port = 0;
     if (!dist_parse_host_port(listen, bind_host, port)) {
@@ -1366,6 +1459,7 @@ int main(int argc, char ** argv) {
             g_nodes[node.node_id] = node;
         }
 
+        bootstrap_all_models_from_cluster();
         if (cluster_changed) {
             trigger_cluster_optimization_async();
         }
@@ -2044,11 +2138,27 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        dist_model_record record = dist_model_record_from_json(body);
-        record.status = dist_model_status::discovered;
-        g_registry.add_or_update(record);
+        dist_model_record incoming = dist_model_record_from_json(body);
+        const std::string model_id = incoming.model_id;
 
-        res.set_content(record.to_json().dump(), "application/json");
+        if (dist_model_record * existing = g_registry.find(model_id)) {
+            dist_model_record merged = *existing;
+            if (!incoming.display_name.empty()) merged.display_name = incoming.display_name;
+            if (!incoming.source.empty())       merged.source       = incoming.source;
+            if (!incoming.repository.empty())   merged.repository   = incoming.repository;
+            if (!incoming.filename.empty())     merged.filename     = incoming.filename;
+            if (!incoming.revision.empty())     merged.revision     = incoming.revision;
+            g_registry.add_or_update(merged);
+            persist_registry();
+            res.set_content(merged.to_json().dump(), "application/json");
+            return;
+        }
+
+        incoming.status = dist_model_status::discovered;
+        g_registry.add_or_update(incoming);
+        persist_registry();
+
+        res.set_content(incoming.to_json().dump(), "application/json");
     });
 
     // GET /models - List all registered models.
@@ -2313,6 +2423,7 @@ int main(int argc, char ** argv) {
         }
 
         cache_manifest_metadata(model_id, build.manifest);
+        persist_registry();
 
         res.set_content(json({
             { "status", "ok" },
@@ -2324,7 +2435,11 @@ int main(int argc, char ** argv) {
             { "metadata_bytes_read", build.bytes_read },
         }).dump(), "application/json");
 
-        trigger_cluster_optimization_async();
+        if (!record->layout.has_value() ||
+                !record->coverage.has_value() ||
+                record->coverage->state != coverage_state::ready) {
+            trigger_cluster_optimization_async();
+        }
     });
 
     // GET /models/{model_id}/manifest - Return the stored manifest.
@@ -2344,7 +2459,8 @@ int main(int argc, char ** argv) {
         res.set_content(record->manifest->to_json().dump(), "application/json");
     });
 
-    // POST /models/{model_id}/layout - Build desired cluster layout.
+    // POST /models/{model_id}/layout - Return stored layout or build if missing.
+    // Pass {"force": true} to recompute layout from the planner.
     svr.Post(R"(/models/([^/]+)/layout)", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.matches[1];
 
@@ -2360,6 +2476,44 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        bool force = false;
+        int request_ctx = g_n_ctx;
+        try {
+            if (!req.body.empty()) {
+                const json body = json::parse(req.body);
+                force = body.value("force", false);
+                if (body.contains("n_ctx")) {
+                    request_ctx = body.value("n_ctx", g_n_ctx);
+                }
+            }
+        } catch (...) {}
+
+        sync_model_state_from_cluster(model_id, true);
+        record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+
+        if (!force && record->layout.has_value() &&
+                !record->layout->desired.placements.empty()) {
+            const auto & layout = record->layout->desired;
+            res.set_content(json({
+                { "status", "ok" },
+                { "cached", true },
+                { "model", model_id },
+                { "fits_cluster", layout.fits_cluster },
+                { "placements", static_cast<int>(layout.placements.size()) },
+                { "coverage", record->coverage.has_value()
+                        ? coverage_state_to_string(record->coverage->state)
+                        : "unknown" },
+                { "total_weight_bytes", layout.total_weight_bytes },
+                { "total_required_memory", layout.total_required_memory },
+            }).dump(), "application/json");
+            return;
+        }
+
         std::vector<layout_node_input> nodes;
         {
             std::lock_guard<std::mutex> lock(g_mu);
@@ -2370,15 +2524,10 @@ int main(int argc, char ** argv) {
             }
         }
 
-        int request_ctx = g_n_ctx;
-        try {
-            if (!req.body.empty()) {
-                const json body = json::parse(req.body);
-                if (body.contains("n_ctx")) {
-                    request_ctx = body.value("n_ctx", g_n_ctx);
-                }
-            }
-        } catch (...) {}
+        desired_model_layout previous;
+        if (record->layout.has_value()) {
+            previous = record->layout->desired;
+        }
 
         const auto built = build_desired_layout(model_id, *record->manifest, nodes, request_ctx);
         if (!built.success) {
@@ -2397,8 +2546,12 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        sync_model_state_from_cluster(model_id, false);
+        persist_registry();
+
         res.set_content(json({
             { "status", "ok" },
+            { "cached", false },
             { "model", model_id },
             { "fits_cluster", built.layout.fits_cluster },
             { "placements", static_cast<int>(built.layout.placements.size()) },
@@ -2406,7 +2559,9 @@ int main(int argc, char ** argv) {
             { "total_required_memory", built.layout.total_required_memory },
         }).dump(), "application/json");
 
-        trigger_cluster_optimization_async();
+        if (!layouts_placement_equal(previous, built.layout)) {
+            trigger_cluster_optimization_async();
+        }
     });
 
     // GET /models/{model_id}/layout - Return stored desired layout.
@@ -2792,6 +2947,7 @@ int main(int argc, char ** argv) {
     svr.Delete(R"(/models/([^/]+))", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.matches[1];
         if (g_registry.remove(model_id)) {
+            persist_registry();
             res.set_content(json({ { "ok", true } }).dump(), "application/json");
             return;
         }

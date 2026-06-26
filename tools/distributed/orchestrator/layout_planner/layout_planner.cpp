@@ -228,6 +228,28 @@ bool layout_has_full_coverage(const desired_model_layout & layout, int32_t n_lay
     return true;
 }
 
+bool layouts_placement_equal(
+        const desired_model_layout & a,
+        const desired_model_layout & b) {
+    if (a.placements.size() != b.placements.size()) {
+        return false;
+    }
+
+    std::vector<std::pair<int32_t, std::string>> pa;
+    std::vector<std::pair<int32_t, std::string>> pb;
+    pa.reserve(a.placements.size());
+    pb.reserve(b.placements.size());
+    for (const auto & p : a.placements) {
+        pa.emplace_back(p.layer_index, p.node_id);
+    }
+    for (const auto & p : b.placements) {
+        pb.emplace_back(p.layer_index, p.node_id);
+    }
+    std::sort(pa.begin(), pa.end());
+    std::sort(pb.begin(), pb.end());
+    return pa == pb;
+}
+
 bool validate_desired_layout(
         const desired_model_layout & layout,
         const model_manifest & manifest,

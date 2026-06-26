@@ -7,6 +7,7 @@
 #include "nlohmann/json.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -87,5 +88,9 @@ bool validate_desired_layout(
 
 bool layout_has_full_coverage(const desired_model_layout & layout, int32_t n_layer);
 bool layout_has_no_overlap(const desired_model_layout & layout);
+
+bool layouts_placement_equal(
+        const desired_model_layout & a,
+        const desired_model_layout & b);
 
 std::string layout_normalize_device(const layout_node_input & node);
