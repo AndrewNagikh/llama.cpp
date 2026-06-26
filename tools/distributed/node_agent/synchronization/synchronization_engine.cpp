@@ -20,6 +20,14 @@ static bool verify_operation_stored(const install_operation & op, layer_store & 
 
 static executor_result execute_delete(const install_operation & op, layer_store & store) {
     executor_result result;
+    if (!op.download.blob_id.empty() && !op.download.tensor_name.empty()) {
+        if (!store.remove_blob_tensor(op.download.blob_id, op.download.tensor_name)) {
+            result.error = "failed to remove blob tensor";
+            return result;
+        }
+        result.success = true;
+        return result;
+    }
     if (!store.remove_layer(op.layer_index)) {
         result.error = "failed to remove layer";
         return result;

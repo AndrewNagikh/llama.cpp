@@ -230,6 +230,7 @@ static dist_configure_req parse_configure(const json & body) {
     req.next_port   = body.value("next_port", 0);
     req.peer_bind   = body.value("peer_bind", "0.0.0.0");
     req.next_is_final = body.value("next_is_final", false);
+    req.source_url    = body.value("source_url", "");
     return req;
 }
 
@@ -492,6 +493,14 @@ static std::string materialize_worker_gguf(
     const auto manifest = store.load_manifest();
     if (!manifest.has_value()) {
         err = "manifest not found in layer store; run install/sync first";
+        return {};
+    }
+
+    if (!store.metadata_bytes().has_value() && !cfg.source_url.empty()) {
+        layer_store_cache_metadata(store, *manifest, cfg.source_url);
+    }
+    if (!store.metadata_bytes().has_value()) {
+        err = "metadata.bin missing in layer store; run install/sync first";
         return {};
     }
 

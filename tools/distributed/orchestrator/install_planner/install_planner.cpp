@@ -511,6 +511,7 @@ install_plan_build_result build_install_plan(
                     final_node,
                     node_list,
                     source_url,
+                    actual,
                     ready_blobs);
         }
     }

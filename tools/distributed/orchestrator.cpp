@@ -1153,6 +1153,10 @@ static bool setup_pipeline(
             { "peer_bind", "0.0.0.0" },
         };
 
+        if (const dist_model_record * record = g_registry.find(session.model)) {
+            cfg["source_url"] = resolve_model_source_url(*record);
+        }
+
         if (stage.role == DIST_ROLE_FINAL) {
             cfg["role"] = "final";
             cfg["peer_port"] = stage.peer_port;

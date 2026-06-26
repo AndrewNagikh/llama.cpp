@@ -173,6 +173,13 @@ bool layer_store_materialize_gguf(
             desc.worker_requirements, role, layer_start, layer_end);
 
     std::vector<std::string> required_blobs = plan.required_blobs;
+
+    // Replicated globals (e.g. Llama 3 RoPE table) must be present on every worker GGUF.
+    for (const semantic_blob & blob : desc.blobs) {
+        if (blob.deploy == blob_deploy_target::all_nodes) {
+            required_blobs.push_back(blob.id);
+        }
+    }
     if (include_embedding) {
         for (const semantic_blob & blob : desc.blobs) {
             if (blob.deploy == blob_deploy_target::entry_node ||

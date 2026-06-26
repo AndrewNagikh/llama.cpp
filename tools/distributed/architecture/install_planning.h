@@ -23,4 +23,5 @@ void add_semantic_blob_downloads(
         const std::string & final_node,
         const std::vector<std::string> & all_nodes,
         const std::string & source_url,
+        const actual_model_layout & actual,
         const std::set<std::string> & ready_blobs = {});

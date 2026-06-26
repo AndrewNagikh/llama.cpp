@@ -31,6 +31,8 @@ void build_entry_globals(architecture_descriptor & desc, const model_manifest & 
             blob_id = "input_norm";
         } else if (semantic == tensor_semantic_role::rotary) {
             blob_id = "rope";
+            // RoPE frequency table is required on every pipeline stage (Llama 3+).
+            deploy = blob_deploy_target::all_nodes;
         }
 
         semantic_blob * blob = ensure_blob(desc, blob_id, semantic, deploy);
