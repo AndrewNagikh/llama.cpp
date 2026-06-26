@@ -10,6 +10,14 @@
 
 namespace {
 
+static bool verify_operation_stored(const install_operation & op, layer_store & store) {
+    const download_operation & dl = op.download;
+    if (!dl.blob_id.empty() && !dl.tensor_name.empty()) {
+        return store.verify_blob_tensor(dl.blob_id, dl.tensor_name, dl.checksum);
+    }
+    return store.verify_layer(op.layer_index, dl.checksum);
+}
+
 static executor_result execute_delete(const install_operation & op, layer_store & store) {
     executor_result result;
     if (!store.remove_layer(op.layer_index)) {
@@ -22,8 +30,7 @@ static executor_result execute_delete(const install_operation & op, layer_store 
 
 static executor_result execute_verify(const install_operation & op, layer_store & store) {
     executor_result result;
-    const std::string checksum = op.download.checksum;
-    if (!store.verify_layer(op.layer_index, checksum)) {
+    if (!verify_operation_stored(op, store)) {
         result.error = "layer verification failed";
         return result;
     }
@@ -149,7 +156,7 @@ void synchronization_engine::run_job(
                 if (it != jobs_.end() && i < it->second.operations.size()) {
                     it->second.operations[i].state = sync_operation_state::verifying;
                 }
-                if (!store.verify_layer(op.layer_index, op.download.checksum)) {
+                if (!verify_operation_stored(op, store)) {
                     result.success = false;
                     result.error   = "verification failed after download";
                 }
