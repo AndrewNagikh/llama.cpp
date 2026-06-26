@@ -28,8 +28,13 @@ bool checksum_matches(
         return len > 0;
     }
 
-    const std::string stub = "manifest:layer:" + std::to_string(layer_index);
-    if (expected == stub) {
+    const std::string layer_stub = "manifest:layer:" + std::to_string(layer_index);
+    if (expected == layer_stub) {
+        return len == size_bytes;
+    }
+
+    // manifest:role:* and other manifest stubs verify size only.
+    if (expected.rfind("manifest:", 0) == 0) {
         return len == size_bytes;
     }
 

@@ -57,7 +57,8 @@ static bool http_range_fetch(
 
     httplib::Client cli(url.c_str());
     cli.set_connection_timeout(30, 0);
-    cli.set_read_timeout(300, 0);
+    const int read_timeout_s = length > 64 * 1024 * 1024 ? 900 : 300;
+    cli.set_read_timeout(read_timeout_s, 0);
     cli.set_follow_location(true);
 
     const auto res = cli.Get(url.c_str(), headers);
