@@ -71,6 +71,12 @@ set(VERIFICATION_SOURCES
     verification/alignment_verify.cpp
     verification/parity_verify.cpp
     verification/materialization_verify.cpp
+    verification/manifest_verify.cpp
+    verification/worker_tensor_plan.cpp
+    verification/load_verify.cpp
+    verification/hidden_state_verify.cpp
+    verification/logits_compare.cpp
+    verification/verification_stages.cpp
     verification/verification_pipeline.cpp
     verification/layer_store_populate.cpp
     verification/worker_verify.cpp
@@ -121,6 +127,9 @@ dist_add_verify_exe(gguf_inspect gguf_inspect.cpp)
 dist_add_verify_exe(gguf_diff gguf_diff.cpp)
 dist_add_verify_exe(tensor_verify tensor_verify.cpp)
 dist_add_verify_exe(layer_verify layer_verify.cpp)
+dist_add_verify_exe(materialization_verify materialization_verify_tool.cpp)
+dist_add_verify_exe(logits_compare logits_compare_tool.cpp)
+dist_add_verify_exe(hidden_state_compare hidden_state_compare_tool.cpp)
 
 dist_add_worker(split_gen3_a ${DIST_WORKERS_DIR}/split_gen3_a.cpp)
 dist_add_worker(split_gen3_b ${DIST_WORKERS_DIR}/split_gen3_b.cpp)
@@ -542,6 +551,7 @@ if (LLAMA_BUILD_TESTS)
     dist_add_verify_test(test-materialized-load)
     dist_add_verify_test(test-logit-parity)
     dist_add_verify_test(test-sampling-parity)
+    dist_add_verify_test(test-materialization-verification)
     dist_add_verify_test(test-layer-store-verification)
     dist_add_verify_test(test-verification-multi-model)
 endif()

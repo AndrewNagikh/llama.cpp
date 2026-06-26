@@ -70,27 +70,6 @@ static bool write_at(std::vector<uint8_t> & file, const uint64_t offset, const u
     return true;
 }
 
-static bool tensor_included(
-        const tensor_descriptor & t,
-        const int32_t layer_start,
-        const int32_t layer_end,
-        const bool include_embedding,
-        const bool include_output) {
-    if (t.role == tensor_role::embedding && include_embedding) {
-        return true;
-    }
-    if (include_embedding && t.layer < layer_start &&
-            t.role != tensor_role::output_norm &&
-            t.role != tensor_role::lm_head) {
-        return true;
-    }
-    if (include_output &&
-            (t.role == tensor_role::output_norm || t.role == tensor_role::lm_head)) {
-        return true;
-    }
-    return t.layer >= layer_start && t.layer < layer_end;
-}
-
 } // namespace
 
 bool layer_store_cache_metadata(
