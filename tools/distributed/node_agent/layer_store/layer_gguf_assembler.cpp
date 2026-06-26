@@ -126,10 +126,9 @@ bool layer_store_materialize_gguf(
     }
 
     uint64_t file_size = manifest.tensor_data_offset;
+    // Metadata describes the full tensor directory; the file must span every
+    // listed tensor offset even for partial workers (unused regions stay zero).
     for (const auto & t : manifest.tensors) {
-        if (!tensor_included(t, layer_start, layer_end, include_embedding, include_output)) {
-            continue;
-        }
         if (t.offset > 0 || t.size_bytes > 0) {
             file_size = std::max(file_size, t.offset + t.size_bytes);
         }
