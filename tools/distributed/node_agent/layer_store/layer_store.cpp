@@ -1,6 +1,8 @@
 #include "layer_store.h"
+#include "layer_special.h"
 
 #include "layer_checksum.h"
+#include "layer_gguf_assembler.h"
 
 #include <algorithm>
 #include <fstream>
@@ -27,6 +29,12 @@ std::filesystem::path layer_store::layers_dir() const {
 }
 
 std::string layer_store::layer_filename(const int32_t layer_index) {
+    if (layer_index == layer_special::embedding) {
+        return "special_embedding.bin";
+    }
+    if (layer_index == layer_special::output) {
+        return "special_output.bin";
+    }
     char buf[16];
     snprintf(buf, sizeof(buf), "%03d.bin", layer_index);
     return buf;
@@ -255,4 +263,48 @@ std::vector<layer_blob> layer_store::list_layers() const {
 bool layer_store::has_layer(const int32_t layer_index) const {
     std::error_code ec;
     return std::filesystem::exists(layer_path(layer_index), ec);
+}
+
+bool layer_store::save_metadata_blob(const std::vector<uint8_t> & data) {
+    if (!ensure_dirs() || data.empty()) {
+        return false;
+    }
+    std::ofstream out(model_root() / "metadata.bin", std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return false;
+    }
+    out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+    return static_cast<bool>(out);
+}
+
+std::optional<std::vector<uint8_t>> layer_store::load_metadata_blob() const {
+    const auto path = model_root() / "metadata.bin";
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        return std::nullopt;
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return std::nullopt;
+    }
+    in.seekg(0, std::ios::end);
+    const auto size = in.tellg();
+    if (size <= 0) {
+        return std::nullopt;
+    }
+    in.seekg(0, std::ios::beg);
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    in.read(reinterpret_cast<char *>(data.data()), size);
+    if (!in) {
+        return std::nullopt;
+    }
+    return data;
+}
+
+std::optional<uint64_t> layer_store::metadata_bytes() const {
+    const auto data = load_metadata_blob();
+    if (!data.has_value()) {
+        return std::nullopt;
+    }
+    return static_cast<uint64_t>(data->size());
 }

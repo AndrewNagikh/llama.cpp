@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <map>
 #include <set>
 #include <tuple>
@@ -284,6 +285,34 @@ layer_byte_range manifest_layer_byte_range(
     return range;
 }
 
+layer_byte_range manifest_role_byte_range(
+        const model_manifest & manifest,
+        const tensor_role role) {
+    layer_byte_range range{};
+    uint64_t min_offset = UINT64_MAX;
+    uint64_t max_end    = 0;
+
+    for (const auto & t : manifest.tensors) {
+        if (t.role != role) {
+            continue;
+        }
+        if (t.offset > 0 || t.size_bytes > 0) {
+            min_offset = std::min(min_offset, t.offset);
+            max_end    = std::max(max_end, t.offset + t.size_bytes);
+        }
+    }
+
+    if (min_offset == UINT64_MAX || max_end <= min_offset) {
+        return range;
+    }
+
+    range.offset     = min_offset;
+    range.length     = max_end - min_offset;
+    range.size_bytes = range.length;
+    range.checksum   = "manifest:role:" + tensor_role_to_string(role);
+    return range;
+}
+
 // ---------------------------------------------------------------------------
 // Planner
 // ---------------------------------------------------------------------------
@@ -351,6 +380,66 @@ install_plan_build_result build_install_plan(
                 contains_layer(coverage.missing, placement.layer_index)) {
             add_operation(operations, seen, install_action::download,
                     placement.node_id, placement.layer_index, dl);
+        }
+    }
+
+    if (!source_url.empty() && !desired.placements.empty()) {
+        std::string entry_node;
+        std::string final_node;
+        int32_t min_layer = INT32_MAX;
+        int32_t max_layer = -1;
+        for (const auto & placement : desired.placements) {
+            if (placement.layer_index < min_layer) {
+                min_layer  = placement.layer_index;
+                entry_node = placement.node_id;
+            }
+            if (placement.layer_index > max_layer) {
+                max_layer  = placement.layer_index;
+                final_node = placement.node_id;
+            }
+        }
+
+        if (!entry_node.empty()) {
+            const layer_byte_range emb = manifest_role_byte_range(manifest, tensor_role::embedding);
+            if (emb.length > 0) {
+                download_operation dl = make_download_op(
+                        layer_special::embedding, entry_node, emb, source_url);
+                add_operation(operations, seen, install_action::download,
+                        entry_node, layer_special::embedding, dl);
+            }
+        }
+
+        if (!final_node.empty()) {
+            layer_byte_range out_range{};
+            const layer_byte_range norm = manifest_role_byte_range(manifest, tensor_role::output_norm);
+            const layer_byte_range head = manifest_role_byte_range(manifest, tensor_role::lm_head);
+            if (norm.length > 0) {
+                if (out_range.length == 0) {
+                    out_range = norm;
+                } else {
+                    const uint64_t end = std::max(norm.offset + norm.length, out_range.offset + out_range.length);
+                    out_range.offset = std::min(norm.offset, out_range.offset);
+                    out_range.length = end - out_range.offset;
+                    out_range.size_bytes = out_range.length;
+                }
+            }
+            if (head.length > 0) {
+                if (out_range.length == 0) {
+                    out_range = head;
+                } else {
+                    const uint64_t end = std::max(head.offset + head.length, out_range.offset + out_range.length);
+                    out_range.offset = std::min(head.offset, out_range.offset);
+                    out_range.length = end - out_range.offset;
+                    out_range.size_bytes = out_range.length;
+                }
+            }
+            if (out_range.length > 0) {
+                out_range.checksum = "manifest:role:output";
+                download_operation dl = make_download_op(
+                        layer_special::output, final_node, out_range, source_url);
+                add_operation(operations, seen, install_action::download,
+                        final_node, layer_special::output, dl);
+            }
         }
     }
 

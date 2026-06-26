@@ -49,6 +49,7 @@ set(DIST_INCLUDE_DIRS
 set(NODE_AGENT_SOURCES
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
+    node_agent/layer_store/layer_gguf_assembler.cpp
     node_agent/synchronization/sync_types.cpp
     node_agent/synchronization/synchronization_engine.cpp
     node_agent/synchronization/executors/http_range/http_range_executor.cpp
@@ -82,6 +83,11 @@ endfunction()
 
 dist_add_exe_light(node_agent node_agent.cpp)
 dist_add_exe(orchestrator orchestrator.cpp)
+target_sources(orchestrator PRIVATE
+    node_agent/layer_store/layer_store.cpp
+    node_agent/layer_store/layer_checksum.cpp
+    node_agent/layer_store/layer_gguf_assembler.cpp
+)
 
 dist_add_worker(split_gen3_a ${DIST_WORKERS_DIR}/split_gen3_a.cpp)
 dist_add_worker(split_gen3_b ${DIST_WORKERS_DIR}/split_gen3_b.cpp)
@@ -399,6 +405,7 @@ if (LLAMA_BUILD_TESTS)
     set(SYNC_AGENT_SOURCES
         node_agent/layer_store/layer_store.cpp
         node_agent/layer_store/layer_checksum.cpp
+        node_agent/layer_store/layer_gguf_assembler.cpp
         node_agent/synchronization/sync_types.cpp
         node_agent/synchronization/synchronization_engine.cpp
         node_agent/synchronization/executors/http_range/http_range_executor.cpp
@@ -458,6 +465,7 @@ if (LLAMA_BUILD_TESTS)
         ${MODEL_REGISTRY_SOURCES}
         node_agent/layer_store/layer_store.cpp
         node_agent/layer_store/layer_checksum.cpp
+        node_agent/layer_store/layer_gguf_assembler.cpp
         node_agent/synchronization/sync_types.cpp
         node_agent/synchronization/synchronization_engine.cpp
         node_agent/synchronization/executors/http_range/http_range_executor.cpp)

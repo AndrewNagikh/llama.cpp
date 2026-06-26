@@ -3,6 +3,7 @@
 #include "coverage/coverage.h"
 #include "layout_planner/layout_planner.h"
 #include "manifest_builder/manifest_builder.h"
+#include "node_agent/layer_store/layer_special.h"
 
 #include "nlohmann/json.hpp"
 
@@ -88,6 +89,10 @@ struct install_plan_build_result {
 layer_byte_range manifest_layer_byte_range(
         const model_manifest & manifest,
         int32_t layer_index);
+
+layer_byte_range manifest_role_byte_range(
+        const model_manifest & manifest,
+        tensor_role role);
 
 // Build install plan from registry state inputs.
 install_plan_build_result build_install_plan(

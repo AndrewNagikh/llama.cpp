@@ -204,3 +204,59 @@ model_memory_requirements estimate_model_memory_from_catalog(
 
     return result;
 }
+
+model_memory_requirements estimate_model_memory_from_manifest(
+        const model_manifest & manifest,
+        const int32_t          n_ctx) {
+    model_memory_requirements result{};
+    if (manifest.empty()) {
+        return result;
+    }
+
+    result.model_id = manifest.architecture.empty() ? "unknown" : manifest.architecture;
+    result.n_layer  = static_cast<int32_t>(manifest.n_layer);
+    result.n_embd   = static_cast<int32_t>(manifest.n_embd);
+    result.n_ctx    = n_ctx;
+
+    const int32_t n_layer = std::max(1, result.n_layer);
+    const int32_t n_embd  = std::max(1, result.n_embd);
+
+    uint64_t weights = 0;
+    for (const auto & layer : manifest.layers) {
+        weights += layer.size_bytes;
+    }
+    for (const auto & t : manifest.tensors) {
+        if (t.role == tensor_role::embedding ||
+                t.role == tensor_role::output_norm ||
+                t.role == tensor_role::lm_head) {
+            weights += t.size_bytes;
+        }
+    }
+    if (weights == 0 && manifest.tensor_data_offset > 0) {
+        weights = manifest.tensor_data_offset;
+    }
+    result.weights_bytes = weights;
+
+    const uint64_t kv_dim_per_token = static_cast<uint64_t>(n_embd) / 4;
+    const uint64_t kv_per_layer_for_ctx = 2 * kv_dim_per_token * KV_ELEMENT_BYTES *
+                                          static_cast<uint64_t>(n_ctx);
+    result.kv_bytes = kv_per_layer_for_ctx * static_cast<uint64_t>(n_layer);
+
+    result.compute_bytes = std::max(MIN_COMPUTE_BYTES, result.weights_bytes / 16);
+    result.scratch_bytes = std::max(MIN_SCRATCH_BYTES, result.weights_bytes / 32);
+
+    result.layers.reserve(n_layer);
+    for (int32_t i = 0; i < n_layer; ++i) {
+        model_layer_memory layer{};
+        layer.layer_index = i;
+        if (i < static_cast<int32_t>(manifest.layers.size())) {
+            layer.weight_bytes = manifest.layers[static_cast<size_t>(i)].size_bytes;
+        } else if (n_layer > 0) {
+            layer.weight_bytes = result.weights_bytes / static_cast<uint64_t>(n_layer);
+        }
+        layer.kv_bytes_per_token = kv_dim_per_token * 2 * KV_ELEMENT_BYTES;
+        result.layers.push_back(layer);
+    }
+
+    return result;
+}

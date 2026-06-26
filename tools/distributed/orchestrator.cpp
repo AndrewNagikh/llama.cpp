@@ -8,6 +8,8 @@
 #include "orchestrator/coverage/coverage.h"
 #include "orchestrator/install_planner/install_planner.h"
 #include "orchestrator/optimizer/cluster_optimizer.h"
+#include "node_agent/layer_store/layer_store.h"
+#include "node_agent/layer_store/layer_gguf_assembler.h"
 #include "split_gen_common.h"
 #include "split_tcp_wire.h"
 
@@ -420,31 +422,39 @@ static std::map<std::string, dist_node_info> collect_online_nodes_copy() {
 
 static std::string resolve_model_source_url(const dist_model_record & record) {
     std::string source_url;
-    if (record.manifest.has_value() && !record.manifest->source_file.empty()) {
+
+    for (const auto & file : record.files) {
+        if (!file.download_url.empty() &&
+                (record.filename.empty() || file.filename == record.filename)) {
+            source_url = file.download_url;
+            break;
+        }
+    }
+
+    if (source_url.empty() && record.manifest.has_value() &&
+            !record.manifest->source_file.empty()) {
         std::error_code ec;
         if (std::filesystem::exists(record.manifest->source_file, ec)) {
             source_url = "file://" + record.manifest->source_file;
         }
     }
+
+    if (source_url.empty() && !g_models_dir.empty() && !record.filename.empty()) {
+        const std::string candidate =
+                (std::filesystem::path(g_models_dir) / record.filename).string();
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec)) {
+            source_url = "file://" + candidate;
+        }
+    }
+
     if (source_url.empty() && !g_model_path.empty()) {
         std::error_code ec;
         if (std::filesystem::exists(g_model_path, ec)) {
             source_url = "file://" + g_model_path;
         }
     }
-    if (source_url.empty()) {
-        for (const auto & file : record.files) {
-            if (!file.download_url.empty() &&
-                    (record.filename.empty() || file.filename == record.filename)) {
-                source_url = file.download_url;
-                break;
-            }
-        }
-    }
-    if (source_url.empty() && record.manifest.has_value() &&
-            !record.manifest->source_file.empty()) {
-        source_url = "file://" + record.manifest->source_file;
-    }
+
     return source_url;
 }
 
@@ -561,7 +571,7 @@ static void coordinate_rebalance_pipeline(const std::string model_id) {
     }
 
     record = g_registry.find(model_id);
-    if (!record || !record->install_plan.has_value() || !record->manifest.has_value()) {
+    if (!record || !record->stored_install_plan.has_value() || !record->manifest.has_value()) {
         g_registry.discard_pending_layout(model_id);
         return;
     }
@@ -580,7 +590,7 @@ static void coordinate_rebalance_pipeline(const std::string model_id) {
     coordinate_install_plan_execute(
             job_id,
             model_id,
-            *record->install_plan,
+            *record->stored_install_plan,
             *record->manifest,
             nodes_copy);
 
@@ -745,6 +755,14 @@ static std::string resolve_model_path(const dist_model_record & record) {
 static model_memory_requirements get_model_memory_for_record(
         const dist_model_record & record,
         int32_t                   n_ctx) {
+    if (record.manifest.has_value() && !record.manifest->empty()) {
+        model_memory_requirements mem = estimate_model_memory_from_manifest(*record.manifest, n_ctx);
+        if (mem.valid()) {
+            mem.model_id = record.model_id;
+            return mem;
+        }
+    }
+
     // Prefer a local GGUF matching the registry filename.
     const std::string path = resolve_model_path(record);
     if (!path.empty()) {
@@ -755,8 +773,7 @@ static model_memory_requirements get_model_memory_for_record(
         }
     }
 
-    // Otherwise fall back to the legacy catalog entry until manifests carry
-    // enough architecture data for memory estimation.
+    // Otherwise fall back to the legacy catalog entry.
     {
         std::lock_guard<std::mutex> lock(g_mu);
         const auto * model = g_catalog.find_model(record.model_id);
@@ -765,6 +782,68 @@ static model_memory_requirements get_model_memory_for_record(
         }
     }
 
+    return {};
+}
+
+static std::string default_models_dir() {
+    const char * home = std::getenv("HOME");
+    if (home != nullptr && home[0] != '\0') {
+        return std::string(home) + "/.distributed-llm/models";
+    }
+    return ".distributed-llm/models";
+}
+
+static bool cache_manifest_metadata(const std::string & model_id, const model_manifest & manifest) {
+    if (g_models_dir.empty() || manifest.tensor_data_offset == 0) {
+        return false;
+    }
+    dist_model_record * record = g_registry.find(model_id);
+    if (!record) {
+        return false;
+    }
+    const std::string source_url = resolve_model_source_url(*record);
+    if (source_url.empty()) {
+        return false;
+    }
+    layer_store store(g_models_dir, model_id);
+    return layer_store_cache_metadata(store, manifest, source_url);
+}
+
+static std::string resolve_tokenizer_gguf_path(const dist_model_record & record) {
+    const std::string local = resolve_model_path(record);
+    if (!local.empty()) {
+        return local;
+    }
+    if (!record.manifest.has_value() || record.manifest->empty()) {
+        return {};
+    }
+
+    if (g_models_dir.empty()) {
+        return {};
+    }
+
+    layer_store store(g_models_dir, record.model_id);
+    if (!store.metadata_bytes().has_value()) {
+        cache_manifest_metadata(record.model_id, *record.manifest);
+    }
+
+    const std::string out =
+            (store.model_root() / "tokenizer.gguf").string();
+    std::error_code ec;
+    if (std::filesystem::exists(out, ec)) {
+        return out;
+    }
+
+    if (layer_store_materialize_gguf(
+                store,
+                *record.manifest,
+                out,
+                0,
+                0,
+                false,
+                false)) {
+        return out;
+    }
     return {};
 }
 
@@ -920,6 +999,7 @@ static bool setup_pipeline(
 
         json cfg = {
             { "session_id", session_id },
+            { "model_id", session.model },
             { "layer_start", stage.layer_start },
             { "layer_end", stage.layer_end },
             { "peer_bind", "0.0.0.0" },
@@ -1058,7 +1138,10 @@ static bool run_generation(
 }
 
 static void usage(const char * prog) {
-    fprintf(stderr, "usage: %s --model PATH [--listen HOST:PORT] [--ctx-size N] [--models-dir DIR]\n", prog);
+    fprintf(stderr,
+            "usage: %s [--model PATH] [--listen HOST:PORT] [--ctx-size N] [--models-dir DIR]\n"
+            "  Layer-first mode: omit --model; register model via API, discover + manifest from HuggingFace.\n",
+            prog);
 }
 
 int main(int argc, char ** argv) {
@@ -1082,10 +1165,8 @@ int main(int argc, char ** argv) {
     if (g_models_dir.empty() && !g_model_path.empty()) {
         g_models_dir = std::filesystem::path(g_model_path).parent_path().string();
     }
-
-    if (g_model_path.empty()) {
-        usage(argv[0]);
-        return 1;
+    if (g_models_dir.empty()) {
+        g_models_dir = default_models_dir();
     }
 
     std::string bind_host;
@@ -1362,12 +1443,17 @@ int main(int argc, char ** argv) {
 
         std::map<std::string, dist_node_info> node_map;
         int n_layers = 0;
+        if (record->manifest.has_value() && record->manifest->n_layer > 0) {
+            n_layers = static_cast<int>(record->manifest->n_layer);
+        }
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto & kv : g_nodes) {
-                if (kv.second.online && kv.second.n_layer > 0) {
+                if (kv.second.online) {
                     node_map[kv.first] = kv.second;
-                    n_layers = std::max(n_layers, kv.second.n_layer);
+                    if (n_layers <= 0 && kv.second.n_layer > 0) {
+                        n_layers = std::max(n_layers, kv.second.n_layer);
+                    }
                 }
             }
         }
@@ -1443,7 +1529,7 @@ int main(int argc, char ** argv) {
         dist_session session{};
         session.session_id = make_id("sess");
         session.model      = record->model_id;
-        session.model_path = resolve_model_path(*record);
+        session.model_path = resolve_tokenizer_gguf_path(*record);
 
         std::string err;
         if (!setup_pipeline(session.session_id, n_layers, plan.assignments, node_map, session, err)) {
@@ -1797,7 +1883,20 @@ int main(int argc, char ** argv) {
         }
 
         ggml_backend_load_all();
-        llama_model * model = llama_model_load_from_file(session.model_path.c_str(), llama_model_default_params());
+        const dist_model_record * record = g_registry.find(session.model);
+        std::string tokenizer_path = session.model_path;
+        if (tokenizer_path.empty() && record != nullptr) {
+            tokenizer_path = resolve_tokenizer_gguf_path(*record);
+        }
+        if (tokenizer_path.empty()) {
+            res.status = 503;
+            res.set_content(json({
+                { "error", "no tokenizer GGUF available; build manifest and cache metadata first" },
+            }).dump(), "application/json");
+            return;
+        }
+
+        llama_model * model = llama_model_load_from_file(tokenizer_path.c_str(), llama_model_default_params());
         if (!model) {
             res.status = 500;
             res.set_content(R"({"error":"failed to load model for tokenization"})", "application/json");
@@ -2151,6 +2250,8 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        cache_manifest_metadata(model_id, build.manifest);
+
         res.set_content(json({
             { "status", "ok" },
             { "architecture", build.manifest.architecture },
@@ -2449,7 +2550,7 @@ int main(int argc, char ** argv) {
         }
 
         record = g_registry.find(model_id);
-        if (!record || !record->install_plan.has_value()) {
+        if (!record || !record->stored_install_plan.has_value()) {
             res.status = 500;
             res.set_content(json({ { "error", "install plan not stored" } }).dump(), "application/json");
             return;
@@ -2458,9 +2559,9 @@ int main(int argc, char ** argv) {
         res.set_content(json({
             { "status", "ok" },
             { "model", model_id },
-            { "operation_count", record->install_plan->operation_count },
-            { "total_download_bytes", record->install_plan->total_download_bytes },
-            { "install_plan", record->install_plan->to_json() },
+            { "operation_count", record->stored_install_plan->operation_count },
+            { "total_download_bytes", record->stored_install_plan->total_download_bytes },
+            { "install_plan", record->stored_install_plan->to_json() },
         }).dump(), "application/json");
     });
 
@@ -2473,12 +2574,12 @@ int main(int argc, char ** argv) {
             res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
             return;
         }
-        if (!record->install_plan.has_value()) {
+        if (!record->stored_install_plan.has_value()) {
             res.status = 404;
             res.set_content(json({ { "error", "install plan not ready" } }).dump(), "application/json");
             return;
         }
-        res.set_content(record->install_plan->to_json().dump(), "application/json");
+        res.set_content(record->stored_install_plan->to_json().dump(), "application/json");
     });
 
     // POST /models/{model_id}/install/execute - Execute stored install plan via nodes.
@@ -2491,7 +2592,7 @@ int main(int argc, char ** argv) {
             res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
             return;
         }
-        if (!record->install_plan.has_value()) {
+        if (!record->stored_install_plan.has_value()) {
             res.status = 404;
             res.set_content(json({ { "error", "install plan not ready" } }).dump(), "application/json");
             return;
@@ -2526,7 +2627,7 @@ int main(int argc, char ** argv) {
                 coordinate_install_plan_execute,
                 job_id,
                 model_id,
-                *record->install_plan,
+                *record->stored_install_plan,
                 *record->manifest,
                 nodes_copy).detach();
 
@@ -2534,7 +2635,7 @@ int main(int argc, char ** argv) {
             { "job_id", job_id },
             { "model_id", model_id },
             { "status", "started" },
-            { "operation_count", record->install_plan->operation_count },
+            { "operation_count", record->stored_install_plan->operation_count },
         }).dump(), "application/json");
     });
 
@@ -2586,6 +2687,12 @@ int main(int argc, char ** argv) {
         res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
     });
 
+    if (!g_model_path.empty()) {
+        fprintf(stderr, "orchestrator: local model=%s models_dir=%s\n",
+                g_model_path.c_str(), g_models_dir.c_str());
+    } else {
+        fprintf(stderr, "orchestrator: layer-first mode models_dir=%s\n", g_models_dir.c_str());
+    }
     fprintf(stderr, "orchestrator: listening on %s:%d (dynamic layer planner)\n", bind_host.c_str(), port);
 
     if (!svr.listen(bind_host.c_str(), port)) {

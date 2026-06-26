@@ -39,5 +39,13 @@ BenchmarkResult dist_get_or_run_benchmark(
         const std::string & model_path,
         bool rebenchmark);
 
+// Hardware-only score when no local GGUF is available (layer-first nodes).
+BenchmarkResult dist_run_hardware_benchmark();
+
+// Model benchmark when path is set; otherwise hardware-only estimate.
+BenchmarkResult dist_get_or_run_benchmark_optional(
+        const std::string & model_path,
+        bool rebenchmark);
+
 std::string dist_benchmark_cache_path();
 std::string dist_compute_model_hash(const std::string & model_path);

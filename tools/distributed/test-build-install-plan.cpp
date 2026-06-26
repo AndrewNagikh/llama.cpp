@@ -39,7 +39,7 @@ int main() {
     }
     reg.apply_install_plan("m", built.plan, nullptr);
 
-    if (!reg.find("m")->install_plan.has_value()) {
+    if (!reg.find("m")->stored_install_plan.has_value()) {
         fprintf(stderr, "test-build-install-plan: plan not stored\n");
         return 1;
     }

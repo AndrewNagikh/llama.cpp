@@ -2,6 +2,7 @@
 #include "model_catalog.h"
 #include "node_benchmark.h"
 #include "node_agent/layer_store/layer_store.h"
+#include "node_agent/layer_store/layer_gguf_assembler.h"
 #include "node_agent/synchronization/synchronization_engine.h"
 #include "orchestrator/install_planner/install_planner.h"
 #include "orchestrator/coverage/coverage.h"
@@ -83,9 +84,10 @@ static uint64_t file_size_or_zero(const std::string & path) {
 
 static void usage(const char * prog) {
     fprintf(stderr,
-            "usage: %s --model PATH --listen HOST:PORT --orchestrator URL "
-            "[--node-id ID] [--advertise-host IP] [--models-dir DIR] [--rebenchmark]\n"
-            "example: %s --model llama.gguf --listen 0.0.0.0:9001 --orchestrator http://10.0.0.1:9000 --advertise-host 10.0.0.2\n",
+            "usage: %s --listen HOST:PORT --orchestrator URL "
+            "[--model PATH] [--node-id ID] [--advertise-host IP] [--models-dir DIR] [--rebenchmark]\n"
+            "  Layer-first mode: omit --model; workers load GGUF assembled from synced layers.\n"
+            "example: %s --listen 0.0.0.0:9001 --orchestrator http://10.0.0.1:9000 --advertise-host 10.0.0.2\n",
             prog, prog);
 }
 
@@ -113,9 +115,11 @@ static bool parse_args(int argc, char ** argv, std::string & listen, std::string
     if (g_models_dir.empty()) {
         if (const char * env = std::getenv("MODELS_DIR")) {
             g_models_dir = env;
+        } else if (const char * home = std::getenv("HOME")) {
+            g_models_dir = std::string(home) + "/.distributed-llm/models";
         }
     }
-    return !g_model_path.empty() && !listen.empty() && !orchestrator.empty();
+    return !listen.empty() && !orchestrator.empty();
 }
 
 static std::string exe_dir(const char * argv0) {
@@ -212,6 +216,7 @@ static dist_configure_req parse_configure(const json & body) {
     req.layer_start = body.value("layer_start", 0);
     req.layer_end   = body.value("layer_end", 0);
     req.session_id  = body.value("session_id", "");
+    req.model_id    = body.value("model_id", "");
     req.ctrl_port   = body.value("ctrl_port", 0);
     req.peer_port   = body.value("peer_port", 0);
     req.next_host   = body.value("next_host", "127.0.0.1");
@@ -312,8 +317,17 @@ static void stop_worker() {
     }
 }
 
-static bool start_worker(const std::string & agent_bin, const dist_configure_req & cfg, std::string & err) {
+static bool start_worker(
+        const std::string & agent_bin,
+        const dist_configure_req & cfg,
+        const std::string & model_path,
+        std::string & err) {
     stop_worker();
+
+    if (model_path.empty()) {
+        err = "no model path for worker";
+        return false;
+    }
 
     const std::string dir = agent_bin;
     std::string bin;
@@ -322,7 +336,7 @@ static bool start_worker(const std::string & agent_bin, const dist_configure_req
     if (cfg.role == DIST_ROLE_ENTRY) {
         bin = dir + "split_gen3_a";
         args = {
-            bin, g_model_path,
+            bin, model_path,
             "--ctrl-port", std::to_string(cfg.ctrl_port),
             "--b-host", cfg.next_host,
             "--b-port", std::to_string(cfg.next_port),
@@ -332,7 +346,7 @@ static bool start_worker(const std::string & agent_bin, const dist_configure_req
     } else if (cfg.role == DIST_ROLE_MIDDLE) {
         bin = dir + "split_gen3_b";
         args = {
-            bin, g_model_path,
+            bin, model_path,
             "--ab-port", std::to_string(cfg.peer_port),
             "--bc-host", cfg.next_host,
             "--bc-port", std::to_string(cfg.next_port),
@@ -343,7 +357,7 @@ static bool start_worker(const std::string & agent_bin, const dist_configure_req
     } else if (cfg.role == DIST_ROLE_FINAL) {
         bin = dir + "split_gen3_c";
         args = {
-            bin, g_model_path,
+            bin, model_path,
             "--bc-port", std::to_string(cfg.peer_port),
             "--layer-start", std::to_string(cfg.layer_start),
             "--bind", cfg.peer_bind,
@@ -377,6 +391,49 @@ static bool start_worker(const std::string & agent_bin, const dist_configure_req
 
 #endif
 
+static std::string materialize_worker_gguf(
+        const dist_configure_req & cfg,
+        std::string & err) {
+    if (cfg.model_id.empty()) {
+        err = "model_id required for layer-first configure";
+        return {};
+    }
+
+    layer_store store = get_layer_store(cfg.model_id);
+    const auto manifest = store.load_manifest();
+    if (!manifest.has_value()) {
+        err = "manifest not found in layer store; run install/sync first";
+        return {};
+    }
+
+    const bool include_embedding = (cfg.role == DIST_ROLE_ENTRY);
+    const bool include_output    = (cfg.role == DIST_ROLE_FINAL);
+    const std::string role_name  = dist_role_name(cfg.role);
+    const std::string out_path =
+            (store.model_root() / ("worker_" + role_name + ".gguf")).string();
+
+    if (!layer_store_materialize_gguf(
+                store,
+                *manifest,
+                out_path,
+                cfg.layer_start,
+                cfg.layer_end,
+                include_embedding,
+                include_output)) {
+        err = "failed to assemble GGUF from layer store for role " + role_name;
+        return {};
+    }
+
+    fprintf(stderr,
+            "node_agent: materialized %s from layers [%d,%d) embedding=%d output=%d\n",
+            out_path.c_str(),
+            cfg.layer_start,
+            cfg.layer_end,
+            include_embedding ? 1 : 0,
+            include_output ? 1 : 0);
+    return out_path;
+}
+
 int main(int argc, char ** argv) {
     std::string listen;
     std::string orchestrator;
@@ -399,8 +456,12 @@ int main(int argc, char ** argv) {
         g_node_id = bind_host + ":" + std::to_string(http_port);
     }
 
-    fprintf(stderr, "node_agent: running benchmark on %s\n", g_model_path.c_str());
-    g_benchmark = dist_get_or_run_benchmark(g_model_path, rebenchmark);
+    if (!g_model_path.empty()) {
+        fprintf(stderr, "node_agent: running benchmark on %s\n", g_model_path.c_str());
+    } else {
+        fprintf(stderr, "node_agent: no local model — hardware-only benchmark\n");
+    }
+    g_benchmark = dist_get_or_run_benchmark_optional(g_model_path, rebenchmark);
     if (g_benchmark.score <= 0.0f) {
         fprintf(stderr, "node_agent: benchmark failed\n");
         return 1;
@@ -409,7 +470,7 @@ int main(int argc, char ** argv) {
     g_n_layer = g_benchmark.n_layer;
     g_n_embd  = g_benchmark.n_embd;
     if (g_n_layer <= 0 || g_n_embd <= 0) {
-        if (!load_model_metadata()) {
+        if (!g_model_path.empty() && !load_model_metadata()) {
             fprintf(stderr, "node_agent: failed to read model metadata from %s\n", g_model_path.c_str());
             return 1;
         }
@@ -511,8 +572,27 @@ int main(int argc, char ** argv) {
         }
 
         const dist_configure_req cfg = parse_configure(body);
+        std::string worker_model = g_model_path;
         std::string err;
-        if (!start_worker(agent_bin, cfg, err)) {
+
+        if (!cfg.model_id.empty()) {
+            const std::string materialized = materialize_worker_gguf(cfg, err);
+            if (materialized.empty()) {
+                res.status = 500;
+                res.set_content(json({ { "ok", false }, { "error", err } }).dump(), "application/json");
+                return;
+            }
+            worker_model = materialized;
+        } else if (worker_model.empty()) {
+            res.status = 400;
+            res.set_content(json({
+                { "ok", false },
+                { "error", "model_id or local --model required" },
+            }).dump(), "application/json");
+            return;
+        }
+
+        if (!start_worker(agent_bin, cfg, worker_model, err)) {
             res.status = 500;
             res.set_content(json({ { "ok", false }, { "error", err } }).dump(), "application/json");
             return;
@@ -759,8 +839,9 @@ int main(int argc, char ** argv) {
         }).dump(), "application/json");
     });
 
+    const char * model_label = g_model_path.empty() ? "(layer-store)" : g_model_path.c_str();
     fprintf(stderr, "node_agent: listening on %s:%d model=%s score=%.1f\n",
-            bind_host.c_str(), http_port, g_model_path.c_str(), g_benchmark.score);
+            bind_host.c_str(), http_port, model_label, g_benchmark.score);
 
     if (!svr.listen(bind_host.c_str(), http_port)) {
         fprintf(stderr, "node_agent: failed to bind %s:%d\n", bind_host.c_str(), http_port);

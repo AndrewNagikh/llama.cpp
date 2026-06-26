@@ -46,6 +46,10 @@ public:
     bool has_layer(int32_t layer_index) const;
     std::optional<layer_blob> get_layer(int32_t layer_index) const;
 
+    bool save_metadata_blob(const std::vector<uint8_t> & data);
+    std::optional<std::vector<uint8_t>> load_metadata_blob() const;
+    std::optional<uint64_t> metadata_bytes() const;
+
 private:
     std::filesystem::path root_;
     std::string           model_id_;

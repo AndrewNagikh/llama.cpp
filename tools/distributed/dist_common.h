@@ -106,6 +106,7 @@ struct dist_pipeline_stage {
 
 struct dist_configure_req {
     std::string    session_id;
+    std::string    model_id;
     dist_node_role role        = DIST_ROLE_UNCONFIGURED;
     int            layer_start = 0;
     int            layer_end   = 0;

@@ -1,6 +1,7 @@
 #include "synchronization_engine.h"
 
 #include "executors/http_range/http_range_executor.h"
+#include "node_agent/layer_store/layer_gguf_assembler.h"
 
 #include <chrono>
 #include <map>
@@ -186,6 +187,18 @@ void synchronization_engine::run_job(
         it->second.error = "one or more operations failed";
     } else {
         it->second.state = sync_job_state::completed;
+        if (has_manifest) {
+            std::string source_url;
+            for (const auto & op : operations) {
+                if (!op.download.source_url.empty()) {
+                    source_url = op.download.source_url;
+                    break;
+                }
+            }
+            if (!source_url.empty()) {
+                layer_store_cache_metadata(store, manifest, source_url);
+            }
+        }
     }
 }
 

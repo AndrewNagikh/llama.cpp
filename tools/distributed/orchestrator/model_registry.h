@@ -51,7 +51,7 @@ struct dist_model_record {
     std::optional<model_layout>   layout;
     std::optional<actual_model_layout> actual;
     std::optional<coverage_report>   coverage;
-    std::optional<install_plan>      install_plan;
+    std::optional<install_plan>      stored_install_plan;
     std::optional<model_layout>      pending_layout;   // Task 9.8 two-phase rebalance
     std::optional<optimization_result> optimization; // Task 9.8 last optimizer run
 

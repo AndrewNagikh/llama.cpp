@@ -1,5 +1,6 @@
 #include "node_benchmark.h"
 
+#include "dist_common.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "llama.h"
@@ -327,6 +328,41 @@ BenchmarkResult run_node_benchmark(const std::string & model_path) {
     llama_free(ctx);
     llama_model_free(model);
     return result;
+}
+
+BenchmarkResult dist_run_hardware_benchmark() {
+    BenchmarkResult result{};
+
+    dist_node_cpu cpu{};
+    dist_node_memory memory{};
+    dist_probe_node_cpu(cpu);
+    dist_probe_node_memory(memory);
+    const dist_node_capabilities caps = dist_probe_capabilities();
+
+    const int cores = cpu.logical_cores > 0 ? cpu.logical_cores : 4;
+    float base      = static_cast<float>(cores) * 12.0f;
+    if (memory.has_gpu) {
+        base += static_cast<float>(std::max(1, caps.gpu_memory_mb)) / 256.0f * 40.0f;
+    }
+
+    result.decode_tps  = base;
+    result.prefill_tps = base * 1.15f;
+    result.score       = dist_compute_benchmark_score(result.decode_tps, result.prefill_tps);
+    result.load_ms     = 0.0f;
+
+    fprintf(stderr,
+            "node_benchmark: hardware-only score=%.1f (cores=%d gpu=%s)\n",
+            result.score, cores, memory.has_gpu ? "yes" : "no");
+    return result;
+}
+
+BenchmarkResult dist_get_or_run_benchmark_optional(
+        const std::string & model_path,
+        const bool rebenchmark) {
+    if (!model_path.empty()) {
+        return dist_get_or_run_benchmark(model_path, rebenchmark);
+    }
+    return dist_run_hardware_benchmark();
 }
 
 BenchmarkResult dist_get_or_run_benchmark(const std::string & model_path, const bool rebenchmark) {

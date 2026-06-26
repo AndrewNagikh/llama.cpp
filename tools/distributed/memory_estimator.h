@@ -2,6 +2,7 @@
 
 #include "dist_common.h"
 #include "model_catalog.h"
+#include "manifest_builder/manifest_builder.h"
 
 #include "nlohmann/json.hpp"
 
@@ -79,3 +80,8 @@ model_memory_requirements estimate_model_memory(
 model_memory_requirements estimate_model_memory_from_catalog(
         const model_info & model,
         int32_t            n_ctx = 4096);
+
+// Estimate memory from a layer manifest (Task 9 — no local GGUF required).
+model_memory_requirements estimate_model_memory_from_manifest(
+        const model_manifest & manifest,
+        int32_t                n_ctx = 4096);
