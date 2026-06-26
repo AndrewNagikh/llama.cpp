@@ -21,19 +21,19 @@ int main(int argc, char ** argv) {
         return 77;
     }
 
-    const auto built = build_manifest_from_file(source);
-    if (!built.success) {
+    const model_manifest manifest = build_manifest_from_file(source);
+    if (manifest.empty()) {
         fprintf(stderr, "layer_verify: manifest failed\n");
         return 1;
     }
 
     layer_store store(store_root, "verify-model");
-    if (!populate_layer_store_from_gguf(store, built.manifest, source)) {
+    if (!populate_layer_store_from_gguf(store, manifest, source)) {
         fprintf(stderr, "layer_verify: populate failed\n");
         return 1;
     }
 
-    const auto result = layer_verify_store(store, built.manifest, source);
+    const auto result = layer_verify_store(store, manifest, source);
     nlohmann::json out = result.summary.to_json();
     out["issues"] = result.issues;
     printf("%s\n", out.dump(2).c_str());
