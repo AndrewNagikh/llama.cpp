@@ -548,8 +548,9 @@ bool validate_install_plan(
     std::set<int32_t> planned_download;
     std::set<int32_t> planned_repair;
     for (const auto & op : plan.operations) {
+        const bool semantic_blob = op.layer_index < 0 || !op.download.blob_id.empty();
         if (op.action == install_action::download) {
-            if (ready_layers.count(op.layer_index)) {
+            if (!semantic_blob && ready_layers.count(op.layer_index)) {
                 error = "download planned for ready layer " + std::to_string(op.layer_index);
                 return false;
             }
@@ -557,7 +558,9 @@ bool validate_install_plan(
                 error = "download missing tensor length for layer " + std::to_string(op.layer_index);
                 return false;
             }
-            planned_download.insert(op.layer_index);
+            if (!semantic_blob) {
+                planned_download.insert(op.layer_index);
+            }
         } else if (op.action == install_action::repair) {
             if (!contains_layer(coverage.corrupted, op.layer_index)) {
                 error = "repair planned for non-corrupted layer " + std::to_string(op.layer_index);

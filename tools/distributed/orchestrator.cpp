@@ -490,30 +490,31 @@ static bool build_and_store_install_plan(
     std::set<std::string> online_nodes;
     poll_installed_layers_from_nodes(model_id, actual, online_nodes);
     g_registry.apply_actual(model_id, actual, record);
-
-    if (record->pending_layout.has_value()) {
-        g_registry.refresh_pending_coverage(model_id, online_nodes, record);
-    } else {
-        g_registry.refresh_coverage(model_id, online_nodes, record);
-    }
+    g_registry.refresh_coverage(model_id, online_nodes, record);
 
     record = g_registry.find(model_id);
     if (!record || !record->coverage.has_value()) {
         return false;
     }
 
+    const coverage_report & coverage_for_plan = layout_override
+            ? compute_coverage(*layout_override, actual, online_nodes)
+            : *record->coverage;
+
     const auto built = build_install_plan(
             *record->manifest,
             *target,
             actual,
-            *record->coverage,
+            coverage_for_plan,
             resolve_model_source_url(*record));
     if (!built.success) {
         return false;
     }
 
     std::string verr;
-    if (!validate_install_plan(built.plan, *target, *record->coverage, verr)) {
+    if (!validate_install_plan(built.plan, *target, coverage_for_plan, verr)) {
+        fprintf(stderr, "orchestrator: install plan validation failed for %s: %s\n",
+                model_id.c_str(), verr.c_str());
         return false;
     }
 
