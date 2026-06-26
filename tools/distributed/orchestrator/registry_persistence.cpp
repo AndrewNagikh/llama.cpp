@@ -41,32 +41,7 @@ bool registry_persistence_load(const std::string & models_dir, cluster_model_reg
 
     int loaded = 0;
     for (const auto & item : root["models"]) {
-        dist_model_record record;
-        record.model_id     = item.value("model_id", "");
-        record.display_name = item.value("display_name", "");
-        record.source       = item.value("source", item.value("provider", ""));
-        record.repository   = item.value("repository", "");
-        record.filename     = item.value("filename", "");
-        record.revision     = item.value("revision", "");
-        record.architecture = item.value("architecture", "");
-        record.status       = dist_model_status_from_string(item.value("status", "DISCOVERED"));
-
-        if (item.contains("manifest") && item["manifest"].is_object()) {
-            record.manifest = model_manifest::from_json(item["manifest"]);
-        }
-        if (item.contains("layout") && item["layout"].is_object()) {
-            record.layout = model_layout::from_json(item["layout"]);
-        }
-        if (item.contains("actual") && item["actual"].is_object()) {
-            record.actual = actual_model_layout::from_json(item["actual"]);
-        }
-        if (item.contains("coverage") && item["coverage"].is_object()) {
-            record.coverage = coverage_report::from_json(item["coverage"]);
-        }
-        if (item.contains("install_plan") && item["install_plan"].is_object()) {
-            record.stored_install_plan = install_plan::from_json(item["install_plan"]);
-        }
-
+        dist_model_record record = dist_model_record_from_json(item);
         if (record.model_id.empty()) {
             continue;
         }

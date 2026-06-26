@@ -145,14 +145,17 @@ dist_model_record dist_model_record_from_json(const json & j) {
     dist_model_record r;
     r.model_id     = j.value("model_id", "");
     r.display_name = j.value("display_name", "");
-    r.source       = j.value("source", "");
+    r.source       = j.value("source", j.value("provider", ""));
     r.repository   = j.value("repository", "");
     r.filename     = j.value("filename", "");
     r.revision     = j.value("revision", "");
     r.architecture = j.value("architecture", "");
 
-    // Task 9.1 forces every new registration to DISCOVERED.
-    r.status = dist_model_status::discovered;
+    if (j.contains("status") && j["status"].is_string()) {
+        r.status = dist_model_status_from_string(j.value("status", "DISCOVERED"));
+    } else {
+        r.status = dist_model_status::discovered;
+    }
 
     if (j.contains("manifest") && j["manifest"].is_object()) {
         r.manifest = model_manifest::from_json(j["manifest"]);
@@ -182,6 +185,12 @@ dist_model_record dist_model_record_from_json(const json & j) {
         r.stored_install_plan = install_plan::from_json(j["install_plan"]);
     } else {
         r.stored_install_plan = std::nullopt;
+    }
+
+    if (j.contains("pending_layout") && j["pending_layout"].is_object()) {
+        r.pending_layout = model_layout::from_json(j["pending_layout"]);
+    } else {
+        r.pending_layout = std::nullopt;
     }
 
     if (j.contains("files") && j["files"].is_array()) {

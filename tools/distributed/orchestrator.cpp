@@ -456,6 +456,12 @@ static std::string resolve_model_source_url(const dist_model_record & record) {
         }
     }
 
+    if (source_url.empty() && !record.repository.empty() && !record.filename.empty()) {
+        const std::string revision = record.revision.empty() ? "main" : record.revision;
+        source_url = "https://huggingface.co/" + record.repository +
+                     "/resolve/" + revision + "/" + record.filename;
+    }
+
     return source_url;
 }
 
