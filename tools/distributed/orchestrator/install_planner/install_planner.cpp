@@ -447,16 +447,38 @@ install_plan_build_result build_install_plan(
             }
         }
 
-        if (!entry_node.empty()) {
+        if (!entry_node.empty() || !final_node.empty()) {
             layer_byte_range emb = manifest_global_preamble_range(manifest);
             if (emb.length == 0) {
                 emb = manifest_role_byte_range(manifest, tensor_role::embedding);
             }
+
+            const layer_byte_range head_check =
+                    manifest_role_byte_range(manifest, tensor_role::lm_head);
+            const bool tied_lm_head = head_check.length == 0;
+
             if (emb.length > 0) {
-                download_operation dl = make_download_op(
-                        layer_special::embedding, entry_node, emb, source_url);
-                add_operation(operations, seen, install_action::download,
-                        entry_node, layer_special::embedding, dl);
+                if (!entry_node.empty()) {
+                    download_operation dl = make_download_op(
+                            layer_special::embedding, entry_node, emb, source_url);
+                    add_operation(operations, seen, install_action::download,
+                            entry_node, layer_special::embedding, dl);
+                }
+
+                // Tied lm_head models need token_embd.weight on every node that may
+                // run a FINAL worker, not only the entry node.
+                if (tied_lm_head) {
+                    std::set<std::string> all_nodes;
+                    for (const auto & placement : desired.placements) {
+                        all_nodes.insert(placement.node_id);
+                    }
+                    for (const auto & node_id : all_nodes) {
+                        download_operation dl = make_download_op(
+                                layer_special::embedding, node_id, emb, source_url);
+                        add_operation(operations, seen, install_action::download,
+                                node_id, layer_special::embedding, dl);
+                    }
+                }
             }
         }
 
