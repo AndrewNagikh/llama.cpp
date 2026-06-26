@@ -126,6 +126,18 @@ json dist_model_record::to_json() const {
         j["install_plan"] = nullptr;
     }
 
+    if (pending_layout.has_value()) {
+        j["pending_layout"] = pending_layout->to_json();
+    } else {
+        j["pending_layout"] = nullptr;
+    }
+
+    if (optimization.has_value()) {
+        j["optimization"] = optimization->to_json();
+    } else {
+        j["optimization"] = nullptr;
+    }
+
     return j;
 }
 
@@ -380,6 +392,106 @@ bool cluster_model_registry::apply_install_plan(
 
     if (out) {
         *out = r;
+    }
+    return true;
+}
+
+bool cluster_model_registry::apply_optimization(
+        const std::string & model_id,
+        const optimization_result & result,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    dist_model_record & r = it->second;
+    r.optimization = result;
+
+    if (out) {
+        *out = r;
+    }
+    return true;
+}
+
+bool cluster_model_registry::apply_pending_layout(
+        const std::string & model_id,
+        const desired_model_layout & layout,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    model_layout ml;
+    ml.desired = layout;
+    it->second.pending_layout = ml;
+
+    if (out) {
+        *out = it->second;
+    }
+    return true;
+}
+
+bool cluster_model_registry::commit_pending_layout(
+        const std::string & model_id,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end() || !it->second.pending_layout.has_value()) {
+        return false;
+    }
+
+    it->second.layout = *it->second.pending_layout;
+    it->second.pending_layout = std::nullopt;
+
+    if (out) {
+        *out = it->second;
+    }
+    return true;
+}
+
+bool cluster_model_registry::discard_pending_layout(
+        const std::string & model_id,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    it->second.pending_layout = std::nullopt;
+
+    if (out) {
+        *out = it->second;
+    }
+    return true;
+}
+
+bool cluster_model_registry::refresh_pending_coverage(
+        const std::string & model_id,
+        const std::set<std::string> & online_nodes,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end() || !it->second.pending_layout.has_value()) {
+        return false;
+    }
+
+    actual_model_layout actual{};
+    actual.model_id = model_id;
+    if (it->second.actual.has_value()) {
+        actual = *it->second.actual;
+    }
+
+    const coverage_report report = compute_coverage(
+            it->second.pending_layout->desired, actual, online_nodes);
+    it->second.coverage = report;
+
+    if (out) {
+        *out = it->second;
     }
     return true;
 }

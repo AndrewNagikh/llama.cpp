@@ -13,6 +13,23 @@ import argparse
 import urllib.parse
 import urllib.request
 
+def hf_token() -> str:
+    for key in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    token_path = Path.home() / ".cache" / "huggingface" / "token"
+    if token_path.is_file():
+        return token_path.read_text().strip()
+    return ""
+
+def auth_headers() -> dict:
+    headers = {"User-Agent": "distributed-llm-node-agent"}
+    token = hf_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
 def download_with_hf_hub(repo_id: str, filename: str, target_path: str) -> bool:
     """Download using huggingface_hub library."""
     try:
@@ -28,7 +45,8 @@ def download_with_hf_hub(repo_id: str, filename: str, target_path: str) -> bool:
             repo_id=repo_id,
             filename=filename,
             local_dir=os.path.dirname(target_path),
-            local_dir_use_symlinks=False
+            local_dir_use_symlinks=False,
+            token=hf_token() or None,
         )
         
         # Move to expected location if needed
@@ -91,7 +109,7 @@ def download_with_urllib(repo_id: str, filename: str, target_path: str, progress
         print(f"Downloading {url} using urllib...")
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
-        request = urllib.request.Request(url, headers={"User-Agent": "distributed-llm-node-agent"})
+        request = urllib.request.Request(url, headers=auth_headers())
         with urllib.request.urlopen(request, timeout=30) as response:
             total = int(response.headers.get("Content-Length") or 0)
             downloaded = 0

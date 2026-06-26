@@ -146,4 +146,7 @@ double dist_bytes_to_gb(uint64_t bytes);
 // Normalize backend name to planner device id: cpu / cuda / metal.
 std::string dist_normalize_device(const std::string & backend, bool has_gpu);
 
+// Hugging Face token for discovery/downloads (HF_TOKEN, HUGGINGFACE_HUB_TOKEN, ~/.cache/huggingface/token).
+std::string dist_hf_token();
+
 int64_t dist_now_unix();

@@ -7,6 +7,7 @@
 #include "orchestrator/layout_planner/layout_planner.h"
 #include "orchestrator/coverage/coverage.h"
 #include "orchestrator/install_planner/install_planner.h"
+#include "orchestrator/optimizer/cluster_optimizer.h"
 #include "split_gen_common.h"
 #include "split_tcp_wire.h"
 
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -398,6 +400,228 @@ static void coordinate_install_plan_execute(
     }
 
     set_sync_job_state(job_id, "failed", "sync job timed out");
+}
+
+static bool poll_installed_layers_from_nodes(
+        const std::string & model_id,
+        actual_model_layout & out,
+        std::set<std::string> & online_nodes);
+
+static std::map<std::string, dist_node_info> collect_online_nodes_copy() {
+    std::map<std::string, dist_node_info> nodes_copy;
+    std::lock_guard<std::mutex> lock(g_mu);
+    for (const auto & kv : g_nodes) {
+        if (kv.second.online) {
+            nodes_copy[kv.first] = kv.second;
+        }
+    }
+    return nodes_copy;
+}
+
+static std::string resolve_model_source_url(const dist_model_record & record) {
+    std::string source_url;
+    if (record.manifest.has_value() && !record.manifest->source_file.empty()) {
+        std::error_code ec;
+        if (std::filesystem::exists(record.manifest->source_file, ec)) {
+            source_url = "file://" + record.manifest->source_file;
+        }
+    }
+    if (source_url.empty() && !g_model_path.empty()) {
+        std::error_code ec;
+        if (std::filesystem::exists(g_model_path, ec)) {
+            source_url = "file://" + g_model_path;
+        }
+    }
+    if (source_url.empty()) {
+        for (const auto & file : record.files) {
+            if (!file.download_url.empty() &&
+                    (record.filename.empty() || file.filename == record.filename)) {
+                source_url = file.download_url;
+                break;
+            }
+        }
+    }
+    if (source_url.empty() && record.manifest.has_value() &&
+            !record.manifest->source_file.empty()) {
+        source_url = "file://" + record.manifest->source_file;
+    }
+    return source_url;
+}
+
+static const desired_model_layout * planning_target_layout(const dist_model_record & record) {
+    if (record.pending_layout.has_value()) {
+        return &record.pending_layout->desired;
+    }
+    if (record.layout.has_value()) {
+        return &record.layout->desired;
+    }
+    return nullptr;
+}
+
+static bool build_and_store_install_plan(
+        const std::string & model_id,
+        dist_model_record * record) {
+    if (!record || !record->manifest.has_value()) {
+        return false;
+    }
+    const desired_model_layout * target = planning_target_layout(*record);
+    if (!target) {
+        return false;
+    }
+
+    actual_model_layout actual;
+    std::set<std::string> online_nodes;
+    poll_installed_layers_from_nodes(model_id, actual, online_nodes);
+    g_registry.apply_actual(model_id, actual, record);
+
+    if (record->pending_layout.has_value()) {
+        g_registry.refresh_pending_coverage(model_id, online_nodes, record);
+    } else {
+        g_registry.refresh_coverage(model_id, online_nodes, record);
+    }
+
+    record = g_registry.find(model_id);
+    if (!record || !record->coverage.has_value()) {
+        return false;
+    }
+
+    const auto built = build_install_plan(
+            *record->manifest,
+            *target,
+            actual,
+            *record->coverage,
+            resolve_model_source_url(*record));
+    if (!built.success) {
+        return false;
+    }
+
+    std::string verr;
+    if (!validate_install_plan(built.plan, *target, *record->coverage, verr)) {
+        return false;
+    }
+
+    return g_registry.apply_install_plan(model_id, built.plan, record);
+}
+
+static optimization_result optimize_registered_model(
+        const std::string & model_id,
+        const optimizer_policy * policy_override = nullptr) {
+    optimization_result empty;
+    empty.model_id = model_id;
+
+    dist_model_record * record = g_registry.find(model_id);
+    if (!record || !record->manifest.has_value()) {
+        empty.reason = "model or manifest not ready";
+        return empty;
+    }
+
+    const desired_model_layout * current = nullptr;
+    if (record->layout.has_value()) {
+        current = &record->layout->desired;
+    }
+
+    std::vector<dist_node_info> node_vec;
+    const auto nodes_copy = collect_online_nodes_copy();
+    node_vec.reserve(nodes_copy.size());
+    for (const auto & kv : nodes_copy) {
+        node_vec.push_back(kv.second);
+    }
+
+    const optimizer_policy policy = policy_override ? *policy_override : optimizer_policy{};
+    optimization_result result = run_cluster_optimization(
+            model_id,
+            *record->manifest,
+            current,
+            node_vec,
+            policy,
+            g_n_ctx);
+
+    g_registry.apply_optimization(model_id, result);
+    return result;
+}
+
+static void coordinate_rebalance_pipeline(const std::string model_id) {
+    dist_model_record * record = g_registry.find(model_id);
+    if (!record || !record->optimization.has_value()) {
+        return;
+    }
+    if (record->optimization->decision != optimizer_decision::rebalance) {
+        return;
+    }
+
+    g_registry.apply_pending_layout(model_id, record->optimization->candidate_layout);
+    record = g_registry.find(model_id);
+    if (!record) {
+        return;
+    }
+
+    if (!build_and_store_install_plan(model_id, record)) {
+        g_registry.discard_pending_layout(model_id);
+        return;
+    }
+
+    record = g_registry.find(model_id);
+    if (!record || !record->install_plan.has_value() || !record->manifest.has_value()) {
+        g_registry.discard_pending_layout(model_id);
+        return;
+    }
+
+    const std::string job_id = make_id("job");
+  {
+        std::lock_guard<std::mutex> lock(g_mu);
+        cluster_sync_job job;
+        job.job_id   = job_id;
+        job.model_id = model_id;
+        job.state    = "queued";
+        g_sync_jobs[job_id] = std::move(job);
+    }
+
+    const auto nodes_copy = collect_online_nodes_copy();
+    coordinate_install_plan_execute(
+            job_id,
+            model_id,
+            *record->install_plan,
+            *record->manifest,
+            nodes_copy);
+
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        const auto it = g_sync_jobs.find(job_id);
+        if (it == g_sync_jobs.end() || it->second.state != "completed") {
+            g_registry.discard_pending_layout(model_id);
+            return;
+        }
+    }
+
+    actual_model_layout actual;
+    std::set<std::string> online_nodes;
+    poll_installed_layers_from_nodes(model_id, actual, online_nodes);
+    g_registry.apply_actual(model_id, actual);
+    g_registry.refresh_pending_coverage(model_id, online_nodes);
+
+    record = g_registry.find(model_id);
+    if (!record || !record->coverage.has_value() ||
+            record->coverage->state != coverage_state::ready) {
+        g_registry.discard_pending_layout(model_id);
+        return;
+    }
+
+    g_registry.commit_pending_layout(model_id);
+}
+
+static void trigger_cluster_optimization_async() {
+    std::thread([]() {
+        const auto models = g_registry.list();
+        for (const auto & model : models) {
+            if (!model.manifest.has_value()) {
+                continue;
+            }
+            const optimization_result result = optimize_registered_model(model.model_id);
+            if (result.decision == optimizer_decision::rebalance) {
+                coordinate_rebalance_pipeline(model.model_id);
+            }
+        }
+    }).detach();
 }
 
 static bool gen3_send_recv(
@@ -986,9 +1210,33 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        bool cluster_changed = false;
         {
             std::lock_guard<std::mutex> lock(g_mu);
+            const auto prev_it = g_nodes.find(node.node_id);
+            if (prev_it == g_nodes.end()) {
+                cluster_changed = true;
+            } else {
+                const auto & prev = prev_it->second;
+                const double score_base = std::max(prev.score, 1.0);
+                if (std::fabs(prev.score - node.score) / score_base >= 0.05) {
+                    cluster_changed = true;
+                }
+                const uint64_t prev_mem = prev.memory.free_ram_bytes + prev.memory.free_vram_bytes;
+                const uint64_t new_mem  = node.memory.free_ram_bytes + node.memory.free_vram_bytes;
+                if (prev_mem > 0) {
+                    const double mem_delta = static_cast<double>(
+                            prev_mem > new_mem ? prev_mem - new_mem : new_mem - prev_mem);
+                    if (mem_delta / static_cast<double>(prev_mem) >= 0.10) {
+                        cluster_changed = true;
+                    }
+                }
+            }
             g_nodes[node.node_id] = node;
+        }
+
+        if (cluster_changed) {
+            trigger_cluster_optimization_async();
         }
 
         fprintf(stderr, "orchestrator: registered node %s at %s:%d layers=%d score=%.1f decode=%.1f prefill=%.1f "
@@ -1912,6 +2160,8 @@ int main(int argc, char ** argv) {
             { "layers", static_cast<int>(build.manifest.layers.size()) },
             { "metadata_bytes_read", build.bytes_read },
         }).dump(), "application/json");
+
+        trigger_cluster_optimization_async();
     });
 
     // GET /models/{model_id}/manifest - Return the stored manifest.
@@ -1992,6 +2242,8 @@ int main(int argc, char ** argv) {
             { "total_weight_bytes", built.layout.total_weight_bytes },
             { "total_required_memory", built.layout.total_required_memory },
         }).dump(), "application/json");
+
+        trigger_cluster_optimization_async();
     });
 
     // GET /models/{model_id}/layout - Return stored desired layout.
@@ -2009,6 +2261,72 @@ int main(int argc, char ** argv) {
             return;
         }
         res.set_content(record->layout->to_json().dump(), "application/json");
+    });
+
+    // POST /models/{model_id}/optimize - Run cluster optimizer (Task 9.8).
+    svr.Post(R"(/models/([^/]+)/optimize)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+
+        dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (!record->manifest.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "manifest not ready" } }).dump(), "application/json");
+            return;
+        }
+
+        optimizer_policy policy{};
+        try {
+            if (!req.body.empty()) {
+                const json body = json::parse(req.body);
+                if (body.contains("min_decode_improvement_percent")) {
+                    policy.min_decode_improvement_percent = body.value("min_decode_improvement_percent", 5.0);
+                }
+                if (body.contains("min_prefill_improvement_percent")) {
+                    policy.min_prefill_improvement_percent = body.value("min_prefill_improvement_percent", 5.0);
+                }
+                if (body.contains("max_rebalance_cost_bytes")) {
+                    policy.max_rebalance_cost_bytes = body.value("max_rebalance_cost_bytes", UINT64_MAX);
+                }
+                if (body.contains("allow_storage_only_nodes")) {
+                    policy.allow_storage_only_nodes = body.value("allow_storage_only_nodes", true);
+                }
+            }
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+
+        const optimization_result result = optimize_registered_model(model_id, &policy);
+        if (result.decision == optimizer_decision::rebalance) {
+            std::thread([model_id]() {
+                coordinate_rebalance_pipeline(model_id);
+            }).detach();
+        }
+
+        res.set_content(result.to_json().dump(), "application/json");
+    });
+
+    // GET /models/{model_id}/optimization - Last optimizer result (Task 9.8).
+    svr.Get(R"(/models/([^/]+)/optimization)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        const auto * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (!record->optimization.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "optimization not run yet" } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(record->optimization->to_json().dump(), "application/json");
     });
 
     // POST /models/{model_id}/coverage/refresh - Poll nodes and recompute coverage.
@@ -2111,81 +2429,38 @@ int main(int argc, char ** argv) {
             res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
             return;
         }
-        if (!record->manifest.has_value() || !record->layout.has_value()) {
+        if (!record->manifest.has_value()) {
             res.status = 404;
-            res.set_content(json({ { "error", "manifest or layout not ready" } }).dump(), "application/json");
+            res.set_content(json({ { "error", "manifest not ready" } }).dump(), "application/json");
             return;
         }
 
-        actual_model_layout actual;
-        std::set<std::string> online_nodes;
-        poll_installed_layers_from_nodes(model_id, actual, online_nodes);
-        g_registry.apply_actual(model_id, actual, record);
-        g_registry.refresh_coverage(model_id, online_nodes, record);
+        const desired_model_layout * target = planning_target_layout(*record);
+        if (!target && !record->layout.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "layout not ready" } }).dump(), "application/json");
+            return;
+        }
 
-        if (!record->coverage.has_value()) {
+        if (!build_and_store_install_plan(model_id, record)) {
+            res.status = 502;
+            res.set_content(json({ { "error", "install plan build failed" } }).dump(), "application/json");
+            return;
+        }
+
+        record = g_registry.find(model_id);
+        if (!record || !record->install_plan.has_value()) {
             res.status = 500;
-            res.set_content(json({ { "error", "coverage not available" } }).dump(), "application/json");
-            return;
-        }
-
-        std::string source_url;
-        if (!record->manifest->source_file.empty()) {
-            std::error_code ec;
-            if (std::filesystem::exists(record->manifest->source_file, ec)) {
-                source_url = "file://" + record->manifest->source_file;
-            }
-        }
-        if (source_url.empty() && !g_model_path.empty()) {
-            std::error_code ec;
-            if (std::filesystem::exists(g_model_path, ec)) {
-                source_url = "file://" + g_model_path;
-            }
-        }
-        if (source_url.empty()) {
-            for (const auto & file : record->files) {
-                if (!file.download_url.empty() &&
-                        (record->filename.empty() || file.filename == record->filename)) {
-                    source_url = file.download_url;
-                    break;
-                }
-            }
-        }
-        if (source_url.empty() && !record->manifest->source_file.empty()) {
-            source_url = "file://" + record->manifest->source_file;
-        }
-
-        const auto built = build_install_plan(
-                *record->manifest,
-                record->layout->desired,
-                actual,
-                *record->coverage,
-                source_url);
-        if (!built.success) {
-            res.status = 502;
-            res.set_content(json({ { "error", built.error } }).dump(), "application/json");
-            return;
-        }
-
-        std::string verr;
-        if (!validate_install_plan(built.plan, record->layout->desired, *record->coverage, verr)) {
-            res.status = 502;
-            res.set_content(json({ { "error", verr } }).dump(), "application/json");
-            return;
-        }
-
-        if (!g_registry.apply_install_plan(model_id, built.plan, record)) {
-            res.status = 404;
-            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            res.set_content(json({ { "error", "install plan not stored" } }).dump(), "application/json");
             return;
         }
 
         res.set_content(json({
             { "status", "ok" },
             { "model", model_id },
-            { "operation_count", built.plan.operation_count },
-            { "total_download_bytes", built.plan.total_download_bytes },
-            { "install_plan", built.plan.to_json() },
+            { "operation_count", record->install_plan->operation_count },
+            { "total_download_bytes", record->install_plan->total_download_bytes },
+            { "install_plan", record->install_plan->to_json() },
         }).dump(), "application/json");
     });
 

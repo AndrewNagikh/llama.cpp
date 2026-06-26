@@ -2,20 +2,15 @@
 
 #include "../model_registry.h"
 
+#include "dist_common.h"
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 
-#include <cstdlib>
 #include <string>
 
 using json = nlohmann::json;
 
 namespace {
-
-static std::string hf_token() {
-    const char * token = std::getenv("HF_TOKEN");
-    return token ? std::string(token) : std::string{};
-}
 
 class huggingface_provider_impl : public model_provider {
 public:
@@ -42,7 +37,7 @@ public:
             { "Accept", "application/json" }
         };
 
-        const std::string token = hf_token();
+        const std::string token = dist_hf_token();
         if (!token.empty()) {
             headers.emplace("Authorization", "Bearer " + token);
         }

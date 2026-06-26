@@ -1,5 +1,6 @@
 #include "http_range_executor.h"
 
+#include "dist_common.h"
 #include "node_agent/layer_store/layer_checksum.h"
 
 #include "httplib.h"
@@ -9,13 +10,6 @@
 #include <vector>
 
 namespace {
-
-static std::string hf_token() {
-    if (const char * token = std::getenv("HF_TOKEN")) {
-        return token;
-    }
-    return {};
-}
 
 static bool read_file_range(
         const std::string & path,
@@ -49,7 +43,7 @@ static bool http_range_fetch(
         { "Accept", "*/*" },
     };
 
-    const std::string token = hf_token();
+    const std::string token = dist_hf_token();
     if (!token.empty()) {
         headers.emplace("Authorization", "Bearer " + token);
     }

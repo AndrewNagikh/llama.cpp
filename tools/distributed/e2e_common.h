@@ -504,6 +504,39 @@ inline bool execute_install_plan(const std::string & orch, const std::string & m
     return false;
 }
 
+// Run cluster optimizer (Task 9.8).
+inline bool run_optimize(
+        const std::string & orch,
+        const std::string & model_id,
+        json & out,
+        std::string & err) {
+    int status = 0;
+    if (!http_post(orch, "/models/" + model_id + "/optimize", json({}), out, status, 120) ||
+            status != 200) {
+        err = "optimize failed status=" + std::to_string(status) + " body=" + out.dump();
+        return false;
+    }
+    if (!out.contains("decision")) {
+        err = "optimize response missing decision: " + out.dump();
+        return false;
+    }
+    return true;
+}
+
+inline bool get_optimization(
+        const std::string & orch,
+        const std::string & model_id,
+        json & out,
+        std::string & err) {
+    int status = 0;
+    if (!http_get(orch, "/models/" + model_id + "/optimization", out, status, 30) ||
+            status != 200) {
+        err = "get optimization failed status=" + std::to_string(status);
+        return false;
+    }
+    return true;
+}
+
 // Build install plan, execute synchronization, and wait for coverage READY.
 inline bool sync_model_layers(const std::string & orch, const std::string & model_id,
         std::string & err) {

@@ -2,6 +2,7 @@
 
 #include "../model_registry.h"
 
+#include "dist_common.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "httplib.h"
@@ -345,18 +346,13 @@ static std::string find_download_url(const dist_model_record & record) {
     return {};
 }
 
-static std::string hf_token() {
-    const char * token = std::getenv("HF_TOKEN");
-    return token ? std::string(token) : std::string{};
-}
-
 static bool http_range_fetch(const std::string & url, size_t end_inclusive, std::vector<uint8_t> & out) {
     httplib::Headers headers = {
         { "User-Agent", "distributed-llama-orchestrator/0.1" },
         { "Accept", "*/*" },
     };
 
-    const std::string token = hf_token();
+    const std::string token = dist_hf_token();
     if (!token.empty()) {
         headers.emplace("Authorization", "Bearer " + token);
     }

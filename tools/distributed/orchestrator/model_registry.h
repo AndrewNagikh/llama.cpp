@@ -13,6 +13,7 @@
 #include "layout_planner/layout_planner.h"
 #include "coverage/coverage.h"
 #include "install_planner/install_planner.h"
+#include "optimizer/cluster_optimizer.h"
 #include "model_provider/model_provider.h"
 
 // ---------------------------------------------------------------------------
@@ -51,6 +52,8 @@ struct dist_model_record {
     std::optional<actual_model_layout> actual;
     std::optional<coverage_report>   coverage;
     std::optional<install_plan>      install_plan;
+    std::optional<model_layout>      pending_layout;   // Task 9.8 two-phase rebalance
+    std::optional<optimization_result> optimization; // Task 9.8 last optimizer run
 
     // Task 9.2: remote discovery metadata
     std::vector<remote_model_file> files;
@@ -123,6 +126,32 @@ public:
     bool apply_install_plan(
             const std::string & model_id,
             const install_plan & plan,
+            dist_model_record * out = nullptr);
+
+    bool apply_optimization(
+            const std::string & model_id,
+            const optimization_result & result,
+            dist_model_record * out = nullptr);
+
+    // Stage candidate layout before atomic switch (Task 9.8).
+    bool apply_pending_layout(
+            const std::string & model_id,
+            const desired_model_layout & layout,
+            dist_model_record * out = nullptr);
+
+    // Promote pending layout to current after coverage is READY.
+    bool commit_pending_layout(
+            const std::string & model_id,
+            dist_model_record * out = nullptr);
+
+    bool discard_pending_layout(
+            const std::string & model_id,
+            dist_model_record * out = nullptr);
+
+    // Coverage against pending (candidate) layout.
+    bool refresh_pending_coverage(
+            const std::string & model_id,
+            const std::set<std::string> & online_nodes = {},
             dist_model_record * out = nullptr);
 
 private:

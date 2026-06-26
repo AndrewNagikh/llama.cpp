@@ -18,6 +18,8 @@ set(DIST_COMMON_SOURCES
     orchestrator/model_provider/huggingface_provider.cpp
     orchestrator/manifest_builder/manifest_builder.cpp
     orchestrator/layout_planner/layout_planner.cpp
+    orchestrator/layout_estimator/layout_estimator.cpp
+    orchestrator/optimizer/cluster_optimizer.cpp
     orchestrator/coverage/coverage.cpp
     orchestrator/install_planner/install_planner.cpp
     node_core.cpp
@@ -91,6 +93,8 @@ dist_add_test_exe(test-cluster-e2e test-cluster-e2e.cpp)
 dist_add_test_exe(test-cluster-e2e-install-reuse test-cluster-e2e-install-reuse.cpp)
 dist_add_test_exe(test-cluster-e2e-node-loss test-cluster-e2e-node-loss.cpp)
 dist_add_test_exe(test-cluster-e2e-orchestrator-restart test-cluster-e2e-orchestrator-restart.cpp)
+dist_add_test_exe(test-cluster-e2e-optimizer-api test-cluster-e2e-optimizer-api.cpp)
+dist_add_test_exe(test-cluster-e2e-optimizer-join test-cluster-e2e-optimizer-join.cpp)
 
 if (LLAMA_BUILD_TESTS)
     add_executable(test-layer-planner test-layer-planner.cpp ${DIST_PLANNER_SOURCES} dist_common.cpp)
@@ -147,6 +151,8 @@ if (LLAMA_BUILD_TESTS)
         orchestrator/model_provider/huggingface_provider.cpp
         orchestrator/manifest_builder/manifest_builder.cpp
         orchestrator/layout_planner/layout_planner.cpp
+        orchestrator/layout_estimator/layout_estimator.cpp
+        orchestrator/optimizer/cluster_optimizer.cpp
         orchestrator/coverage/coverage.cpp
         orchestrator/install_planner/install_planner.cpp
         memory_estimator.cpp
@@ -458,4 +464,23 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-coverage-after-sync PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(test-coverage-after-sync PRIVATE cxx_std_17)
     target_link_libraries(test-coverage-after-sync PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    # Task 9.8 cluster optimizer tests
+    macro(dist_add_optimizer_test name)
+        add_executable(${name} ${name}.cpp ${MODEL_REGISTRY_SOURCES})
+        target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
+        target_compile_features(${name} PRIVATE cxx_std_17)
+        target_link_libraries(${name} PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+    endmacro()
+
+    dist_add_optimizer_test(test-layout-estimator)
+    dist_add_optimizer_test(test-storage-only-node)
+    dist_add_optimizer_test(test-performance-simulation)
+    dist_add_optimizer_test(test-optimizer-policy)
+    dist_add_optimizer_test(test-no-benefit)
+    dist_add_optimizer_test(test-improvement-threshold)
+    dist_add_optimizer_test(test-node-join)
+    dist_add_optimizer_test(test-slow-node)
+    dist_add_optimizer_test(test-node-loss)
+    dist_add_optimizer_test(test-memory-change)
 endif()

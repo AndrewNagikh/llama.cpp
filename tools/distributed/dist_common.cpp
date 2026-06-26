@@ -378,6 +378,51 @@ std::string dist_normalize_device(const std::string & backend, bool has_gpu) {
     return "cpu";
 }
 
+std::string dist_hf_token() {
+    auto trim = [](std::string s) {
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+            s.pop_back();
+        }
+        size_t start = 0;
+        while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) {
+            ++start;
+        }
+        return s.substr(start);
+    };
+
+    if (const char * env = std::getenv("HF_TOKEN")) {
+        const std::string token = trim(env);
+        if (!token.empty()) {
+            return token;
+        }
+    }
+    if (const char * env = std::getenv("HUGGINGFACE_HUB_TOKEN")) {
+        const std::string token = trim(env);
+        if (!token.empty()) {
+            return token;
+        }
+    }
+
+    const char * home = std::getenv("HOME");
+    if (!home) {
+        return {};
+    }
+
+    const std::string path = std::string(home) + "/.cache/huggingface/token";
+    std::ifstream in(path);
+    if (!in) {
+        return {};
+    }
+
+    std::string token;
+    std::getline(in, token);
+    token = trim(token);
+    if (token.size() >= 4 && token.rfind("hf_", 0) == 0) {
+        return token;
+    }
+    return {};
+}
+
 int64_t dist_now_unix() {
     return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
