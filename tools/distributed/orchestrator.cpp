@@ -738,6 +738,58 @@ static json planned_layout_json(const std::vector<dist_layer_assignment> & assig
     return layout;
 }
 
+static std::vector<dist_layer_assignment> assignments_from_desired_layout(
+        const desired_model_layout & desired,
+        const std::map<std::string, dist_node_info> & node_map,
+        int n_layers) {
+    std::vector<dist_layer_assignment> out;
+    if (desired.placements.empty() || n_layers <= 0) {
+        return out;
+    }
+
+    std::vector<layer_placement> sorted = desired.placements;
+    std::sort(sorted.begin(), sorted.end(),
+            [](const layer_placement & a, const layer_placement & b) {
+                return a.layer_index < b.layer_index;
+            });
+
+    dist_layer_assignment current{};
+    for (const auto & placement : sorted) {
+        if (placement.layer_index < 0 || placement.layer_index >= n_layers) {
+            continue;
+        }
+        const auto node_it = node_map.find(placement.node_id);
+        if (node_it == node_map.end() || !node_it->second.online) {
+            return {};
+        }
+
+        if (current.node_id.empty()) {
+            current.node_id     = placement.node_id;
+            current.score       = node_it->second.score;
+            current.layer_start = placement.layer_index;
+            current.layer_end   = placement.layer_index + 1;
+            continue;
+        }
+
+        if (placement.node_id == current.node_id && placement.layer_index == current.layer_end) {
+            current.layer_end = placement.layer_index + 1;
+            continue;
+        }
+
+        out.push_back(current);
+        current = {};
+        current.node_id     = placement.node_id;
+        current.score       = node_it->second.score;
+        current.layer_start = placement.layer_index;
+        current.layer_end   = placement.layer_index + 1;
+    }
+
+    if (!current.node_id.empty()) {
+        out.push_back(current);
+    }
+    return out;
+}
+
 static std::string resolve_model_path(const dist_model_record & record) {
     if (!record.filename.empty()) {
         if (!g_model_path.empty() &&
@@ -1508,19 +1560,29 @@ int main(int argc, char ** argv) {
             planner_nodes.push_back(r);
         }
 
-        const dist_planner_result plan = dist_plan_layers_memory_aware(mem, planner_nodes);
-        if (!plan.success) {
-            res.status = 503;
-            json err = fit.to_json();
-            err["error"] = plan.error;
-            err["planning_error"] = true;
-            res.set_content(err.dump(), "application/json");
-            return;
+        std::vector<dist_layer_assignment> assignments;
+        if (record->layout.has_value() &&
+                layout_has_full_coverage(record->layout->desired, n_layers)) {
+            assignments = assignments_from_desired_layout(
+                    record->layout->desired, node_map, n_layers);
         }
 
-        dist_print_planner_report(record->model_id, mem, node_vec, fit, plan.assignments);
+        if (assignments.empty()) {
+            const dist_planner_result plan = dist_plan_layers_memory_aware(mem, planner_nodes);
+            if (!plan.success) {
+                res.status = 503;
+                json err = fit.to_json();
+                err["error"] = plan.error;
+                err["planning_error"] = true;
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            assignments = plan.assignments;
+        }
 
-        const json planned = planned_layout_json(plan.assignments);
+        dist_print_planner_report(record->model_id, mem, node_vec, fit, assignments);
+
+        const json planned = planned_layout_json(assignments);
 
         for (const auto & kv : node_map) {
             std::string herr;
@@ -1540,7 +1602,7 @@ int main(int argc, char ** argv) {
         session.model_path = resolve_tokenizer_gguf_path(*record);
 
         std::string err;
-        if (!setup_pipeline(session.session_id, n_layers, plan.assignments, node_map, session, err)) {
+        if (!setup_pipeline(session.session_id, n_layers, assignments, node_map, session, err)) {
             res.status = 500;
             res.set_content(json({
                 { "error", err },
