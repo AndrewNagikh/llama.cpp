@@ -24,10 +24,34 @@ struct worker_tensor_plan {
     bool               include_output    = false;
 };
 
-worker_tensor_plan make_worker_tensor_plan(
-        worker_verify_role role,
-        int32_t layer_start,
-        int32_t layer_end);
+inline worker_tensor_plan make_worker_tensor_plan(
+        const worker_verify_role role,
+        const int32_t layer_start,
+        const int32_t layer_end) {
+    worker_tensor_plan plan;
+    plan.role         = role;
+    plan.layer_start  = layer_start;
+    plan.layer_end    = layer_end;
+    switch (role) {
+        case worker_verify_role::entry:
+            plan.include_embedding = true;
+            plan.include_output    = false;
+            break;
+        case worker_verify_role::middle:
+            plan.include_embedding = false;
+            plan.include_output    = false;
+            break;
+        case worker_verify_role::final:
+            plan.include_embedding = false;
+            plan.include_output    = true;
+            break;
+        case worker_verify_role::full:
+            plan.include_embedding = true;
+            plan.include_output    = true;
+            break;
+    }
+    return plan;
+}
 
 bool gguf_tensor_included(
         const tensor_descriptor & t,

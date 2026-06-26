@@ -1,5 +1,7 @@
 #include "install_planner.h"
 
+#include "architecture_descriptor/architecture_descriptor.h"
+
 #include <algorithm>
 #include <cctype>
 #include <climits>
@@ -453,9 +455,8 @@ install_plan_build_result build_install_plan(
                 emb = manifest_role_byte_range(manifest, tensor_role::embedding);
             }
 
-            const layer_byte_range head_check =
-                    manifest_role_byte_range(manifest, tensor_role::lm_head);
-            const bool tied_lm_head = head_check.length == 0;
+            const auto desc = build_architecture_descriptor(manifest);
+            const bool replicate_embedding = architecture_should_replicate_embedding(desc);
 
             if (emb.length > 0) {
                 if (!entry_node.empty()) {
@@ -465,9 +466,7 @@ install_plan_build_result build_install_plan(
                             entry_node, layer_special::embedding, dl);
                 }
 
-                // Tied lm_head models need token_embd.weight on every node that may
-                // run a FINAL worker, not only the entry node.
-                if (tied_lm_head) {
+                if (replicate_embedding) {
                     std::set<std::string> all_nodes;
                     for (const auto & placement : desired.placements) {
                         all_nodes.insert(placement.node_id);

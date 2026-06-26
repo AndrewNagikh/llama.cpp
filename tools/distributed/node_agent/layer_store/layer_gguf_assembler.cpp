@@ -1,5 +1,6 @@
 #include "layer_gguf_assembler.h"
 
+#include "architecture_descriptor/architecture_descriptor.h"
 #include "dist_common.h"
 
 #include "httplib.h"
@@ -160,8 +161,9 @@ bool layer_store_materialize_gguf(
     }
 
     if (include_output) {
-        const bool tied_lm_head = manifest.special_tensors.count("lm_head") == 0;
-        if (tied_lm_head && !include_embedding) {
+        const auto desc = build_architecture_descriptor(manifest);
+        if (architecture_materialize_needs_embedding_for_output(
+                    desc, include_embedding, include_output)) {
             if (!write_blob(layer_special::embedding)) {
                 return false;
             }

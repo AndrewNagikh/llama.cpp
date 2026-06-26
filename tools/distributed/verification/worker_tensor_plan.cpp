@@ -1,5 +1,6 @@
 #include "worker_tensor_plan.h"
 
+#include "architecture_descriptor/architecture_descriptor.h"
 #include "gguf_inspector.h"
 #include "node_agent/layer_store/layer_special.h"
 
@@ -17,35 +18,6 @@ std::string worker_verify_role_to_string(const worker_verify_role role) {
     return "UNKNOWN";
 }
 
-worker_tensor_plan make_worker_tensor_plan(
-        const worker_verify_role role,
-        const int32_t layer_start,
-        const int32_t layer_end) {
-    worker_tensor_plan plan;
-    plan.role         = role;
-    plan.layer_start  = layer_start;
-    plan.layer_end    = layer_end;
-    switch (role) {
-        case worker_verify_role::entry:
-            plan.include_embedding = true;
-            plan.include_output    = false;
-            break;
-        case worker_verify_role::middle:
-            plan.include_embedding = false;
-            plan.include_output    = false;
-            break;
-        case worker_verify_role::final:
-            plan.include_embedding = false;
-            plan.include_output    = true;
-            break;
-        case worker_verify_role::full:
-            plan.include_embedding = true;
-            plan.include_output    = true;
-            break;
-    }
-    return plan;
-}
-
 bool gguf_tensor_included(
         const tensor_descriptor & t,
         const int32_t layer_start,
@@ -53,25 +25,25 @@ bool gguf_tensor_included(
         const bool include_embedding,
         const bool include_output,
         const model_manifest * manifest) {
-    if (t.role == tensor_role::embedding && include_embedding) {
-        return true;
+    if (manifest == nullptr) {
+        if (t.role == tensor_role::embedding && include_embedding) {
+            return true;
+        }
+        if (include_embedding && t.layer < layer_start &&
+                t.role != tensor_role::output_norm &&
+                t.role != tensor_role::lm_head) {
+            return true;
+        }
+        if (include_output &&
+                (t.role == tensor_role::output_norm || t.role == tensor_role::lm_head)) {
+            return true;
+        }
+        return t.layer >= layer_start && t.layer < layer_end;
     }
-    // Tied lm_head models reuse token_embd.weight at the final stage.
-    if (include_output && manifest != nullptr &&
-            manifest->special_tensors.count("lm_head") == 0 &&
-            t.role == tensor_role::embedding) {
-        return true;
-    }
-    if (include_embedding && t.layer < layer_start &&
-            t.role != tensor_role::output_norm &&
-            t.role != tensor_role::lm_head) {
-        return true;
-    }
-    if (include_output &&
-            (t.role == tensor_role::output_norm || t.role == tensor_role::lm_head)) {
-        return true;
-    }
-    return t.layer >= layer_start && t.layer < layer_end;
+
+    const auto desc = build_architecture_descriptor(*manifest);
+    return architecture_tensor_included(
+            desc, t, layer_start, layer_end, include_embedding, include_output);
 }
 
 std::vector<std::string> list_tensors_for_worker(
@@ -115,12 +87,12 @@ materialized_special_flags inspect_materialized_special_tensors(
     };
 
     if (!manifest.empty()) {
+        const auto desc = build_architecture_descriptor(manifest);
         flags.embedding   = has_tensor("embedding");
         flags.output_norm = has_tensor("output_norm");
-        if (manifest.special_tensors.count("lm_head") > 0) {
+        if (desc.has_separate_output) {
             flags.output = has_tensor("lm_head");
         } else {
-            // Tied embeddings: lm_head shares token_embd.weight.
             flags.output = flags.embedding;
         }
         return flags;
@@ -136,17 +108,18 @@ static bool special_flags_match_role(
         const materialized_special_flags & flags,
         const worker_tensor_plan & plan,
         const model_manifest & manifest) {
+    const auto desc = build_architecture_descriptor(manifest);
     if (plan.include_embedding && !flags.embedding) {
         return false;
     }
     if (plan.include_output) {
-        if (manifest.special_tensors.count("output_norm") > 0 && !flags.output_norm) {
+        if (desc.has_output_norm && !flags.output_norm) {
             return false;
         }
-        if (manifest.special_tensors.count("lm_head") > 0 && !flags.output) {
+        if (desc.has_separate_output && !flags.output) {
             return false;
         }
-        if (manifest.special_tensors.count("lm_head") == 0 && !flags.embedding) {
+        if (desc.tied_embeddings && !flags.embedding) {
             return false;
         }
     }
@@ -261,6 +234,7 @@ verify_check_result verify_worker_store_assignment(
     verify_check_result result;
     result.name = "stage_7_worker_assignment";
 
+    const auto desc = build_architecture_descriptor(manifest);
     std::vector<std::string> issues;
     if (plan.include_embedding && !store.has_layer(layer_special::embedding)) {
         issues.push_back("missing embedding blob (-1)");
@@ -271,8 +245,8 @@ verify_check_result verify_worker_store_assignment(
         }
     }
     if (plan.include_output) {
-        if (manifest.special_tensors.count("lm_head") == 0 && !store.has_layer(layer_special::embedding)) {
-            issues.push_back("missing tied lm_head embedding blob (-1)");
+        if (desc.tied_embeddings && !store.has_layer(layer_special::embedding)) {
+            issues.push_back("missing tied output embedding blob (-1)");
         }
         if (!store.has_layer(layer_special::output)) {
             issues.push_back("missing output blob (-2)");
@@ -281,15 +255,17 @@ verify_check_result verify_worker_store_assignment(
 
     std::vector<std::string> special;
     if (plan.include_embedding ||
-            (plan.include_output && manifest.special_tensors.count("lm_head") == 0)) {
-        special.push_back("token_embd.weight");
+            (plan.include_output && desc.tied_embeddings)) {
+        if (desc.special_tensors.count("embedding") > 0) {
+            special.push_back(desc.special_tensors.at("embedding"));
+        }
     }
     if (plan.include_output) {
-        if (manifest.special_tensors.count("output_norm") > 0) {
-            special.push_back(manifest.special_tensors.at("output_norm"));
+        if (desc.special_tensors.count("output_norm") > 0) {
+            special.push_back(desc.special_tensors.at("output_norm"));
         }
-        if (manifest.special_tensors.count("lm_head") > 0) {
-            special.push_back(manifest.special_tensors.at("lm_head"));
+        if (desc.has_separate_output && desc.special_tensors.count("lm_head") > 0) {
+            special.push_back(desc.special_tensors.at("lm_head"));
         }
     }
 

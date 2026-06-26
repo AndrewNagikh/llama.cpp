@@ -1,5 +1,6 @@
 #include "worker_verify.h"
 
+#include "architecture_descriptor/architecture_descriptor.h"
 #include "node_agent/layer_store/layer_special.h"
 
 bool verify_worker_materialization(
@@ -40,15 +41,16 @@ bool verify_worker_materialization(
     }
 
     if (include_output) {
-        const bool tied_lm_head = manifest.special_tensors.count("lm_head") == 0;
-        if (tied_lm_head && !include_embedding) {
+        const auto desc = build_architecture_descriptor(manifest);
+        if (architecture_materialize_needs_embedding_for_output(
+                    desc, include_embedding, include_output)) {
             if (!store.has_layer(layer_special::embedding)) {
-                err = "missing tied lm_head embedding blob";
+                err = "missing tied output embedding blob";
                 return false;
             }
             if (!store.verify_layer(layer_special::embedding, "manifest:role:preamble") &&
                     !store.verify_layer(layer_special::embedding, "manifest:role:embedding")) {
-                err = "tied lm_head embedding checksum failed";
+                err = "tied output embedding checksum failed";
                 return false;
             }
         }

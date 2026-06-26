@@ -9,10 +9,15 @@ set(DIST_TRANSPORT_SOURCES
     ${DIST_TRANSPORT_DIR}/split_tcp_wire.cpp
 )
 
+set(DIST_ARCHITECTURE_DESCRIPTOR_SOURCES
+    architecture_descriptor/descriptor_builder.cpp
+)
+
 set(DIST_COMMON_SOURCES
     ${DIST_TRANSPORT_SOURCES}
     dist_common.cpp
     model_catalog.cpp
+    ${DIST_ARCHITECTURE_DESCRIPTOR_SOURCES}
     orchestrator/model_registry.cpp
     orchestrator/model_provider/model_provider.cpp
     orchestrator/model_provider/huggingface_provider.cpp
@@ -58,6 +63,7 @@ set(NODE_AGENT_SOURCES
     node_agent/synchronization/executors/http_range/http_range_executor.cpp
     orchestrator/install_planner/install_planner.cpp
     orchestrator/manifest_builder/manifest_builder.cpp
+    ${DIST_ARCHITECTURE_DESCRIPTOR_SOURCES}
 )
 
 set(VERIFICATION_SOURCES
@@ -201,6 +207,7 @@ if (LLAMA_BUILD_TESTS)
         orchestrator/model_provider/model_provider.cpp
         orchestrator/model_provider/huggingface_provider.cpp
         orchestrator/manifest_builder/manifest_builder.cpp
+        ${DIST_ARCHITECTURE_DESCRIPTOR_SOURCES}
         orchestrator/layout_planner/layout_planner.cpp
         orchestrator/layout_estimator/layout_estimator.cpp
         orchestrator/optimizer/cluster_optimizer.cpp
@@ -556,4 +563,25 @@ if (LLAMA_BUILD_TESTS)
     dist_add_verify_test(test-materialization-verification)
     dist_add_verify_test(test-layer-store-verification)
     dist_add_verify_test(test-verification-multi-model)
+
+    set(ARCHITECTURE_TEST_SOURCES
+        ${DIST_ARCHITECTURE_DESCRIPTOR_SOURCES}
+        orchestrator/manifest_builder/manifest_builder.cpp
+        dist_common.cpp
+    )
+    macro(dist_add_architecture_test name)
+        add_executable(${name} ${name}.cpp ${ARCHITECTURE_TEST_SOURCES})
+        target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
+        target_compile_features(${name} PRIVATE cxx_std_17)
+        target_link_libraries(${name} PRIVATE llama llama-common Threads::Threads)
+    endmacro()
+
+    dist_add_architecture_test(test-architecture-descriptor)
+    dist_add_architecture_test(test-semantic-roles)
+    dist_add_architecture_test(test-worker-requirements)
+    dist_add_architecture_test(test-tied-embeddings)
+    dist_add_architecture_test(test-output-head)
+    dist_add_architecture_test(test-qwen-descriptor)
+    dist_add_architecture_test(test-gemma-descriptor)
+    dist_add_architecture_test(test-deepseek-descriptor)
 endif()

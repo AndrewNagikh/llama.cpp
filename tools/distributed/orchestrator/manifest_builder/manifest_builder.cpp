@@ -1,6 +1,7 @@
 #include "manifest_builder.h"
 
 #include "../model_registry.h"
+#include "architecture_descriptor/architecture_descriptor.h"
 
 #include "dist_common.h"
 #include "ggml.h"
@@ -166,37 +167,7 @@ model_manifest model_manifest::from_json(const json & j) {
 // ---------------------------------------------------------------------------
 
 void classify_tensor(const std::string & name, int32_t & layer, tensor_role & role) {
-    layer = -1;
-    role  = tensor_role::other;
-
-    if (name == "token_embd.weight") {
-        role = tensor_role::embedding;
-        return;
-    }
-    if (name == "output.weight") {
-        role = tensor_role::lm_head;
-        return;
-    }
-    if (name == "output_norm.weight") {
-        role = tensor_role::output_norm;
-        return;
-    }
-    if (name == "norm.weight" || name == "token_embd_norm.weight") {
-        role = tensor_role::norm;
-        return;
-    }
-
-    if (name.rfind("blk.", 0) == 0) {
-        const size_t dot = name.find('.', 4);
-        if (dot != std::string::npos) {
-            try {
-                layer = std::stoi(name.substr(4, dot - 4));
-                role  = tensor_role::layer;
-            } catch (...) {
-                role = tensor_role::other;
-            }
-        }
-    }
+    classify_tensor_enhanced(name, layer, role);
 }
 
 std::vector<layer_descriptor> build_layer_descriptors(const std::vector<tensor_descriptor> & tensors) {
