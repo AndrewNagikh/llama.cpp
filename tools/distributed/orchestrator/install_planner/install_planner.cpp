@@ -1,6 +1,7 @@
 #include "install_planner.h"
 
-#include "architecture_descriptor/architecture_descriptor.h"
+#include "architecture/architecture_descriptor.h"
+#include "architecture/install_planning.h"
 
 #include <algorithm>
 #include <cctype>
@@ -119,7 +120,7 @@ install_action install_action_from_string(const std::string & s) {
 // ---------------------------------------------------------------------------
 
 json download_operation::to_json() const {
-    return {
+    json j = {
         { "layer", layer_index },
         { "node", node_id },
         { "tensor_offset", tensor_offset },
@@ -129,11 +130,20 @@ json download_operation::to_json() const {
         { "source_url", source_url },
         { "checksum", checksum },
     };
+    if (!blob_id.empty()) {
+        j["blob_id"] = blob_id;
+    }
+    if (!tensor_name.empty()) {
+        j["tensor_name"] = tensor_name;
+    }
+    return j;
 }
 
 download_operation download_operation::from_json(const json & j) {
     download_operation op;
     op.layer_index   = j.value("layer", j.value("layer_index", -1));
+    op.blob_id       = j.value("blob_id", "");
+    op.tensor_name   = j.value("tensor_name", "");
     op.node_id       = j.value("node", j.value("node_id", ""));
     op.tensor_offset = j.value("tensor_offset", j.value("offset", static_cast<uint64_t>(0)));
     op.tensor_length = j.value("tensor_length", j.value("length", static_cast<uint64_t>(0)));
@@ -450,68 +460,24 @@ install_plan_build_result build_install_plan(
         }
 
         if (!entry_node.empty() || !final_node.empty()) {
-            layer_byte_range emb = manifest_global_preamble_range(manifest);
-            if (emb.length == 0) {
-                emb = manifest_role_byte_range(manifest, tensor_role::embedding);
-            }
-
             const auto desc = build_architecture_descriptor(manifest);
-            const bool replicate_embedding = architecture_should_replicate_embedding(desc);
 
-            if (emb.length > 0) {
-                if (!entry_node.empty()) {
-                    download_operation dl = make_download_op(
-                            layer_special::embedding, entry_node, emb, source_url);
-                    add_operation(operations, seen, install_action::download,
-                            entry_node, layer_special::embedding, dl);
-                }
+            std::set<std::string> all_nodes;
+            for (const auto & placement : desired.placements) {
+                all_nodes.insert(placement.node_id);
+            }
+            std::vector<std::string> node_list(all_nodes.begin(), all_nodes.end());
 
-                if (replicate_embedding) {
-                    std::set<std::string> all_nodes;
-                    for (const auto & placement : desired.placements) {
-                        all_nodes.insert(placement.node_id);
-                    }
-                    for (const auto & node_id : all_nodes) {
-                        download_operation dl = make_download_op(
-                                layer_special::embedding, node_id, emb, source_url);
-                        add_operation(operations, seen, install_action::download,
-                                node_id, layer_special::embedding, dl);
-                    }
-                }
-            }
-        }
-
-        if (!final_node.empty()) {
-            layer_byte_range out_range{};
-            const layer_byte_range norm = manifest_role_byte_range(manifest, tensor_role::output_norm);
-            const layer_byte_range head = manifest_role_byte_range(manifest, tensor_role::lm_head);
-            if (norm.length > 0) {
-                if (out_range.length == 0) {
-                    out_range = norm;
-                } else {
-                    const uint64_t end = std::max(norm.offset + norm.length, out_range.offset + out_range.length);
-                    out_range.offset = std::min(norm.offset, out_range.offset);
-                    out_range.length = end - out_range.offset;
-                    out_range.size_bytes = out_range.length;
-                }
-            }
-            if (head.length > 0) {
-                if (out_range.length == 0) {
-                    out_range = head;
-                } else {
-                    const uint64_t end = std::max(head.offset + head.length, out_range.offset + out_range.length);
-                    out_range.offset = std::min(head.offset, out_range.offset);
-                    out_range.length = end - out_range.offset;
-                    out_range.size_bytes = out_range.length;
-                }
-            }
-            if (out_range.length > 0) {
-                out_range.checksum = "manifest:role:output";
-                download_operation dl = make_download_op(
-                        layer_special::output, final_node, out_range, source_url);
-                add_operation(operations, seen, install_action::download,
-                        final_node, layer_special::output, dl);
-            }
+            std::set<std::string> blob_seen;
+            add_semantic_blob_downloads(
+                    operations,
+                    blob_seen,
+                    desc,
+                    manifest,
+                    entry_node,
+                    final_node,
+                    node_list,
+                    source_url);
         }
     }
 

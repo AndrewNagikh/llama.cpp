@@ -37,6 +37,8 @@ struct layer_byte_range {
 
 struct download_operation {
     int32_t     layer_index   = -1;
+    std::string blob_id;
+    std::string tensor_name;
     std::string node_id;
     uint64_t    tensor_offset = 0;
     uint64_t    tensor_length = 0;

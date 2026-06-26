@@ -8,16 +8,23 @@ int main() {
     const auto desc  = build_architecture_descriptor(llama);
 
     assert(desc.architecture == "llama");
+    assert(desc.family == "llama");
     assert(desc.tied_embeddings);
-    assert(!desc.has_separate_output);
-    assert(desc.has_output_norm);
-    assert(desc.tensors.size() == llama.tensors.size());
-    assert(!desc.role_requirements.empty());
+    assert(!desc.separate_lm_head);
+    assert(find_blob(desc.blobs, "output_norm") != nullptr);
+    assert(find_blob(desc.blobs, "embedding") != nullptr);
+    assert(!desc.blobs.empty());
+    assert(!desc.worker_requirements.empty());
 
     const auto separate = make_dense_manifest("qwen2", false);
     const auto desc2    = build_architecture_descriptor(separate);
+    assert(desc2.family == "qwen");
     assert(!desc2.tied_embeddings);
-    assert(desc2.has_separate_output);
+    assert(desc2.separate_lm_head);
+    assert(find_blob(desc2.blobs, "output_head") != nullptr);
+
+    assert(find_blob(desc2.blobs, "output_head") != nullptr);
+    assert(find_blob(desc2.blobs, "output_norm") != nullptr);
 
     printf("test-architecture-descriptor: OK\n");
     return 0;

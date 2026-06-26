@@ -3,6 +3,8 @@
 #include "layer_blob.h"
 #include "manifest_builder/manifest_builder.h"
 
+#include "architecture/semantic_blob.h"
+
 #include "nlohmann/json.hpp"
 
 #include <filesystem>
@@ -46,6 +48,34 @@ public:
     bool has_layer(int32_t layer_index) const;
     std::optional<layer_blob> get_layer(int32_t layer_index) const;
 
+    std::filesystem::path blobs_dir() const;
+    std::filesystem::path blob_tensor_path(
+            const std::string & blob_id,
+            const std::string & tensor_name) const;
+
+    bool store_blob_tensor(
+            const std::string & blob_id,
+            const std::string & tensor_name,
+            const uint8_t * data,
+            size_t len,
+            uint64_t offset_begin,
+            const std::string & checksum);
+
+    bool load_blob_tensor(
+            const std::string & blob_id,
+            const std::string & tensor_name,
+            std::vector<uint8_t> & out) const;
+
+    bool has_blob_tensor(const std::string & blob_id, const std::string & tensor_name) const;
+    bool has_semantic_blob(
+            const std::string & blob_id,
+            const std::vector<semantic_tensor_slot> & tensors) const;
+    bool verify_blob_tensor(
+            const std::string & blob_id,
+            const std::string & tensor_name,
+            const std::string & expected_checksum) const;
+    bool remove_blob_tensor(const std::string & blob_id, const std::string & tensor_name);
+
     bool save_metadata_blob(const std::vector<uint8_t> & data);
     std::optional<std::vector<uint8_t>> load_metadata_blob() const;
     std::optional<uint64_t> metadata_bytes() const;
@@ -58,4 +88,5 @@ private:
     bool save_checksums(const nlohmann::json & checksums) const;
     nlohmann::json load_checksums() const;
     static std::string layer_filename(int32_t layer_index);
+    static std::string safe_tensor_filename(const std::string & tensor_name);
 };

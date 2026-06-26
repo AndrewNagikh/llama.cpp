@@ -9,15 +9,25 @@ set(DIST_TRANSPORT_SOURCES
     ${DIST_TRANSPORT_DIR}/split_tcp_wire.cpp
 )
 
-set(DIST_ARCHITECTURE_DESCRIPTOR_SOURCES
-    architecture_descriptor/descriptor_builder.cpp
+set(DIST_ARCHITECTURE_SOURCES
+    architecture/semantic_blob.cpp
+    architecture/semantic_roles.cpp
+    architecture/worker_requirement.cpp
+    architecture/architecture_descriptor.cpp
+    architecture/blob_builder.cpp
+    architecture/descriptor_service.cpp
+    architecture/install_planning.cpp
+    architecture/tensor_plan.cpp
+    architecture/plugins/llama_plugin.cpp
+    architecture/plugins/qwen_plugin.cpp
+    architecture/plugins/gemma_plugin.cpp
 )
 
 set(DIST_COMMON_SOURCES
     ${DIST_TRANSPORT_SOURCES}
     dist_common.cpp
     model_catalog.cpp
-    ${DIST_ARCHITECTURE_DESCRIPTOR_SOURCES}
+    ${DIST_ARCHITECTURE_SOURCES}
     orchestrator/model_registry.cpp
     orchestrator/model_provider/model_provider.cpp
     orchestrator/model_provider/huggingface_provider.cpp
@@ -57,13 +67,14 @@ set(DIST_INCLUDE_DIRS
 set(NODE_AGENT_SOURCES
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
+    node_agent/layer_store/descriptor_materialize.cpp
     node_agent/layer_store/layer_gguf_assembler.cpp
     node_agent/synchronization/sync_types.cpp
     node_agent/synchronization/synchronization_engine.cpp
     node_agent/synchronization/executors/http_range/http_range_executor.cpp
     orchestrator/install_planner/install_planner.cpp
     orchestrator/manifest_builder/manifest_builder.cpp
-    ${DIST_ARCHITECTURE_DESCRIPTOR_SOURCES}
+    ${DIST_ARCHITECTURE_SOURCES}
 )
 
 set(VERIFICATION_SOURCES
@@ -125,6 +136,7 @@ dist_add_exe(orchestrator orchestrator.cpp)
 target_sources(orchestrator PRIVATE
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
+    node_agent/layer_store/descriptor_materialize.cpp
     node_agent/layer_store/layer_gguf_assembler.cpp
     ${VERIFICATION_SOURCES}
 )
@@ -207,7 +219,7 @@ if (LLAMA_BUILD_TESTS)
         orchestrator/model_provider/model_provider.cpp
         orchestrator/model_provider/huggingface_provider.cpp
         orchestrator/manifest_builder/manifest_builder.cpp
-        ${DIST_ARCHITECTURE_DESCRIPTOR_SOURCES}
+        ${DIST_ARCHITECTURE_SOURCES}
         orchestrator/layout_planner/layout_planner.cpp
         orchestrator/layout_estimator/layout_estimator.cpp
         orchestrator/optimizer/cluster_optimizer.cpp
@@ -457,12 +469,14 @@ if (LLAMA_BUILD_TESTS)
     set(SYNC_AGENT_SOURCES
         node_agent/layer_store/layer_store.cpp
         node_agent/layer_store/layer_checksum.cpp
+        node_agent/layer_store/descriptor_materialize.cpp
         node_agent/layer_store/layer_gguf_assembler.cpp
         node_agent/synchronization/sync_types.cpp
         node_agent/synchronization/synchronization_engine.cpp
         node_agent/synchronization/executors/http_range/http_range_executor.cpp
         orchestrator/install_planner/install_planner.cpp
         orchestrator/manifest_builder/manifest_builder.cpp
+        ${DIST_ARCHITECTURE_SOURCES}
         dist_common.cpp
     )
     set(SYNC_AGENT_LINK_LIBS cpp-httplib llama Threads::Threads)
@@ -517,6 +531,7 @@ if (LLAMA_BUILD_TESTS)
         ${MODEL_REGISTRY_SOURCES}
         node_agent/layer_store/layer_store.cpp
         node_agent/layer_store/layer_checksum.cpp
+        node_agent/layer_store/descriptor_materialize.cpp
         node_agent/layer_store/layer_gguf_assembler.cpp
         node_agent/synchronization/sync_types.cpp
         node_agent/synchronization/synchronization_engine.cpp
@@ -565,7 +580,7 @@ if (LLAMA_BUILD_TESTS)
     dist_add_verify_test(test-verification-multi-model)
 
     set(ARCHITECTURE_TEST_SOURCES
-        ${DIST_ARCHITECTURE_DESCRIPTOR_SOURCES}
+        ${DIST_ARCHITECTURE_SOURCES}
         orchestrator/manifest_builder/manifest_builder.cpp
         dist_common.cpp
     )
@@ -577,11 +592,32 @@ if (LLAMA_BUILD_TESTS)
     endmacro()
 
     dist_add_architecture_test(test-architecture-descriptor)
+    dist_add_architecture_test(test-architecture-detector)
     dist_add_architecture_test(test-semantic-roles)
+    dist_add_architecture_test(test-semantic-blobs)
     dist_add_architecture_test(test-worker-requirements)
+    dist_add_architecture_test(test-blob-builder)
     dist_add_architecture_test(test-tied-embeddings)
     dist_add_architecture_test(test-output-head)
+    dist_add_architecture_test(test-llama-plugin)
+    dist_add_architecture_test(test-qwen-plugin)
+    dist_add_architecture_test(test-gemma-plugin)
     dist_add_architecture_test(test-qwen-descriptor)
     dist_add_architecture_test(test-gemma-descriptor)
     dist_add_architecture_test(test-deepseek-descriptor)
+
+    add_executable(test-qwen-materialization test-qwen-materialization.cpp
+        ${ARCHITECTURE_TEST_SOURCES}
+        node_agent/layer_store/layer_store.cpp
+        node_agent/layer_store/layer_checksum.cpp
+        node_agent/layer_store/descriptor_materialize.cpp
+        node_agent/layer_store/layer_gguf_assembler.cpp
+        verification/layer_store_populate.cpp
+        verification/verification_common.cpp
+        verification/gguf_inspector.cpp
+        verification/deps/sha256/sha256.c
+        orchestrator/install_planner/install_planner.cpp)
+    target_include_directories(test-qwen-materialization PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-qwen-materialization PRIVATE cxx_std_17)
+    target_link_libraries(test-qwen-materialization PRIVATE llama llama-common Threads::Threads)
 endif()

@@ -1,4 +1,4 @@
-#include "architecture_descriptor/architecture_descriptor.h"
+#include "architecture/architecture_descriptor.h"
 #include "test_sync_common.h"
 #include "test_verify_common.h"
 #include "verification/verification_pipeline.h"

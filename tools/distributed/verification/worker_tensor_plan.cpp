@@ -1,8 +1,10 @@
 #include "worker_tensor_plan.h"
 
-#include "architecture_descriptor/architecture_descriptor.h"
+#include "architecture/architecture_descriptor.h"
+#include "node_agent/layer_store/descriptor_materialize.h"
+#include "architecture/semantic_blob.h"
+#include "architecture/tensor_plan.h"
 #include "gguf_inspector.h"
-#include "node_agent/layer_store/layer_special.h"
 
 #include <algorithm>
 #include <map>
@@ -42,7 +44,7 @@ bool gguf_tensor_included(
     }
 
     const auto desc = build_architecture_descriptor(*manifest);
-    return architecture_tensor_included(
+    return descriptor_tensor_included(
             desc, t, layer_start, layer_end, include_embedding, include_output);
 }
 
@@ -90,7 +92,7 @@ materialized_special_flags inspect_materialized_special_tensors(
         const auto desc = build_architecture_descriptor(manifest);
         flags.embedding   = has_tensor("embedding");
         flags.output_norm = has_tensor("output_norm");
-        if (desc.has_separate_output) {
+        if (desc.separate_lm_head) {
             flags.output = has_tensor("lm_head");
         } else {
             flags.output = flags.embedding;
@@ -113,10 +115,10 @@ static bool special_flags_match_role(
         return false;
     }
     if (plan.include_output) {
-        if (desc.has_output_norm && !flags.output_norm) {
+        if (find_blob(desc.blobs, "output_norm") && !flags.output_norm) {
             return false;
         }
-        if (desc.has_separate_output && !flags.output) {
+        if (desc.separate_lm_head && !flags.output) {
             return false;
         }
         if (desc.tied_embeddings && !flags.embedding) {
@@ -208,13 +210,7 @@ verify_check_result verify_materialized_structure_for_role(
         } },
     };
 
-    if (plan.role == worker_verify_role::full) {
-        if (!special_flags_match_role(flags, plan, manifest)) {
-            result.status  = verify_status::fail;
-            result.message = "full GGUF missing required special tensors";
-            return result;
-        }
-    } else if (!special_flags_match_role(flags, plan, manifest)) {
+    if (!special_flags_match_role(flags, plan, manifest)) {
         result.status  = verify_status::fail;
         result.message = "missing required special tensors for " +
                 worker_verify_role_to_string(plan.role);
@@ -236,36 +232,39 @@ verify_check_result verify_worker_store_assignment(
 
     const auto desc = build_architecture_descriptor(manifest);
     std::vector<std::string> issues;
-    if (plan.include_embedding && !store.has_layer(layer_special::embedding)) {
-        issues.push_back("missing embedding blob (-1)");
+
+    std::vector<std::string> required_blobs;
+    if (plan.include_embedding) {
+        required_blobs.push_back("embedding");
     }
+    if (plan.include_output) {
+        if (find_blob(desc.blobs, "output_norm")) {
+            required_blobs.push_back("output_norm");
+        }
+        if (find_blob(desc.blobs, "output_head")) {
+            required_blobs.push_back("output_head");
+        }
+    }
+
+    std::string blob_err;
+    if (!verify_required_blobs(store, desc, required_blobs, blob_err)) {
+        issues.push_back(blob_err);
+    }
+
     for (int32_t layer = plan.layer_start; layer < plan.layer_end; ++layer) {
         if (!store.has_layer(layer)) {
             issues.push_back("missing layer " + std::to_string(layer));
         }
     }
-    if (plan.include_output) {
-        if (desc.tied_embeddings && !store.has_layer(layer_special::embedding)) {
-            issues.push_back("missing tied output embedding blob (-1)");
-        }
-        if (!store.has_layer(layer_special::output)) {
-            issues.push_back("missing output blob (-2)");
-        }
-    }
 
     std::vector<std::string> special;
-    if (plan.include_embedding ||
-            (plan.include_output && desc.tied_embeddings)) {
-        if (desc.special_tensors.count("embedding") > 0) {
-            special.push_back(desc.special_tensors.at("embedding"));
+    for (const std::string & blob_id : required_blobs) {
+        const semantic_blob * blob = find_blob(desc.blobs, blob_id);
+        if (blob == nullptr) {
+            continue;
         }
-    }
-    if (plan.include_output) {
-        if (desc.special_tensors.count("output_norm") > 0) {
-            special.push_back(desc.special_tensors.at("output_norm"));
-        }
-        if (desc.has_separate_output && desc.special_tensors.count("lm_head") > 0) {
-            special.push_back(desc.special_tensors.at("lm_head"));
+        for (const auto & slot : blob->tensors) {
+            special.push_back(slot.name);
         }
     }
 
@@ -278,11 +277,11 @@ verify_check_result verify_worker_store_assignment(
 
     if (!issues.empty()) {
         result.status  = verify_status::fail;
-        result.message = issues.front();
+        result.message = "worker store assignment incomplete";
         return result;
     }
 
     result.status  = verify_status::ok;
-    result.message = worker_verify_role_to_string(plan.role) + " store assignment OK";
+    result.message = "worker store assignment OK";
     return result;
 }

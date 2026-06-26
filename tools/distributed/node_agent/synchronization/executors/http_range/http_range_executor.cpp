@@ -141,19 +141,36 @@ executor_result http_range_download_executor::execute(
     }
 
     const uint64_t offset_end = dl.tensor_offset + dl.tensor_length;
-    if (!store.store_layer(
-                dl.layer_index,
-                body.data(),
-                body.size(),
-                dl.tensor_offset,
-                offset_end,
-                dl.checksum)) {
+    const bool is_blob_tensor = !dl.blob_id.empty() && !dl.tensor_name.empty();
+    const bool stored = is_blob_tensor
+            ? store.store_blob_tensor(
+                    dl.blob_id,
+                    dl.tensor_name,
+                    body.data(),
+                    body.size(),
+                    dl.tensor_offset,
+                    dl.checksum)
+            : store.store_layer(
+                    dl.layer_index,
+                    body.data(),
+                    body.size(),
+                    dl.tensor_offset,
+                    offset_end,
+                    dl.checksum);
+    if (!stored) {
         result.error = "failed to store layer blob";
         return result;
     }
 
-    if (!store.verify_layer(dl.layer_index, dl.checksum)) {
-        store.remove_layer(dl.layer_index);
+    const bool verified = is_blob_tensor
+            ? store.verify_blob_tensor(dl.blob_id, dl.tensor_name, dl.checksum)
+            : store.verify_layer(dl.layer_index, dl.checksum);
+    if (!verified) {
+        if (is_blob_tensor) {
+            store.remove_blob_tensor(dl.blob_id, dl.tensor_name);
+        } else {
+            store.remove_layer(dl.layer_index);
+        }
         result.error = "post-store verification failed";
         return result;
     }

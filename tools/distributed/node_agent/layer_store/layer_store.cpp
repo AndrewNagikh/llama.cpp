@@ -1,6 +1,7 @@
 #include "layer_store.h"
 #include "layer_special.h"
 
+#include "architecture/semantic_blob.h"
 #include "layer_checksum.h"
 #include "layer_gguf_assembler.h"
 
@@ -266,6 +267,149 @@ std::vector<layer_blob> layer_store::list_layers() const {
 bool layer_store::has_layer(const int32_t layer_index) const {
     std::error_code ec;
     return std::filesystem::exists(layer_path(layer_index), ec);
+}
+
+std::filesystem::path layer_store::blobs_dir() const {
+    return model_root() / "blobs";
+}
+
+std::string layer_store::safe_tensor_filename(const std::string & tensor_name) {
+    std::string safe = tensor_name;
+    for (char & c : safe) {
+        if (c == '/' || c == '\\') {
+            c = '_';
+        }
+    }
+    return safe + ".bin";
+}
+
+std::filesystem::path layer_store::blob_tensor_path(
+        const std::string & blob_id,
+        const std::string & tensor_name) const {
+    return blobs_dir() / blob_id / safe_tensor_filename(tensor_name);
+}
+
+bool layer_store::store_blob_tensor(
+        const std::string & blob_id,
+        const std::string & tensor_name,
+        const uint8_t * data,
+        const size_t len,
+        const uint64_t offset_begin,
+        const std::string & checksum) {
+    if (blob_id.empty() || tensor_name.empty() || data == nullptr || len == 0) {
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(blobs_dir() / blob_id, ec);
+    if (ec) {
+        return false;
+    }
+
+    const auto path = blob_tensor_path(blob_id, tensor_name);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return false;
+    }
+    out.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(len));
+    if (!out) {
+        return false;
+    }
+
+    const std::string stored_checksum = checksum.empty()
+            ? compute_blob_checksum(data, len)
+            : checksum;
+
+    json checksums = load_checksums();
+    const std::string key = blob_checksum_key(blob_id, tensor_name);
+    checksums[key] = {
+        { "blob_id", blob_id },
+        { "tensor_name", tensor_name },
+        { "offset_begin", offset_begin },
+        { "offset_end", offset_begin + len },
+        { "size_bytes", len },
+        { "checksum", stored_checksum },
+        { "path", (std::filesystem::path("blobs") / blob_id / safe_tensor_filename(tensor_name)).string() },
+    };
+    return save_checksums(checksums);
+}
+
+bool layer_store::load_blob_tensor(
+        const std::string & blob_id,
+        const std::string & tensor_name,
+        std::vector<uint8_t> & out) const {
+    out.clear();
+    const auto path = blob_tensor_path(blob_id, tensor_name);
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        return false;
+    }
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    in.seekg(0, std::ios::end);
+    const auto size = in.tellg();
+    if (size <= 0) {
+        return false;
+    }
+    in.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(size));
+    in.read(reinterpret_cast<char *>(out.data()), size);
+    return static_cast<bool>(in);
+}
+
+bool layer_store::has_blob_tensor(const std::string & blob_id, const std::string & tensor_name) const {
+    std::error_code ec;
+    return std::filesystem::exists(blob_tensor_path(blob_id, tensor_name), ec);
+}
+
+bool layer_store::has_semantic_blob(
+        const std::string & blob_id,
+        const std::vector<semantic_tensor_slot> & tensors) const {
+    if (tensors.empty()) {
+        return true;
+    }
+    for (const auto & slot : tensors) {
+        if (!has_blob_tensor(blob_id, slot.name)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool layer_store::verify_blob_tensor(
+        const std::string & blob_id,
+        const std::string & tensor_name,
+        const std::string & expected_checksum) const {
+    std::vector<uint8_t> data;
+    if (!load_blob_tensor(blob_id, tensor_name, data)) {
+        return false;
+    }
+
+    json checksums = load_checksums();
+    const std::string key = blob_checksum_key(blob_id, tensor_name);
+    uint64_t size_bytes = data.size();
+    if (checksums.contains(key) && checksums[key].is_object()) {
+        size_bytes = checksums[key].value("size_bytes", size_bytes);
+    }
+
+    return checksum_matches(
+            expected_checksum,
+            data.data(),
+            data.size(),
+            -1,
+            size_bytes);
+}
+
+bool layer_store::remove_blob_tensor(const std::string & blob_id, const std::string & tensor_name) {
+    std::error_code ec;
+    std::filesystem::remove(blob_tensor_path(blob_id, tensor_name), ec);
+
+    json checksums = load_checksums();
+    checksums.erase(blob_checksum_key(blob_id, tensor_name));
+    return save_checksums(checksums);
 }
 
 bool layer_store::save_metadata_blob(const std::vector<uint8_t> & data) {

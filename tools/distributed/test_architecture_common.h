@@ -1,6 +1,7 @@
 #pragma once
 
-#include "architecture_descriptor/architecture_descriptor.h"
+#include "architecture/architecture_descriptor.h"
+#include "architecture/semantic_blob.h"
 #include "orchestrator/manifest_builder/manifest_builder.h"
 
 #include <cstdlib>
@@ -12,11 +13,13 @@
 inline tensor_descriptor make_tensor(
         const std::string & name,
         const tensor_role role,
-        const int32_t layer = -1) {
+        const int32_t layer = -1,
+        const uint64_t offset = 0) {
     tensor_descriptor t;
-    t.name = name;
-    t.role = role;
-    t.layer = layer;
+    t.name       = name;
+    t.role       = role;
+    t.layer      = layer;
+    t.offset     = offset;
     t.size_bytes = 1024;
     return t;
 }
@@ -26,23 +29,27 @@ inline model_manifest make_dense_manifest(
         const bool tied_embeddings,
         const uint32_t n_layer = 4) {
     model_manifest m;
-    m.architecture = architecture;
-    m.n_layer      = n_layer;
-    m.tensors.push_back(make_tensor("token_embd.weight", tensor_role::embedding));
+    m.architecture         = architecture;
+    m.n_layer              = n_layer;
+    m.tensor_data_offset   = 4096;
+    m.tensors.push_back(make_tensor("token_embd.weight", tensor_role::embedding, -1, 4096));
     m.special_tensors["embedding"] = "token_embd.weight";
 
     if (!tied_embeddings) {
-        m.tensors.push_back(make_tensor("output.weight", tensor_role::lm_head));
+        m.tensors.push_back(make_tensor("output.weight", tensor_role::lm_head, -1, 1000000));
         m.special_tensors["lm_head"] = "output.weight";
     }
 
-    m.tensors.push_back(make_tensor("output_norm.weight", tensor_role::output_norm));
+    m.tensors.push_back(make_tensor("output_norm.weight", tensor_role::output_norm, -1, 2000000));
     m.special_tensors["output_norm"] = "output_norm.weight";
 
+    uint64_t layer_offset = 3000000;
     for (uint32_t i = 0; i < n_layer; ++i) {
         const std::string prefix = "blk." + std::to_string(i) + ".";
-        m.tensors.push_back(make_tensor(prefix + "attn_q.weight", tensor_role::layer, (int32_t) i));
-        m.tensors.push_back(make_tensor(prefix + "ffn_up.weight", tensor_role::layer, (int32_t) i));
+        m.tensors.push_back(make_tensor(prefix + "attn_q.weight", tensor_role::layer, (int32_t) i, layer_offset));
+        layer_offset += 1024;
+        m.tensors.push_back(make_tensor(prefix + "ffn_up.weight", tensor_role::layer, (int32_t) i, layer_offset));
+        layer_offset += 1024;
     }
 
     m.layers = build_layer_descriptors(m.tensors);
@@ -77,7 +84,7 @@ inline std::optional<std::string> find_model_file(const std::vector<std::string>
 
 inline bool test_descriptor_from_gguf(
         const std::vector<std::string> & candidates,
-        const std::string & expected_arch_prefix) {
+        const std::string & expected_family) {
     const auto path = find_model_file(candidates);
     if (!path.has_value()) {
         return false;
@@ -89,5 +96,5 @@ inline bool test_descriptor_from_gguf(
     }
 
     const auto desc = build_architecture_descriptor(manifest);
-    return desc.architecture.rfind(expected_arch_prefix, 0) == 0 && !desc.tensors.empty();
+    return desc.family == expected_family && !desc.blobs.empty();
 }

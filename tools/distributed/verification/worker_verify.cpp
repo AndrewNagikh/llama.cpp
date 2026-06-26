@@ -1,7 +1,8 @@
 #include "worker_verify.h"
 
-#include "architecture_descriptor/architecture_descriptor.h"
-#include "node_agent/layer_store/layer_special.h"
+#include "architecture/architecture_descriptor.h"
+#include "node_agent/layer_store/descriptor_materialize.h"
+#include "architecture/worker_requirement.h"
 
 bool verify_worker_materialization(
         const layer_store & store,
@@ -17,16 +18,31 @@ bool verify_worker_materialization(
         return false;
     }
 
+    const auto desc = build_architecture_descriptor(manifest);
+    const worker_role role = include_embedding && include_output
+            ? worker_role::full
+            : include_embedding
+                    ? worker_role::entry
+                    : include_output ? worker_role::final : worker_role::middle;
+
+    const auto plan = materialize_plan_for_worker(
+            desc.worker_requirements, role, layer_start, layer_end);
+
+    std::vector<std::string> required_blobs = plan.required_blobs;
     if (include_embedding) {
-        if (!store.has_layer(layer_special::embedding)) {
-            err = "missing embedding layer blob";
-            return false;
+        required_blobs.push_back("embedding");
+    }
+    if (include_output) {
+        if (find_blob(desc.blobs, "output_norm")) {
+            required_blobs.push_back("output_norm");
         }
-        if (!store.verify_layer(layer_special::embedding, "manifest:role:preamble") &&
-                !store.verify_layer(layer_special::embedding, "manifest:role:embedding")) {
-            err = "embedding layer checksum failed";
-            return false;
+        if (find_blob(desc.blobs, "output_head")) {
+            required_blobs.push_back("output_head");
         }
+    }
+
+    if (!verify_required_blobs(store, desc, required_blobs, err)) {
+        return false;
     }
 
     for (int32_t layer = layer_start; layer < layer_end; ++layer) {
@@ -36,30 +52,6 @@ bool verify_worker_materialization(
         }
         if (!store.verify_layer(layer, "manifest:layer:" + std::to_string(layer))) {
             err = "layer checksum failed: " + std::to_string(layer);
-            return false;
-        }
-    }
-
-    if (include_output) {
-        const auto desc = build_architecture_descriptor(manifest);
-        if (architecture_materialize_needs_embedding_for_output(
-                    desc, include_embedding, include_output)) {
-            if (!store.has_layer(layer_special::embedding)) {
-                err = "missing tied output embedding blob";
-                return false;
-            }
-            if (!store.verify_layer(layer_special::embedding, "manifest:role:preamble") &&
-                    !store.verify_layer(layer_special::embedding, "manifest:role:embedding")) {
-                err = "tied output embedding checksum failed";
-                return false;
-            }
-        }
-        if (!store.has_layer(layer_special::output)) {
-            err = "missing output layer blob";
-            return false;
-        }
-        if (!store.verify_layer(layer_special::output, "manifest:role:output")) {
-            err = "output layer checksum failed";
             return false;
         }
     }

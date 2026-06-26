@@ -1,7 +1,7 @@
 #include "manifest_builder.h"
 
 #include "../model_registry.h"
-#include "architecture_descriptor/architecture_descriptor.h"
+#include "architecture/semantic_roles.h"
 
 #include "dist_common.h"
 #include "ggml.h"

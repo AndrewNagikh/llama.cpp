@@ -1,4 +1,4 @@
-#include "architecture_descriptor/architecture_descriptor.h"
+#include "architecture/semantic_roles.h"
 
 #include <cassert>
 #include <cstdio>

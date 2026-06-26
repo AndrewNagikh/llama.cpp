@@ -1,7 +1,8 @@
 #include "layer_verify.h"
 
+#include "architecture/architecture_descriptor.h"
+#include "node_agent/layer_store/descriptor_materialize.h"
 #include "node_agent/layer_store/layer_checksum.h"
-#include "node_agent/layer_store/layer_special.h"
 #include "orchestrator/install_planner/install_planner.h"
 #include "verification_common.h"
 
@@ -62,11 +63,18 @@ layer_verify_result layer_verify_store(
         }
     }
 
-    if (!store.has_layer(layer_special::embedding)) {
-        result.issues.push_back("missing embedding blob (-1)");
+    const auto desc = build_architecture_descriptor(manifest);
+    std::vector<std::string> required_blobs;
+    for (const semantic_blob & blob : desc.blobs) {
+        if (blob.storage_alias || blob.deploy == blob_deploy_target::none) {
+            continue;
+        }
+        required_blobs.push_back(blob.id);
     }
-    if (!store.has_layer(layer_special::output)) {
-        result.issues.push_back("missing output blob (-2)");
+
+    std::string blob_err;
+    if (!verify_required_blobs(store, desc, required_blobs, blob_err)) {
+        result.issues.push_back(blob_err);
     }
 
     result.summary.status  = result.issues.empty() ? verify_status::ok : verify_status::fail;

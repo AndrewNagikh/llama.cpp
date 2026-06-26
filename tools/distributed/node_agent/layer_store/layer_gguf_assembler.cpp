@@ -1,6 +1,8 @@
 #include "layer_gguf_assembler.h"
 
-#include "architecture_descriptor/architecture_descriptor.h"
+#include "architecture/architecture_descriptor.h"
+#include "descriptor_materialize.h"
+#include "architecture/worker_requirement.h"
 #include "dist_common.h"
 
 #include "httplib.h"
@@ -71,6 +73,19 @@ static bool write_at(std::vector<uint8_t> & file, const uint64_t offset, const u
     return true;
 }
 
+static worker_role role_from_flags(const bool include_embedding, const bool include_output) {
+    if (include_embedding && include_output) {
+        return worker_role::full;
+    }
+    if (include_embedding) {
+        return worker_role::entry;
+    }
+    if (include_output) {
+        return worker_role::final;
+    }
+    return worker_role::middle;
+}
+
 } // namespace
 
 bool layer_store_cache_metadata(
@@ -106,8 +121,6 @@ bool layer_store_materialize_gguf(
     }
 
     uint64_t file_size = manifest.tensor_data_offset;
-    // Metadata describes the full tensor directory; the file must span every
-    // listed tensor offset even for partial workers (unused regions stay zero).
     for (const auto & t : manifest.tensors) {
         if (t.offset > 0 || t.size_bytes > 0) {
             file_size = std::max(file_size, t.offset + t.size_bytes);
@@ -132,7 +145,7 @@ bool layer_store_materialize_gguf(
         std::memcpy(file.data(), metadata->data(), n);
     }
 
-    auto write_blob = [&](const int32_t layer_index) -> bool {
+    auto write_layer_blob = [&](const int32_t layer_index) -> bool {
         if (!store.has_layer(layer_index)) {
             return false;
         }
@@ -148,29 +161,44 @@ bool layer_store_materialize_gguf(
         return write_at(file, offset, data.data(), data.size());
     };
 
-    if (include_embedding) {
-        if (!write_blob(layer_special::embedding)) {
-            return false;
-        }
-    }
-
     for (int32_t layer = layer_start; layer < layer_end; ++layer) {
-        if (!write_blob(layer)) {
+        if (!write_layer_blob(layer)) {
             return false;
         }
     }
 
-    if (include_output) {
-        const auto desc = build_architecture_descriptor(manifest);
-        if (architecture_materialize_needs_embedding_for_output(
-                    desc, include_embedding, include_output)) {
-            if (!write_blob(layer_special::embedding)) {
-                return false;
+    const auto desc = build_architecture_descriptor(manifest);
+    const worker_role role = role_from_flags(include_embedding, include_output);
+    const auto plan = materialize_plan_for_worker(
+            desc.worker_requirements, role, layer_start, layer_end);
+
+    std::vector<std::string> required_blobs = plan.required_blobs;
+    if (include_embedding) {
+        for (const semantic_blob & blob : desc.blobs) {
+            if (blob.deploy == blob_deploy_target::entry_node ||
+                    blob.deploy == blob_deploy_target::all_nodes) {
+                required_blobs.push_back(blob.id);
             }
         }
-        if (!write_blob(layer_special::output)) {
-            return false;
+    }
+    if (include_output) {
+        for (const semantic_blob & blob : desc.blobs) {
+            if (blob.deploy == blob_deploy_target::final_node ||
+                    blob.role == tensor_semantic_role::output_head ||
+                    blob.role == tensor_semantic_role::output_norm) {
+                required_blobs.push_back(blob.id);
+            }
         }
+    }
+
+    std::sort(required_blobs.begin(), required_blobs.end());
+    required_blobs.erase(
+            std::unique(required_blobs.begin(), required_blobs.end()),
+            required_blobs.end());
+
+    std::string err;
+    if (!materialize_descriptor_tensors(store, desc, required_blobs, file, err)) {
+        return false;
     }
 
     std::error_code ec;
@@ -180,6 +208,6 @@ bool layer_store_materialize_gguf(
     if (!out) {
         return false;
     }
-    out.write(reinterpret_cast<const char *>(file.data()), static_cast<std::streamsize>(file.size()));
+    out.write(reinterpret_cast<const char *>(file.data()), static_cast<std::streamoff>(file.size()));
     return static_cast<bool>(out);
 }
