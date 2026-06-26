@@ -415,6 +415,119 @@ inline bool reconcile_coverage(const std::string & orch, const std::string & mod
     return true;
 }
 
+// Build install plan (Task 9.6) and validate stored result.
+inline bool build_install_plan(const std::string & orch, const std::string & model_id,
+        std::string & err, int expected_operations = -1) {
+    json out;
+    int status = 0;
+    if (!http_post(orch, "/models/" + model_id + "/install-plan", json({}), out, status, 60) ||
+            status != 200) {
+        err = "install-plan build failed status=" + std::to_string(status) + " body=" + out.dump();
+        return false;
+    }
+    if (out.value("status", "") != "ok") {
+        err = "unexpected install-plan status: " + out.dump();
+        return false;
+    }
+
+    const int op_count = out.value("operation_count", -1);
+    if (expected_operations >= 0 && op_count != expected_operations) {
+        err = "expected operation_count=" + std::to_string(expected_operations) +
+              " got " + std::to_string(op_count);
+        return false;
+    }
+
+    json stored;
+    int gs = 0;
+    if (!http_get(orch, "/models/" + model_id + "/install-plan", stored, gs, 15) || gs != 200) {
+        err = "get install-plan failed status=" + std::to_string(gs);
+        return false;
+    }
+    if (stored.value("operation_count", -1) != op_count) {
+        err = "stored install-plan operation_count mismatch";
+        return false;
+    }
+
+    if (stored.contains("operations") && stored["operations"].is_array()) {
+        for (const auto & op : stored["operations"]) {
+            const std::string action = op.value("action", "");
+            if (action == "DOWNLOAD" || action == "REPAIR") {
+                if (!op.contains("offset") || !op.contains("length")) {
+                    err = "operation missing offset/length: " + op.dump();
+                    return false;
+                }
+                if (op.value("length", static_cast<uint64_t>(0)) == 0) {
+                    err = "operation has zero length: " + op.dump();
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+// Execute stored install plan via Synchronization Engine (Task 9.7).
+inline bool execute_install_plan(const std::string & orch, const std::string & model_id,
+        std::string & err, int timeout_s = 1800) {
+    json out;
+    int status = 0;
+    if (!http_post(orch, "/models/" + model_id + "/install/execute", json({}), out, status, 120) ||
+            status != 200) {
+        err = "install execute failed status=" + std::to_string(status) + " body=" + out.dump();
+        return false;
+    }
+
+    const std::string job_id = out.value("job_id", "");
+    if (job_id.empty()) {
+        err = "execute returned no job_id";
+        return false;
+    }
+
+    for (int i = 0; i < timeout_s; ++i) {
+        json job;
+        int js = 0;
+        if (http_get(orch, "/jobs/" + job_id, job, js, 30) && js == 200) {
+            const std::string st = job.value("state", "");
+            if (st == "completed") {
+                return true;
+            }
+            if (st == "failed") {
+                err = "sync job failed: " + job.value("error", job.dump());
+                return false;
+            }
+        }
+        sleep(1);
+    }
+
+    err = "sync job timed out";
+    return false;
+}
+
+// Build install plan, execute synchronization, and wait for coverage READY.
+inline bool sync_model_layers(const std::string & orch, const std::string & model_id,
+        std::string & err) {
+    if (!build_install_plan(orch, model_id, err, -1)) {
+        return false;
+    }
+
+    json plan;
+    int ps = 0;
+    if (!http_get(orch, "/models/" + model_id + "/install-plan", plan, ps, 30) || ps != 200) {
+        err = "get install-plan failed status=" + std::to_string(ps);
+        return false;
+    }
+
+    const int op_count = plan.value("operation_count", 0);
+    if (op_count > 0) {
+        if (!execute_install_plan(orch, model_id, err)) {
+            return false;
+        }
+    }
+
+    return refresh_coverage(orch, model_id, err, "READY");
+}
+
 // ----------------------------------------------------------------------------
 // Process management (Unix only)
 // ----------------------------------------------------------------------------

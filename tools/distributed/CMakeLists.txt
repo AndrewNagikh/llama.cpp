@@ -19,6 +19,7 @@ set(DIST_COMMON_SOURCES
     orchestrator/manifest_builder/manifest_builder.cpp
     orchestrator/layout_planner/layout_planner.cpp
     orchestrator/coverage/coverage.cpp
+    orchestrator/install_planner/install_planner.cpp
     node_core.cpp
 )
 
@@ -35,10 +36,22 @@ set(DIST_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/orchestrator
+    ${CMAKE_CURRENT_SOURCE_DIR}/node_agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/node_agent/synchronization
     ${DIST_TRANSPORT_DIR}
     ${DIST_WORKERS_DIR}
     ${CMAKE_SOURCE_DIR}/vendor
     ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib
+)
+
+set(NODE_AGENT_SOURCES
+    node_agent/layer_store/layer_store.cpp
+    node_agent/layer_store/layer_checksum.cpp
+    node_agent/synchronization/sync_types.cpp
+    node_agent/synchronization/synchronization_engine.cpp
+    node_agent/synchronization/executors/http_range/http_range_executor.cpp
+    orchestrator/install_planner/install_planner.cpp
+    orchestrator/manifest_builder/manifest_builder.cpp
 )
 
 function(dist_add_exe name main_source)
@@ -48,7 +61,7 @@ function(dist_add_exe name main_source)
 endfunction()
 
 function(dist_add_exe_light name main_source)
-    add_executable(${name} ${main_source} dist_common.cpp model_catalog.cpp ${DIST_PLANNER_SOURCES} ${DIST_BENCHMARK_SOURCES})
+    add_executable(${name} ${main_source} dist_common.cpp model_catalog.cpp ${DIST_PLANNER_SOURCES} ${DIST_BENCHMARK_SOURCES} ${NODE_AGENT_SOURCES})
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
 endfunction()
@@ -135,6 +148,7 @@ if (LLAMA_BUILD_TESTS)
         orchestrator/manifest_builder/manifest_builder.cpp
         orchestrator/layout_planner/layout_planner.cpp
         orchestrator/coverage/coverage.cpp
+        orchestrator/install_planner/install_planner.cpp
         memory_estimator.cpp
         dist_common.cpp
     )
@@ -329,4 +343,119 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-reconcile-after-node-loss PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(test-reconcile-after-node-loss PRIVATE cxx_std_17)
     target_link_libraries(test-reconcile-after-node-loss PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    # Task 9.6 install planner tests
+    add_executable(test-install-plan test-install-plan.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-install-plan PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-install-plan PRIVATE cxx_std_17)
+    target_link_libraries(test-install-plan PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-download-operation test-download-operation.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-download-operation PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-download-operation PRIVATE cxx_std_17)
+    target_link_libraries(test-download-operation PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-repair-operation test-repair-operation.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-repair-operation PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-repair-operation PRIVATE cxx_std_17)
+    target_link_libraries(test-repair-operation PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-delete-operation test-delete-operation.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-delete-operation PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-delete-operation PRIVATE cxx_std_17)
+    target_link_libraries(test-delete-operation PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-operation-grouping test-operation-grouping.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-operation-grouping PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-operation-grouping PRIVATE cxx_std_17)
+    target_link_libraries(test-operation-grouping PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-install-validation test-install-validation.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-install-validation PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-install-validation PRIVATE cxx_std_17)
+    target_link_libraries(test-install-validation PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-build-install-plan test-build-install-plan.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-build-install-plan PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-build-install-plan PRIVATE cxx_std_17)
+    target_link_libraries(test-build-install-plan PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-install-plan-after-node-loss test-install-plan-after-node-loss.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-install-plan-after-node-loss PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-install-plan-after-node-loss PRIVATE cxx_std_17)
+    target_link_libraries(test-install-plan-after-node-loss PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    add_executable(test-install-plan-update test-install-plan-update.cpp ${MODEL_REGISTRY_SOURCES})
+    target_include_directories(test-install-plan-update PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-install-plan-update PRIVATE cxx_std_17)
+    target_link_libraries(test-install-plan-update PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
+    set(SYNC_AGENT_SOURCES
+        node_agent/layer_store/layer_store.cpp
+        node_agent/layer_store/layer_checksum.cpp
+        node_agent/synchronization/sync_types.cpp
+        node_agent/synchronization/synchronization_engine.cpp
+        node_agent/synchronization/executors/http_range/http_range_executor.cpp
+        orchestrator/install_planner/install_planner.cpp
+        orchestrator/manifest_builder/manifest_builder.cpp
+        dist_common.cpp
+    )
+    set(SYNC_AGENT_LINK_LIBS cpp-httplib llama Threads::Threads)
+
+    # Task 9.7 synchronization engine tests
+    add_executable(test-layer-store test-layer-store.cpp ${SYNC_AGENT_SOURCES})
+    target_include_directories(test-layer-store PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-layer-store PRIVATE cxx_std_17)
+    target_link_libraries(test-layer-store PRIVATE ${SYNC_AGENT_LINK_LIBS})
+
+    add_executable(test-layer-verify test-layer-verify.cpp ${SYNC_AGENT_SOURCES})
+    target_include_directories(test-layer-verify PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-layer-verify PRIVATE cxx_std_17)
+    target_link_libraries(test-layer-verify PRIVATE ${SYNC_AGENT_LINK_LIBS})
+
+    add_executable(test-http-range-executor test-http-range-executor.cpp ${SYNC_AGENT_SOURCES})
+    target_include_directories(test-http-range-executor PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-http-range-executor PRIVATE cxx_std_17)
+    target_link_libraries(test-http-range-executor PRIVATE ${SYNC_AGENT_LINK_LIBS})
+
+    add_executable(test-install-job test-install-job.cpp ${SYNC_AGENT_SOURCES})
+    target_include_directories(test-install-job PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-install-job PRIVATE cxx_std_17)
+    target_link_libraries(test-install-job PRIVATE ${SYNC_AGENT_LINK_LIBS})
+
+    add_executable(test-job-progress test-job-progress.cpp ${SYNC_AGENT_SOURCES})
+    target_include_directories(test-job-progress PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-job-progress PRIVATE cxx_std_17)
+    target_link_libraries(test-job-progress PRIVATE ${SYNC_AGENT_LINK_LIBS})
+
+    add_executable(test-layer-delete test-layer-delete.cpp ${SYNC_AGENT_SOURCES})
+    target_include_directories(test-layer-delete PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-layer-delete PRIVATE cxx_std_17)
+    target_link_libraries(test-layer-delete PRIVATE ${SYNC_AGENT_LINK_LIBS})
+
+    add_executable(test-sync-engine test-sync-engine.cpp ${SYNC_AGENT_SOURCES})
+    target_include_directories(test-sync-engine PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-sync-engine PRIVATE cxx_std_17)
+    target_link_libraries(test-sync-engine PRIVATE ${SYNC_AGENT_LINK_LIBS})
+
+    add_executable(test-partial-install test-partial-install.cpp ${SYNC_AGENT_SOURCES})
+    target_include_directories(test-partial-install PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-partial-install PRIVATE cxx_std_17)
+    target_link_libraries(test-partial-install PRIVATE ${SYNC_AGENT_LINK_LIBS})
+
+    add_executable(test-corrupted-layer test-corrupted-layer.cpp ${SYNC_AGENT_SOURCES})
+    target_include_directories(test-corrupted-layer PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-corrupted-layer PRIVATE cxx_std_17)
+    target_link_libraries(test-corrupted-layer PRIVATE ${SYNC_AGENT_LINK_LIBS})
+
+    add_executable(test-coverage-after-sync test-coverage-after-sync.cpp
+        ${MODEL_REGISTRY_SOURCES}
+        node_agent/layer_store/layer_store.cpp
+        node_agent/layer_store/layer_checksum.cpp
+        node_agent/synchronization/sync_types.cpp
+        node_agent/synchronization/synchronization_engine.cpp
+        node_agent/synchronization/executors/http_range/http_range_executor.cpp)
+    target_include_directories(test-coverage-after-sync PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-coverage-after-sync PRIVATE cxx_std_17)
+    target_link_libraries(test-coverage-after-sync PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
 endif()

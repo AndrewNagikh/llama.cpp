@@ -107,15 +107,8 @@ int main(int argc, char ** argv) {
     }
 
     std::string install_err;
-    if (!e2e::install_and_wait_ready(orch_url, model_id, 3, install_err)) {
-        fprintf(stderr, "FAIL: model install: %s\n", install_err.c_str());
-        cleanup();
-        return 1;
-    }
-
-    std::string coverage_err;
-    if (!e2e::refresh_coverage(orch_url, model_id, coverage_err, "READY")) {
-        fprintf(stderr, "FAIL: coverage refresh: %s\n", coverage_err.c_str());
+    if (!e2e::sync_model_layers(orch_url, model_id, install_err)) {
+        fprintf(stderr, "FAIL: layer synchronization: %s\n", install_err.c_str());
         cleanup();
         return 1;
     }
@@ -134,6 +127,13 @@ int main(int argc, char ** argv) {
     }
     if (missing_count == 0) {
         fprintf(stderr, "FAIL: reconcile returned no missing layers after node loss\n");
+        cleanup();
+        return 1;
+    }
+
+    std::string plan_err;
+    if (!e2e::build_install_plan(orch_url, model_id, plan_err)) {
+        fprintf(stderr, "FAIL: install plan after node loss: %s\n", plan_err.c_str());
         cleanup();
         return 1;
     }

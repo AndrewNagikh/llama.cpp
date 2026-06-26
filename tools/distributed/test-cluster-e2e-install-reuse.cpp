@@ -1,7 +1,6 @@
-// Task 7.5 - scenario: repeated install must not re-download the model.
+// Task 9.7 - scenario: repeated synchronization must be a no-op when ready.
 //
-// Installs a model, then installs it again and verifies the node short-circuits
-// to "already_installed" without re-fetching (installed_ms stays unchanged).
+// Syncs layers once, then runs sync again and verifies install plan stays empty.
 
 #include "e2e_common.h"
 
@@ -66,94 +65,65 @@ int main(int argc, char ** argv) {
     }
     e2e::wait_http_ok("http://127.0.0.1:" + std::to_string(port_a), 200);
 
-    // Register and discover the model before installing.
     std::string err;
     if (!e2e::register_model(orch_url, model_id, gguf_abs, err, repository)) {
         fprintf(stderr, "FAIL: model registration: %s\n", err.c_str());
         cleanup();
         return 1;
     }
-    std::string disc_err;
-    if (!e2e::discover_model(orch_url, model_id, disc_err, 1)) {
-        fprintf(stderr, "FAIL: model discovery: %s\n", disc_err.c_str());
+    if (!e2e::discover_model(orch_url, model_id, err, 1)) {
+        fprintf(stderr, "FAIL: model discovery: %s\n", err.c_str());
         cleanup();
         return 1;
     }
-    std::string manifest_err;
-    if (!e2e::build_manifest(orch_url, model_id, manifest_err)) {
-        fprintf(stderr, "FAIL: manifest build: %s\n", manifest_err.c_str());
+    if (!e2e::build_manifest(orch_url, model_id, err)) {
+        fprintf(stderr, "FAIL: manifest build: %s\n", err.c_str());
         cleanup();
         return 1;
     }
-    std::string layout_err;
-    if (!e2e::build_layout(orch_url, model_id, layout_err)) {
-        fprintf(stderr, "FAIL: layout build: %s\n", layout_err.c_str());
+    if (!e2e::build_layout(orch_url, model_id, err)) {
+        fprintf(stderr, "FAIL: layout build: %s\n", err.c_str());
         cleanup();
         return 1;
     }
 
-    // First install -> ready.
-    if (!e2e::install_and_wait_ready(orch_url, model_id, 1, err)) {
-        fprintf(stderr, "FAIL: first install did not complete: %s\n", err.c_str());
+    if (!e2e::sync_model_layers(orch_url, model_id, err)) {
+        fprintf(stderr, "FAIL: first sync failed: %s\n", err.c_str());
         cleanup();
         return 1;
     }
 
     const std::string node_url = "http://127.0.0.1:" + std::to_string(port_a);
-    auto read_installed_ms = [&]() -> uint64_t {
+    auto count_layers = [&]() -> size_t {
         json out; int s = 0;
-        if (e2e::http_get(node_url, "/models/local", out, s) && s == 200 && out.is_array()) {
-            for (const auto & m : out) {
-                if (m.value("model_id", "") == model_id) {
-                    return m.value("installed_ms", (uint64_t) 0);
-                }
+        if (e2e::http_get(node_url, "/installed-layers?model=" + model_id, out, s) && s == 200) {
+            if (out.contains("layers") && out["layers"].is_array()) {
+                return out["layers"].size();
             }
         }
         return 0;
     };
 
-    const uint64_t ms_before = read_installed_ms();
+    const size_t layers_before = count_layers();
 
-    // Second install -> should reuse, node reports already_installed.
-    json install_out; int status = 0;
-    if (!e2e::http_post(orch_url, "/models/install", json({ { "model", model_id } }),
-            install_out, status, 30) || status != 200) {
-        fprintf(stderr, "FAIL: second install request failed status=%d\n", status);
+    if (!e2e::sync_model_layers(orch_url, model_id, err)) {
+        fprintf(stderr, "FAIL: second sync failed: %s\n", err.c_str());
         cleanup();
         return 1;
     }
-    const std::string job_id = install_out.value("job_id", "");
 
-    // Poll the job and inspect per-node status.
-    bool reused = false;
-    for (int i = 0; i < 30; ++i) {
-        json job; int js = 0;
-        if (e2e::http_get(orch_url, "/models/install/" + job_id, job, js) && js == 200) {
-            if (job.contains("nodes") && job["nodes"].is_object()) {
-                for (auto it = job["nodes"].begin(); it != job["nodes"].end(); ++it) {
-                    if (it.value().value("status", "") == "already_installed") {
-                        reused = true;
-                    }
-                }
-            }
-            if (job.value("status", "") == "ready") {
-                break;
-            }
-        }
-        sleep(1);
-    }
-
-    const uint64_t ms_after = read_installed_ms();
-    const bool unchanged = (ms_before != 0) && (ms_before == ms_after);
+    std::string plan_err;
+    const bool empty_plan = e2e::build_install_plan(orch_url, model_id, plan_err, 0);
+    const size_t layers_after = count_layers();
 
     cleanup();
 
-    if (reused && unchanged) {
-        printf("test-cluster-e2e-install-reuse: PASS (reused, installed_ms unchanged)\n");
+    if (empty_plan && layers_before > 0 && layers_before == layers_after) {
+        printf("test-cluster-e2e-install-reuse: PASS (layers=%zu, plan empty)\n", layers_before);
         return 0;
     }
-    fprintf(stderr, "test-cluster-e2e-install-reuse: FAIL (reused=%d unchanged=%d ms_before=%llu ms_after=%llu)\n",
-            reused, unchanged, (unsigned long long) ms_before, (unsigned long long) ms_after);
+    fprintf(stderr, "test-cluster-e2e-install-reuse: FAIL (empty_plan=%d layers_before=%zu layers_after=%zu)\n",
+            empty_plan, layers_before, layers_after);
     return 1;
 }
 

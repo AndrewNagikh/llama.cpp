@@ -231,24 +231,68 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // ----- Stage 3: Model install ----------------------------------------
+    // ----- Stage 3: Layer synchronization (Task 9.7) -----------------------
     {
         std::string err;
-        const bool ready = e2e::install_and_wait_ready(orch_url, model_id, 3, err);
-        add("Model install", ready, ready ? "model ready on 3 nodes" : err);
-        if (!ready) {
+        const bool ok = e2e::sync_model_layers(orch_url, model_id, err);
+        add("Layer synchronization", ok, ok ? "install plan executed, coverage READY" : err);
+        if (!ok) {
+            fprintf(stderr, "FAIL: layer synchronization stage (%s)\n", err.c_str());
             kill_all();
             return finish(false);
         }
     }
 
-    // ----- Stage 3.1: Cluster coverage (Task 9.5) --------------------------
+    // ----- Stage 3.1: Install plan empty when cluster is ready (Task 9.6) --
     {
         std::string err;
-        const bool ok = e2e::refresh_coverage(orch_url, model_id, err, "READY");
-        add("Cluster coverage", ok, ok ? "coverage READY" : err);
+        const bool ok = e2e::build_install_plan(orch_url, model_id, err, 0);
+        add("Install plan", ok, ok ? "operation_count=0 (cluster ready)" : err);
         if (!ok) {
-            fprintf(stderr, "FAIL: coverage refresh stage (%s)\n", err.c_str());
+            fprintf(stderr, "FAIL: install plan stage (%s)\n", err.c_str());
+            kill_all();
+            return finish(false);
+        }
+    }
+
+    // ----- Stage 3.2: Repair after layer blob loss (Task 9.7) ------------
+    {
+        std::string err;
+        json layout;
+        int ls = 0;
+        bool ok = e2e::http_get(orch_url, "/models/" + model_id + "/layout", layout, ls, 15) && ls == 200;
+
+        int layer_to_delete = -1;
+        if (ok && layout.contains("placements") && layout["placements"].is_array()) {
+            for (const auto & p : layout["placements"]) {
+                if (p.value("node", "") == "node-a") {
+                    layer_to_delete = p.value("layer", -1);
+                    break;
+                }
+            }
+        }
+        if (layer_to_delete < 0) {
+            ok = false;
+            err = "could not find a layer assigned to node-a";
+        }
+
+        if (ok) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%03d.bin", layer_to_delete);
+            const std::string blob = node_store("node-a") + "/" + model_id + "/layers/" + buf;
+            std::error_code ec;
+            std::filesystem::remove(blob, ec);
+            ok = e2e::refresh_coverage(orch_url, model_id, err, "PARTIAL");
+        }
+        if (ok) {
+            ok = e2e::reconcile_coverage(orch_url, model_id, err);
+        }
+        if (ok) {
+            ok = e2e::sync_model_layers(orch_url, model_id, err);
+        }
+        add("Layer repair", ok, ok ? "blob restored via synchronization" : err);
+        if (!ok) {
+            fprintf(stderr, "FAIL: layer repair stage (%s)\n", err.c_str());
             kill_all();
             return finish(false);
         }

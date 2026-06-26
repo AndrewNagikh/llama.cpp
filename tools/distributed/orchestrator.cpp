@@ -6,6 +6,7 @@
 #include "orchestrator/manifest_builder/manifest_builder.h"
 #include "orchestrator/layout_planner/layout_planner.h"
 #include "orchestrator/coverage/coverage.h"
+#include "orchestrator/install_planner/install_planner.h"
 #include "split_gen_common.h"
 #include "split_tcp_wire.h"
 
@@ -56,6 +57,17 @@ static int32_t g_n_ctx = 4096;
 static model_catalog g_catalog;
 static cluster_model_registry g_registry;
 static std::map<std::string, json> g_install_node_results;
+
+struct cluster_sync_job {
+    std::string job_id;
+    std::string model_id;
+    std::string state = "queued";
+    std::string error;
+    std::map<std::string, std::string> node_job_ids;
+    std::map<std::string, json> node_status;
+};
+
+static std::map<std::string, cluster_sync_job> g_sync_jobs;
 
 static std::string make_id(const char * prefix) {
     static std::mt19937_64 rng{ std::random_device{}() };
@@ -231,6 +243,161 @@ static void coordinate_model_install(
                 std::to_string(total_nodes) + " nodes ready)",
                 static_cast<double>(ready_nodes) / static_cast<double>(total_nodes));
     }
+}
+
+static void set_sync_job_state(
+        const std::string & job_id,
+        const std::string & state,
+        const std::string & error = "") {
+    std::lock_guard<std::mutex> lock(g_mu);
+    auto it = g_sync_jobs.find(job_id);
+    if (it == g_sync_jobs.end()) {
+        return;
+    }
+    it->second.state = state;
+    if (!error.empty()) {
+        it->second.error = error;
+    }
+}
+
+static void coordinate_install_plan_execute(
+        std::string job_id,
+        std::string model_id,
+        install_plan plan,
+        model_manifest manifest,
+        std::map<std::string, dist_node_info> nodes) {
+    if (nodes.empty()) {
+        set_sync_job_state(job_id, "failed", "no online nodes");
+        return;
+    }
+
+    if (plan.operations.empty()) {
+        set_sync_job_state(job_id, "completed");
+        return;
+    }
+
+    std::map<std::string, std::vector<install_operation>> by_node;
+    for (const auto & op : plan.operations) {
+        by_node[op.node_id].push_back(op);
+    }
+
+    int dispatched = 0;
+    int failed_dispatch = 0;
+
+    for (const auto & kv : by_node) {
+        const auto node_it = nodes.find(kv.first);
+        if (node_it == nodes.end()) {
+            ++failed_dispatch;
+            continue;
+        }
+        const dist_node_info & node = node_it->second;
+
+        json body = {
+            { "operations", json::array() },
+            { "manifest", manifest.to_json() },
+        };
+        for (const auto & op : kv.second) {
+            body["operations"].push_back(op.to_json());
+        }
+
+        httplib::Client client(node.host.c_str(), node.http_port);
+        client.set_connection_timeout(5, 0);
+        client.set_read_timeout(120, 0);
+        client.set_write_timeout(120, 0);
+
+        const std::string path = "/models/" + model_id + "/install/execute";
+        const auto result = client.Post(path.c_str(), body.dump(), "application/json");
+        if (!result || result->status != 200) {
+            ++failed_dispatch;
+            std::lock_guard<std::mutex> lock(g_mu);
+            g_sync_jobs[job_id].node_status[kv.first] = {
+                { "status", "error" },
+                { "error", result ? result->body : "node unreachable" },
+            };
+            continue;
+        }
+
+        try {
+            const json resp = json::parse(result->body);
+            const std::string node_job_id = resp.value("job_id", "");
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                g_sync_jobs[job_id].node_job_ids[kv.first] = node_job_id;
+                g_sync_jobs[job_id].node_status[kv.first] = {
+                    { "status", "running" },
+                    { "job_id", node_job_id },
+                };
+            }
+            ++dispatched;
+        } catch (...) {
+            ++failed_dispatch;
+        }
+    }
+
+    if (dispatched == 0) {
+        set_sync_job_state(job_id, "failed", "failed to dispatch to any node");
+        return;
+    }
+
+    set_sync_job_state(job_id, "running");
+
+    constexpr int max_attempts = 1800;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        int completed_nodes = 0;
+        int failed_nodes    = 0;
+
+        std::map<std::string, std::string> node_jobs;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            node_jobs = g_sync_jobs[job_id].node_job_ids;
+        }
+
+        for (const auto & nj : node_jobs) {
+            const auto node_it = nodes.find(nj.first);
+            if (node_it == nodes.end()) {
+                ++failed_nodes;
+                continue;
+            }
+
+            httplib::Client client(node_it->second.host.c_str(), node_it->second.http_port);
+            client.set_connection_timeout(3, 0);
+            client.set_read_timeout(10, 0);
+
+            const auto result = client.Get(("/jobs/" + nj.second).c_str());
+            if (!result || result->status != 200) {
+                continue;
+            }
+
+            try {
+                const json job = json::parse(result->body);
+                const std::string st = job.value("state", "");
+                {
+                    std::lock_guard<std::mutex> lock(g_mu);
+                    g_sync_jobs[job_id].node_status[nj.first] = job;
+                }
+                if (st == "COMPLETED") {
+                    ++completed_nodes;
+                } else if (st == "FAILED") {
+                    ++failed_nodes;
+                }
+            } catch (...) {
+                // keep polling
+            }
+        }
+
+        if (completed_nodes + failed_nodes == static_cast<int>(node_jobs.size())) {
+            if (failed_nodes == 0) {
+                set_sync_job_state(job_id, "completed");
+            } else {
+                set_sync_job_state(job_id, "failed", "one or more node jobs failed");
+            }
+            return;
+        }
+    }
+
+    set_sync_job_state(job_id, "failed", "sync job timed out");
 }
 
 static bool gen3_send_recv(
@@ -1932,6 +2099,193 @@ int main(int argc, char ** argv) {
                 record);
 
         res.set_content(result.to_json().dump(), "application/json");
+    });
+
+    // POST /models/{model_id}/install-plan - Build install plan from registry state.
+    svr.Post(R"(/models/([^/]+)/install-plan)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+
+        dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (!record->manifest.has_value() || !record->layout.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "manifest or layout not ready" } }).dump(), "application/json");
+            return;
+        }
+
+        actual_model_layout actual;
+        std::set<std::string> online_nodes;
+        poll_installed_layers_from_nodes(model_id, actual, online_nodes);
+        g_registry.apply_actual(model_id, actual, record);
+        g_registry.refresh_coverage(model_id, online_nodes, record);
+
+        if (!record->coverage.has_value()) {
+            res.status = 500;
+            res.set_content(json({ { "error", "coverage not available" } }).dump(), "application/json");
+            return;
+        }
+
+        std::string source_url;
+        if (!record->manifest->source_file.empty()) {
+            std::error_code ec;
+            if (std::filesystem::exists(record->manifest->source_file, ec)) {
+                source_url = "file://" + record->manifest->source_file;
+            }
+        }
+        if (source_url.empty() && !g_model_path.empty()) {
+            std::error_code ec;
+            if (std::filesystem::exists(g_model_path, ec)) {
+                source_url = "file://" + g_model_path;
+            }
+        }
+        if (source_url.empty()) {
+            for (const auto & file : record->files) {
+                if (!file.download_url.empty() &&
+                        (record->filename.empty() || file.filename == record->filename)) {
+                    source_url = file.download_url;
+                    break;
+                }
+            }
+        }
+        if (source_url.empty() && !record->manifest->source_file.empty()) {
+            source_url = "file://" + record->manifest->source_file;
+        }
+
+        const auto built = build_install_plan(
+                *record->manifest,
+                record->layout->desired,
+                actual,
+                *record->coverage,
+                source_url);
+        if (!built.success) {
+            res.status = 502;
+            res.set_content(json({ { "error", built.error } }).dump(), "application/json");
+            return;
+        }
+
+        std::string verr;
+        if (!validate_install_plan(built.plan, record->layout->desired, *record->coverage, verr)) {
+            res.status = 502;
+            res.set_content(json({ { "error", verr } }).dump(), "application/json");
+            return;
+        }
+
+        if (!g_registry.apply_install_plan(model_id, built.plan, record)) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+
+        res.set_content(json({
+            { "status", "ok" },
+            { "model", model_id },
+            { "operation_count", built.plan.operation_count },
+            { "total_download_bytes", built.plan.total_download_bytes },
+            { "install_plan", built.plan.to_json() },
+        }).dump(), "application/json");
+    });
+
+    // GET /models/{model_id}/install-plan - Return stored install plan.
+    svr.Get(R"(/models/([^/]+)/install-plan)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        const auto * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (!record->install_plan.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "install plan not ready" } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(record->install_plan->to_json().dump(), "application/json");
+    });
+
+    // POST /models/{model_id}/install/execute - Execute stored install plan via nodes.
+    svr.Post(R"(/models/([^/]+)/install/execute)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+
+        dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+        if (!record->install_plan.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "install plan not ready" } }).dump(), "application/json");
+            return;
+        }
+        if (!record->manifest.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "manifest not ready" } }).dump(), "application/json");
+            return;
+        }
+
+        std::map<std::string, dist_node_info> nodes_copy;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            for (const auto & kv : g_nodes) {
+                if (kv.second.online) {
+                    nodes_copy[kv.first] = kv.second;
+                }
+            }
+        }
+
+        const std::string job_id = make_id("job");
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            cluster_sync_job job;
+            job.job_id   = job_id;
+            job.model_id = model_id;
+            job.state    = "queued";
+            g_sync_jobs[job_id] = std::move(job);
+        }
+
+        std::thread(
+                coordinate_install_plan_execute,
+                job_id,
+                model_id,
+                *record->install_plan,
+                *record->manifest,
+                nodes_copy).detach();
+
+        res.set_content(json({
+            { "job_id", job_id },
+            { "model_id", model_id },
+            { "status", "started" },
+            { "operation_count", record->install_plan->operation_count },
+        }).dump(), "application/json");
+    });
+
+    // GET /jobs/{job_id} - Cluster synchronization job progress.
+    svr.Get(R"(/jobs/(.+))", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string job_id = req.matches[1];
+        std::lock_guard<std::mutex> lock(g_mu);
+        const auto it = g_sync_jobs.find(job_id);
+        if (it == g_sync_jobs.end()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "job not found" } }).dump(), "application/json");
+            return;
+        }
+
+        json nodes = json::object();
+        for (const auto & kv : it->second.node_status) {
+            nodes[kv.first] = kv.second;
+        }
+
+        res.set_content(json({
+            { "job_id", it->second.job_id },
+            { "model_id", it->second.model_id },
+            { "state", it->second.state },
+            { "nodes", nodes },
+            { "error", it->second.error },
+        }).dump(), "application/json");
     });
 
     // GET /models/{model_id} - Return one registered model.

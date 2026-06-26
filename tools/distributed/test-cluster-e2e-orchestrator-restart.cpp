@@ -108,15 +108,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!e2e::install_and_wait_ready(orch_url, model_id, 3, err)) {
-        fprintf(stderr, "FAIL: install did not complete: %s\n", err.c_str());
-        cleanup();
-        return 1;
-    }
-
-    std::string coverage_err;
-    if (!e2e::refresh_coverage(orch_url, model_id, coverage_err, "READY")) {
-        fprintf(stderr, "FAIL: coverage refresh: %s\n", coverage_err.c_str());
+    if (!e2e::sync_model_layers(orch_url, model_id, err)) {
+        fprintf(stderr, "FAIL: layer synchronization: %s\n", err.c_str());
         cleanup();
         return 1;
     }

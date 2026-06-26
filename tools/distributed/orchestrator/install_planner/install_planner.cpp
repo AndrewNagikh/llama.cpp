@@ -1,0 +1,493 @@
+#include "install_planner.h"
+
+#include <algorithm>
+#include <cctype>
+#include <map>
+#include <set>
+#include <tuple>
+
+using json = nlohmann::json;
+
+namespace {
+
+static std::string upper_ascii(std::string s) {
+    for (char & c : s) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+static std::string layer_node_key(int32_t layer_index, const std::string & node_id) {
+    return std::to_string(layer_index) + "@" + node_id;
+}
+
+static bool contains_layer(const std::vector<int32_t> & layers, int32_t layer_index) {
+    return std::find(layers.begin(), layers.end(), layer_index) != layers.end();
+}
+
+static download_operation make_download_op(
+        int32_t layer_index,
+        const std::string & node_id,
+        const layer_byte_range & range,
+        const std::string & source_url) {
+    download_operation op;
+    op.layer_index   = layer_index;
+    op.node_id       = node_id;
+    op.tensor_offset = range.offset;
+    op.tensor_length = range.length > 0 ? range.length : range.size_bytes;
+    op.checksum      = range.checksum;
+    op.source_url    = source_url;
+    return op;
+}
+
+static void add_operation(
+        std::vector<install_operation> & operations,
+        std::set<std::tuple<int, std::string, int32_t>> & seen,
+        install_action action,
+        const std::string & node_id,
+        int32_t layer_index,
+        const download_operation & download = {}) {
+    const int action_key = static_cast<int>(action);
+    const auto key = std::make_tuple(action_key, node_id, layer_index);
+    if (!seen.insert(key).second) {
+        return;
+    }
+    install_operation op;
+    op.action      = action;
+    op.node_id     = node_id;
+    op.layer_index = layer_index;
+    op.download    = download;
+    if (action == install_action::download || action == install_action::repair) {
+        op.download.layer_index = layer_index;
+        op.download.node_id     = node_id;
+    }
+    operations.push_back(std::move(op));
+}
+
+static void finalize_plan(install_plan & plan) {
+    std::sort(plan.operations.begin(), plan.operations.end(),
+            [](const install_operation & a, const install_operation & b) {
+                if (a.node_id != b.node_id) {
+                    return a.node_id < b.node_id;
+                }
+                if (a.action != b.action) {
+                    return static_cast<int>(a.action) < static_cast<int>(b.action);
+                }
+                return a.layer_index < b.layer_index;
+            });
+
+    plan.groups = group_install_operations(plan.operations);
+    plan.operation_count = static_cast<int>(plan.operations.size());
+    plan.total_download_bytes = 0;
+    for (const auto & op : plan.operations) {
+        if (op.action == install_action::download || op.action == install_action::repair) {
+            plan.total_download_bytes += op.download.tensor_length;
+        }
+    }
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// install_action
+// ---------------------------------------------------------------------------
+
+std::string install_action_to_string(install_action action) {
+    switch (action) {
+        case install_action::download: return "DOWNLOAD";
+        case install_action::verify:   return "VERIFY";
+        case install_action::delete_op: return "DELETE";
+        case install_action::repair:   return "REPAIR";
+    }
+    return "DOWNLOAD";
+}
+
+install_action install_action_from_string(const std::string & s) {
+    const std::string upper = upper_ascii(s);
+    if (upper == "DOWNLOAD") return install_action::download;
+    if (upper == "VERIFY")   return install_action::verify;
+    if (upper == "DELETE")   return install_action::delete_op;
+    if (upper == "REPAIR")   return install_action::repair;
+    return install_action::download;
+}
+
+// ---------------------------------------------------------------------------
+// JSON
+// ---------------------------------------------------------------------------
+
+json download_operation::to_json() const {
+    return {
+        { "layer", layer_index },
+        { "node", node_id },
+        { "tensor_offset", tensor_offset },
+        { "tensor_length", tensor_length },
+        { "offset", tensor_offset },
+        { "length", tensor_length },
+        { "source_url", source_url },
+        { "checksum", checksum },
+    };
+}
+
+download_operation download_operation::from_json(const json & j) {
+    download_operation op;
+    op.layer_index   = j.value("layer", j.value("layer_index", -1));
+    op.node_id       = j.value("node", j.value("node_id", ""));
+    op.tensor_offset = j.value("tensor_offset", j.value("offset", static_cast<uint64_t>(0)));
+    op.tensor_length = j.value("tensor_length", j.value("length", static_cast<uint64_t>(0)));
+    op.source_url    = j.value("source_url", "");
+    op.checksum      = j.value("checksum", "");
+    return op;
+}
+
+json install_operation::to_json() const {
+    json j = {
+        { "action", install_action_to_string(action) },
+        { "node", node_id },
+        { "layer", layer_index },
+    };
+    if (action == install_action::download || action == install_action::repair) {
+        j["offset"]        = download.tensor_offset;
+        j["length"]        = download.tensor_length;
+        j["tensor_offset"] = download.tensor_offset;
+        j["tensor_length"] = download.tensor_length;
+        j["source_url"]    = download.source_url;
+        j["checksum"]      = download.checksum;
+        j["download"]      = download.to_json();
+    }
+    return j;
+}
+
+install_operation install_operation::from_json(const json & j) {
+    install_operation op;
+    op.action      = install_action_from_string(j.value("action", "DOWNLOAD"));
+    op.node_id     = j.value("node", j.value("node_id", ""));
+    op.layer_index = j.value("layer", j.value("layer_index", -1));
+    if (j.contains("download") && j["download"].is_object()) {
+        op.download = download_operation::from_json(j["download"]);
+    } else {
+        op.download = download_operation::from_json(j);
+    }
+    op.download.layer_index = op.layer_index;
+    op.download.node_id     = op.node_id;
+    return op;
+}
+
+json install_plan_group::to_json() const {
+    json layers_json = json::array();
+    for (int32_t layer : layers) {
+        layers_json.push_back(layer);
+    }
+    return {
+        { "node", node_id },
+        { "action", install_action_to_string(action) },
+        { "layers", layers_json },
+        { "download_bytes", download_bytes },
+    };
+}
+
+install_plan_group install_plan_group::from_json(const json & j) {
+    install_plan_group group;
+    group.node_id = j.value("node", j.value("node_id", ""));
+    group.action  = install_action_from_string(j.value("action", "DOWNLOAD"));
+    group.download_bytes = j.value("download_bytes", static_cast<uint64_t>(0));
+    if (j.contains("layers") && j["layers"].is_array()) {
+        for (const auto & item : j["layers"]) {
+            group.layers.push_back(item.get<int32_t>());
+        }
+    }
+    return group;
+}
+
+json install_plan::to_json() const {
+    json operations_json = json::array();
+    for (const auto & op : operations) {
+        operations_json.push_back(op.to_json());
+    }
+    json groups_json = json::array();
+    for (const auto & group : groups) {
+        groups_json.push_back(group.to_json());
+    }
+    return {
+        { "model", model_id },
+        { "model_id", model_id },
+        { "operations", operations_json },
+        { "groups", groups_json },
+        { "operation_count", operation_count },
+        { "total_download_bytes", total_download_bytes },
+    };
+}
+
+install_plan install_plan::from_json(const json & j) {
+    install_plan plan;
+    plan.model_id = j.value("model_id", j.value("model", ""));
+    plan.operation_count = j.value("operation_count", 0);
+    plan.total_download_bytes = j.value("total_download_bytes", static_cast<uint64_t>(0));
+    if (j.contains("operations") && j["operations"].is_array()) {
+        for (const auto & item : j["operations"]) {
+            plan.operations.push_back(install_operation::from_json(item));
+        }
+    }
+    if (j.contains("groups") && j["groups"].is_array()) {
+        for (const auto & item : j["groups"]) {
+            plan.groups.push_back(install_plan_group::from_json(item));
+        }
+    }
+    if (plan.operation_count == 0) {
+        plan.operation_count = static_cast<int>(plan.operations.size());
+    }
+    return plan;
+}
+
+// ---------------------------------------------------------------------------
+// Manifest helpers
+// ---------------------------------------------------------------------------
+
+layer_byte_range manifest_layer_byte_range(
+        const model_manifest & manifest,
+        int32_t layer_index) {
+    layer_byte_range range{};
+    uint64_t min_offset = UINT64_MAX;
+    uint64_t max_end    = 0;
+    uint64_t sum_bytes  = 0;
+
+    for (const auto & t : manifest.tensors) {
+        if (t.layer != layer_index) {
+            continue;
+        }
+        sum_bytes += t.size_bytes;
+        if (t.offset > 0 || t.size_bytes > 0) {
+            min_offset = std::min(min_offset, t.offset);
+            max_end    = std::max(max_end, t.offset + t.size_bytes);
+        }
+    }
+
+    if (min_offset != UINT64_MAX && max_end > min_offset) {
+        range.offset     = min_offset;
+        range.length     = max_end - min_offset;
+        range.size_bytes = range.length;
+    } else {
+        for (const auto & ld : manifest.layers) {
+            if (ld.layer_index == layer_index) {
+                range.size_bytes = ld.size_bytes;
+                range.length     = ld.size_bytes;
+                break;
+            }
+        }
+    }
+
+    if (range.size_bytes == 0) {
+        range.size_bytes = sum_bytes;
+        range.length     = sum_bytes;
+    }
+
+    range.checksum = "manifest:layer:" + std::to_string(layer_index);
+    return range;
+}
+
+// ---------------------------------------------------------------------------
+// Planner
+// ---------------------------------------------------------------------------
+
+install_plan_build_result build_install_plan(
+        const model_manifest & manifest,
+        const desired_model_layout & desired,
+        const actual_model_layout & actual,
+        const coverage_report & coverage,
+        const std::string & source_url) {
+    install_plan_build_result result{};
+    result.plan.model_id = desired.model_id.empty() ? coverage.model_id : desired.model_id;
+
+    if (manifest.empty() || desired.placements.empty()) {
+        result.error = "manifest or desired layout is empty";
+        return result;
+    }
+
+    std::map<std::string, installed_layer> actual_by_key;
+    std::map<int32_t, std::vector<installed_layer>> actual_by_layer;
+    for (const auto & layer : actual.layers) {
+        actual_by_key[layer_node_key(layer.layer_index, layer.node_id)] = layer;
+        actual_by_layer[layer.layer_index].push_back(layer);
+    }
+
+    std::vector<install_operation> operations;
+    std::set<std::tuple<int, std::string, int32_t>> seen;
+
+    for (const auto & placement : desired.placements) {
+        const std::string desired_key = layer_node_key(placement.layer_index, placement.node_id);
+        const auto desired_it = actual_by_key.find(desired_key);
+        const bool ready_on_desired = desired_it != actual_by_key.end() &&
+                desired_it->second.state == install_state::ready;
+
+        if (ready_on_desired &&
+                !contains_layer(coverage.missing, placement.layer_index) &&
+                !contains_layer(coverage.corrupted, placement.layer_index)) {
+            continue;
+        }
+
+        for (const auto & wrong : actual_by_layer[placement.layer_index]) {
+            if (wrong.node_id == placement.node_id) {
+                continue;
+            }
+            if (wrong.state == install_state::ready ||
+                    wrong.state == install_state::corrupted) {
+                add_operation(operations, seen, install_action::delete_op,
+                        wrong.node_id, placement.layer_index);
+            }
+        }
+
+        const layer_byte_range byte_range = manifest_layer_byte_range(manifest, placement.layer_index);
+        const download_operation dl = make_download_op(
+                placement.layer_index, placement.node_id, byte_range, source_url);
+
+        if (contains_layer(coverage.corrupted, placement.layer_index) ||
+                (desired_it != actual_by_key.end() &&
+                 desired_it->second.state == install_state::corrupted)) {
+            add_operation(operations, seen, install_action::repair,
+                    placement.node_id, placement.layer_index, dl);
+            continue;
+        }
+
+        if (!ready_on_desired ||
+                contains_layer(coverage.missing, placement.layer_index)) {
+            add_operation(operations, seen, install_action::download,
+                    placement.node_id, placement.layer_index, dl);
+        }
+    }
+
+    result.plan.operations = std::move(operations);
+    finalize_plan(result.plan);
+    result.success = true;
+    return result;
+}
+
+std::vector<install_plan_group> group_install_operations(
+        const std::vector<install_operation> & operations) {
+    std::vector<install_plan_group> groups;
+    if (operations.empty()) {
+        return groups;
+    }
+
+    install_plan_group current;
+    current.node_id = operations.front().node_id;
+    current.action  = operations.front().action;
+
+    auto flush = [&]() {
+        if (!current.layers.empty()) {
+            groups.push_back(current);
+        }
+        current.layers.clear();
+        current.download_bytes = 0;
+    };
+
+    for (const auto & op : operations) {
+        const bool same_group = op.node_id == current.node_id &&
+                op.action == current.action &&
+                !current.layers.empty() &&
+                op.layer_index == current.layers.back() + 1;
+
+        if (!current.layers.empty() && !same_group) {
+            flush();
+            current.node_id = op.node_id;
+            current.action  = op.action;
+        } else if (current.layers.empty()) {
+            current.node_id = op.node_id;
+            current.action  = op.action;
+        }
+
+        current.layers.push_back(op.layer_index);
+        if (op.action == install_action::download || op.action == install_action::repair) {
+            current.download_bytes += op.download.tensor_length;
+        }
+    }
+    flush();
+    return groups;
+}
+
+bool validate_install_plan(
+        const install_plan & plan,
+        const desired_model_layout & desired,
+        const coverage_report & coverage,
+        std::string & error) {
+    error.clear();
+
+    std::set<int32_t> ready_layers;
+    for (const auto & placement : desired.placements) {
+        if (!contains_layer(coverage.missing, placement.layer_index) &&
+                !contains_layer(coverage.corrupted, placement.layer_index)) {
+            ready_layers.insert(placement.layer_index);
+        }
+    }
+
+    std::set<int32_t> planned_download;
+    std::set<int32_t> planned_repair;
+    for (const auto & op : plan.operations) {
+        if (op.action == install_action::download) {
+            if (ready_layers.count(op.layer_index)) {
+                error = "download planned for ready layer " + std::to_string(op.layer_index);
+                return false;
+            }
+            if (op.download.tensor_length == 0) {
+                error = "download missing tensor length for layer " + std::to_string(op.layer_index);
+                return false;
+            }
+            planned_download.insert(op.layer_index);
+        } else if (op.action == install_action::repair) {
+            if (!contains_layer(coverage.corrupted, op.layer_index)) {
+                error = "repair planned for non-corrupted layer " + std::to_string(op.layer_index);
+                return false;
+            }
+            planned_repair.insert(op.layer_index);
+            if (op.download.tensor_length == 0) {
+                error = "repair missing tensor length for layer " + std::to_string(op.layer_index);
+                return false;
+            }
+        }
+    }
+
+    for (int32_t layer : coverage.missing) {
+        bool found = planned_download.count(layer) > 0;
+        if (!found) {
+            for (const auto & op : plan.operations) {
+                if (op.layer_index == layer &&
+                        (op.action == install_action::download || op.action == install_action::repair)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            error = "missing layer " + std::to_string(layer) + " has no install operation";
+            return false;
+        }
+    }
+
+    for (int32_t layer : coverage.corrupted) {
+        if (!planned_repair.count(layer)) {
+            error = "corrupted layer " + std::to_string(layer) + " has no repair operation";
+            return false;
+        }
+    }
+
+    if (plan.operation_count != static_cast<int>(plan.operations.size())) {
+        error = "operation_count mismatch";
+        return false;
+    }
+
+    return true;
+}
+
+bool install_plan_has_grouped_layers(
+        const install_plan & plan,
+        const std::string & node_id,
+        install_action action,
+        const std::vector<int32_t> & expected_layers) {
+    for (const auto & group : plan.groups) {
+        if (group.node_id != node_id || group.action != action) {
+            continue;
+        }
+        if (group.layers == expected_layers) {
+            return true;
+        }
+    }
+    return false;
+}

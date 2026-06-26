@@ -12,6 +12,7 @@
 #include "manifest_builder/manifest_builder.h"
 #include "layout_planner/layout_planner.h"
 #include "coverage/coverage.h"
+#include "install_planner/install_planner.h"
 #include "model_provider/model_provider.h"
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,7 @@ struct dist_model_record {
     std::optional<model_layout>   layout;
     std::optional<actual_model_layout> actual;
     std::optional<coverage_report>   coverage;
+    std::optional<install_plan>      install_plan;
 
     // Task 9.2: remote discovery metadata
     std::vector<remote_model_file> files;
@@ -116,6 +118,11 @@ public:
     bool refresh_coverage(
             const std::string & model_id,
             const std::set<std::string> & online_nodes = {},
+            dist_model_record * out = nullptr);
+
+    bool apply_install_plan(
+            const std::string & model_id,
+            const install_plan & plan,
             dist_model_record * out = nullptr);
 
 private:

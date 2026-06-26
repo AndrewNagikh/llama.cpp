@@ -120,6 +120,12 @@ json dist_model_record::to_json() const {
         j["coverage"] = nullptr;
     }
 
+    if (install_plan.has_value()) {
+        j["install_plan"] = install_plan->to_json();
+    } else {
+        j["install_plan"] = nullptr;
+    }
+
     return j;
 }
 
@@ -158,6 +164,12 @@ dist_model_record dist_model_record_from_json(const json & j) {
         r.coverage = coverage_report::from_json(j["coverage"]);
     } else {
         r.coverage = std::nullopt;
+    }
+
+    if (j.contains("install_plan") && j["install_plan"].is_object()) {
+        r.install_plan = install_plan::from_json(j["install_plan"]);
+    } else {
+        r.install_plan = std::nullopt;
     }
 
     if (j.contains("files") && j["files"].is_array()) {
@@ -346,6 +358,25 @@ bool cluster_model_registry::refresh_coverage(
     const coverage_report report = compute_coverage(
             r.layout->desired, actual, online_nodes);
     r.coverage = report;
+
+    if (out) {
+        *out = r;
+    }
+    return true;
+}
+
+bool cluster_model_registry::apply_install_plan(
+        const std::string & model_id,
+        const install_plan & plan,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    dist_model_record & r = it->second;
+    r.install_plan = plan;
 
     if (out) {
         *out = r;

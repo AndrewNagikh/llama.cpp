@@ -1,6 +1,11 @@
 #include "dist_common.h"
 #include "model_catalog.h"
 #include "node_benchmark.h"
+#include "node_agent/layer_store/layer_store.h"
+#include "node_agent/synchronization/synchronization_engine.h"
+#include "orchestrator/install_planner/install_planner.h"
+#include "orchestrator/coverage/coverage.h"
+#include "orchestrator/manifest_builder/manifest_builder.h"
 
 #include "httplib.h"
 #include "nlohmann/json.hpp"
@@ -42,6 +47,14 @@ static std::set<std::string> g_active_downloads;
 static std::map<std::string, std::string> g_download_errors;
 static std::string g_models_state_path;
 static std::string g_models_dir;
+static synchronization_engine g_sync_engine;
+static std::mutex g_layer_store_mu;
+
+static layer_store get_layer_store(const std::string & model_id) {
+    std::lock_guard<std::mutex> lock(g_layer_store_mu);
+    layer_store store(g_model_store.get_models_dir(), model_id);
+    return store;
+}
 
 static uint64_t now_ms() {
     const auto now = std::chrono::system_clock::now();
@@ -556,36 +569,31 @@ int main(int argc, char ** argv) {
         res.set_content(models_json.dump(), "application/json");
     });
 
-    // GET /installed-layers - Report per-layer install state for a model (Task 9.5).
+    // GET /installed-layers - Report per-layer state from Layer Store (Task 9.7).
     svr.Get("/installed-layers", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.get_param_value("model");
         json layers_json = json::array();
 
-        if (!model_id.empty() && g_n_layer > 0) {
-            std::lock_guard<std::mutex> lock(g_model_store_mu);
-            const auto * model = g_model_store.find_model(model_id);
-            if (model && model->ready && std::filesystem::exists(model->local_path)) {
-                const dist_node_capabilities caps = dist_probe_capabilities();
-                const std::string device = dist_normalize_device(caps.gpu_backend, caps.has_gpu);
+        if (!model_id.empty()) {
+            const dist_node_capabilities caps = dist_probe_capabilities();
+            const std::string device = dist_normalize_device(caps.gpu_backend, caps.has_gpu);
+            const layer_store store = get_layer_store(model_id);
 
-                const uint64_t file_size = model->size_bytes > 0
-                        ? model->size_bytes
-                        : file_size_or_zero(model->local_path);
-                const uint64_t per_layer = g_n_layer > 0
-                        ? file_size / static_cast<uint64_t>(g_n_layer)
-                        : file_size;
-
-                for (int32_t i = 0; i < g_n_layer; ++i) {
-                    layers_json.push_back({
-                        { "layer", i },
-                        { "node", g_node_id },
-                        { "node_id", g_node_id },
-                        { "device", device },
-                        { "size_bytes", per_layer },
-                        { "checksum", std::string("stub:") + model_id + ":layer:" + std::to_string(i) },
-                        { "state", "READY" },
-                    });
+            for (const layer_blob & blob : store.list_layers()) {
+                std::string state = "READY";
+                if (!store.verify_layer(blob.layer_index, blob.checksum)) {
+                    state = "CORRUPTED";
                 }
+
+                layers_json.push_back({
+                    { "layer", blob.layer_index },
+                    { "node", g_node_id },
+                    { "node_id", g_node_id },
+                    { "device", device },
+                    { "size_bytes", blob.size_bytes },
+                    { "checksum", blob.checksum },
+                    { "state", state },
+                });
             }
         }
 
@@ -593,6 +601,61 @@ int main(int argc, char ** argv) {
             { "model", model_id },
             { "layers", layers_json },
         }).dump(), "application/json");
+    });
+
+    // POST /models/{model_id}/install/execute - Run Synchronization Engine locally.
+    svr.Post(R"(/models/([^/]+)/install/execute)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+
+        if (!body.contains("operations") || !body["operations"].is_array()) {
+            res.status = 400;
+            res.set_content(R"({"error":"operations array required"})", "application/json");
+            return;
+        }
+
+        std::vector<install_operation> operations;
+        for (const auto & item : body["operations"]) {
+            operations.push_back(install_operation::from_json(item));
+        }
+
+        const model_manifest * manifest_ptr = nullptr;
+        model_manifest manifest;
+        if (body.contains("manifest") && body["manifest"].is_object()) {
+            manifest = model_manifest::from_json(body["manifest"]);
+            manifest_ptr = &manifest;
+        }
+
+        layer_store store = get_layer_store(model_id);
+        const std::string job_id = g_sync_engine.start_job(
+                model_id, operations, store, manifest_ptr);
+
+        res.set_content(json({
+            { "job_id", job_id },
+            { "model_id", model_id },
+            { "status", "started" },
+            { "operation_count", static_cast<int>(operations.size()) },
+        }).dump(), "application/json");
+    });
+
+    // GET /jobs/{job_id} - Synchronization job progress.
+    svr.Get(R"(/jobs/(.+))", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string job_id = req.matches[1];
+        const auto job = g_sync_engine.get_job(job_id);
+        if (!job.has_value()) {
+            res.status = 404;
+            res.set_content(R"({"error":"job not found"})", "application/json");
+            return;
+        }
+        res.set_content(job->to_json().dump(), "application/json");
     });
 
     // POST /models/install - Install a model locally
