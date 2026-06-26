@@ -119,7 +119,10 @@ bool layer_store::store_layer(
         const uint64_t offset_begin,
         const uint64_t offset_end,
         const std::string & checksum) {
-    if (layer_index < 0 || data == nullptr || len == 0) {
+    if (data == nullptr || len == 0) {
+        return false;
+    }
+    if (layer_index < layer_special::output) {
         return false;
     }
     if (!ensure_dirs()) {
@@ -244,8 +247,8 @@ std::vector<layer_blob> layer_store::list_layers() const {
         if (!it.value().is_object()) {
             continue;
         }
-        const int32_t layer_index = it.value().value("layer_index", -1);
-        if (layer_index < 0) {
+        const int32_t layer_index = it.value().value("layer_index", -99);
+        if (layer_index < layer_special::output) {
             continue;
         }
         if (auto blob = get_layer(layer_index)) {

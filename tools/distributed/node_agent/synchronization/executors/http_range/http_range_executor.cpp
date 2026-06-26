@@ -5,6 +5,7 @@
 
 #include "httplib.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <vector>
@@ -48,26 +49,42 @@ static bool http_range_fetch(
         headers.emplace("Authorization", "Bearer " + token);
     }
 
-    const uint64_t end = offset + length - 1;
-    char range_buf[80];
-    snprintf(range_buf, sizeof(range_buf), "bytes=%llu-%llu",
-            static_cast<unsigned long long>(offset),
-            static_cast<unsigned long long>(end));
-    headers.emplace("Range", range_buf);
-
     httplib::Client cli(url.c_str());
     cli.set_connection_timeout(30, 0);
-    const int read_timeout_s = length > 64 * 1024 * 1024 ? 900 : 300;
-    cli.set_read_timeout(read_timeout_s, 0);
+    cli.set_read_timeout(900, 0);
     cli.set_follow_location(true);
 
-    const auto res = cli.Get(url.c_str(), headers);
-    if (!res || (res->status != 200 && res->status != 206)) {
-        return false;
+    constexpr uint64_t chunk_size = 32 * 1024 * 1024;
+    out.clear();
+    out.reserve(static_cast<size_t>(length));
+
+    for (uint64_t pos = 0; pos < length; pos += chunk_size) {
+        const uint64_t chunk_len = std::min(chunk_size, length - pos);
+        const uint64_t chunk_end = offset + pos + chunk_len - 1;
+
+        char range_buf[80];
+        snprintf(range_buf, sizeof(range_buf), "bytes=%llu-%llu",
+                static_cast<unsigned long long>(offset + pos),
+                static_cast<unsigned long long>(chunk_end));
+
+        httplib::Headers chunk_headers = headers;
+        chunk_headers.emplace("Range", range_buf);
+
+        const auto res = cli.Get(url.c_str(), chunk_headers);
+        if (!res || (res->status != 200 && res->status != 206)) {
+            return false;
+        }
+
+        out.insert(out.end(), res->body.begin(), res->body.end());
+        if (res->body.size() < chunk_len && res->status == 206) {
+            return false;
+        }
     }
 
-    out.assign(res->body.begin(), res->body.end());
-    return out.size() == length || (res->status == 200 && out.size() >= length);
+    if (out.size() < length) {
+        out.resize(static_cast<size_t>(length));
+    }
+    return out.size() >= length;
 }
 
 static bool fetch_range(
