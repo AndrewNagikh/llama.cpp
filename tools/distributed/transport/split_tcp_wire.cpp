@@ -11,6 +11,7 @@
 typedef int socklen_t;
 #else
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -128,34 +129,50 @@ int split_tcp_accept(int listen_fd) {
 }
 
 int split_tcp_connect(const char * host, int port) {
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    if (port <= 0 || port > 65535) {
         return -1;
     }
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons((uint16_t) port);
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
 
-    if (host == nullptr || host[0] == '\0' || strcmp(host, "localhost") == 0) {
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    } else if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+    const char * connect_host = host;
+    if (connect_host == nullptr || connect_host[0] == '\0') {
+        connect_host = "127.0.0.1";
+    }
+
+    addrinfo hints{};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo * res = nullptr;
+    if (getaddrinfo(connect_host, port_str, &hints, &res) != 0 || res == nullptr) {
+        return -1;
+    }
+
+    int fd = -1;
+    for (addrinfo * ai = res; ai != nullptr; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+
+        if (connect(fd, ai->ai_addr, (socklen_t) ai->ai_addrlen) == 0) {
+            split_tcp_set_timeouts(fd, 30000);
+            freeaddrinfo(res);
+            return fd;
+        }
+
 #if !defined(_WIN32)
         close(fd);
+#else
+        closesocket(fd);
 #endif
-        return -1;
+        fd = -1;
     }
 
-    if (connect(fd, (sockaddr *) &addr, sizeof(addr)) != 0) {
-#if !defined(_WIN32)
-        close(fd);
-#endif
-        return -1;
-    }
-
-    split_tcp_set_timeouts(fd, 30000);
-
-    return fd;
+    freeaddrinfo(res);
+    return -1;
 }
 
 int split_tcp_connect_retry(const char * host, int port, int retries, int delay_ms) {

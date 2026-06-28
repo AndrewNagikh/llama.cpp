@@ -28,7 +28,20 @@ in this task; others fall through to the llama plugin until a specific plugin is
 | router | `ffn_gate_inp.weight`, `*.gate.*` |
 | expert | `*exps*`, `*expert*` |
 
-## MoE (future plugins)
+## Task 9.9 — semantic runtime descriptor
+
+Plugins now build descriptors via `tensor_graph` (classify all tensors → semantic blobs).
+Blob deploy targets drive install and coverage:
+
+| Blob role | Deploy target |
+|-----------|---------------|
+| embedding, input_norm | entry node |
+| output_head, output_norm | final node |
+| rope (Llama 3+) | all nodes |
+| layer:N | layout node for layer N |
+
+Tied embeddings: `output_head` storage-aliases `embedding`; embedding deploy becomes `all_nodes`.
+Coverage READY requires layer indices **and** semantic blobs on correct layout nodes.
 
 DeepSeek / Qwen-MoE add per-layer `router` and `expert` tensors inside `layer:N`
 blobs. `architecture_descriptor.is_moe` is set when architecture name contains `moe`.

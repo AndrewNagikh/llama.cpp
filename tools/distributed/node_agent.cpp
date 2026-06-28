@@ -2,7 +2,9 @@
 #include "model_catalog.h"
 #include "node_benchmark.h"
 #include "node_agent/layer_store/layer_store.h"
+#include "node_agent/layer_store/worker_builder.h"
 #include "node_agent/layer_store/layer_gguf_assembler.h"
+#include "architecture/semantic_runtime_descriptor.h"
 #include "verification/worker_verify.h"
 #include "node_agent/synchronization/synchronization_engine.h"
 #include "orchestrator/install_planner/install_planner.h"
@@ -504,7 +506,16 @@ static bool start_worker(
 
 #endif
 
-static std::string materialize_worker_gguf(
+static worker_role dist_role_to_worker_role(const dist_node_role role) {
+    switch (role) {
+        case DIST_ROLE_ENTRY:  return worker_role::entry;
+        case DIST_ROLE_MIDDLE: return worker_role::middle;
+        case DIST_ROLE_FINAL:  return worker_role::final;
+        default:               return worker_role::entry;
+    }
+}
+
+static std::string configure_materialize_worker_gguf(
         const dist_configure_req & cfg,
         std::string & err) {
     if (cfg.model_id.empty()) {
@@ -527,12 +538,14 @@ static std::string materialize_worker_gguf(
         return {};
     }
 
-    const bool include_embedding = (cfg.role == DIST_ROLE_ENTRY);
-    const bool include_output    = (cfg.role == DIST_ROLE_FINAL);
-    const std::string role_name  = dist_role_name(cfg.role);
+    const worker_role role          = dist_role_to_worker_role(cfg.role);
+    const std::string role_name     = dist_role_name(cfg.role);
+    const semantic_runtime_descriptor rt = build_semantic_runtime_descriptor(*manifest);
 
     if (g_verify_materialization) {
         std::string verr;
+        const bool include_embedding = (cfg.role == DIST_ROLE_ENTRY);
+        const bool include_output    = (cfg.role == DIST_ROLE_FINAL);
         if (!verify_worker_materialization(
                     store,
                     *manifest,
@@ -549,25 +562,25 @@ static std::string materialize_worker_gguf(
     const std::string out_path =
             (store.model_root() / ("worker_" + role_name + ".gguf")).string();
 
-    if (!layer_store_materialize_gguf(
+    if (!materialize_worker_gguf(
                 store,
                 *manifest,
-                out_path,
+                rt,
+                role,
                 cfg.layer_start,
                 cfg.layer_end,
-                include_embedding,
-                include_output)) {
-        err = "failed to assemble GGUF from layer store for role " + role_name;
+                out_path,
+                err)) {
+        err = "failed to assemble GGUF from layer store for role " + role_name + ": " + err;
         return {};
     }
 
     fprintf(stderr,
-            "node_agent: materialized %s from layers [%d,%d) embedding=%d output=%d\n",
+            "node_agent: materialized %s from layers [%d,%d) role=%s\n",
             out_path.c_str(),
             cfg.layer_start,
             cfg.layer_end,
-            include_embedding ? 1 : 0,
-            include_output ? 1 : 0);
+            role_name.c_str());
     return out_path;
 }
 
@@ -718,7 +731,7 @@ int main(int argc, char ** argv) {
         std::string err;
 
         if (!cfg.model_id.empty()) {
-            const std::string materialized = materialize_worker_gguf(cfg, err);
+            const std::string materialized = configure_materialize_worker_gguf(cfg, err);
             if (materialized.empty()) {
                 res.status = 500;
                 res.set_content(json({ { "ok", false }, { "error", err } }).dump(), "application/json");

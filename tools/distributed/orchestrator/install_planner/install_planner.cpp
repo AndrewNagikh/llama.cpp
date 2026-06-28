@@ -1,12 +1,14 @@
 #include "install_planner.h"
 
-#include "architecture/architecture_descriptor.h"
 #include "architecture/install_planning.h"
+#include "architecture/semantic_runtime_descriptor.h"
 
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cstring>
 #include <map>
+#include <optional>
 #include <set>
 #include <tuple>
 
@@ -27,6 +29,25 @@ static std::string layer_node_key(int32_t layer_index, const std::string & node_
 
 static bool contains_layer(const std::vector<int32_t> & layers, int32_t layer_index) {
     return std::find(layers.begin(), layers.end(), layer_index) != layers.end();
+}
+
+static std::optional<int32_t> layer_index_from_blob_id(const std::string & blob_id) {
+    constexpr const char * prefix = "layer:";
+    if (blob_id.rfind(prefix, 0) != 0) {
+        return std::nullopt;
+    }
+    try {
+        return static_cast<int32_t>(std::stoi(blob_id.substr(std::strlen(prefix))));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+static std::optional<int32_t> operation_layer_index(const install_operation & op) {
+    if (op.layer_index >= 0) {
+        return op.layer_index;
+    }
+    return layer_index_from_blob_id(op.download.blob_id);
 }
 
 static download_operation make_download_op(
@@ -381,142 +402,77 @@ install_plan_build_result build_install_plan(
         return result;
     }
 
-    std::map<std::string, installed_layer> actual_by_key;
-    std::map<int32_t, std::vector<installed_layer>> actual_by_layer;
-    for (const auto & layer : actual.layers) {
-        actual_by_key[layer_node_key(layer.layer_index, layer.node_id)] = layer;
-        actual_by_layer[layer.layer_index].push_back(layer);
-    }
-
     std::vector<install_operation> operations;
-    std::set<std::tuple<int, std::string, int32_t>> seen;
+    std::set<std::string> blob_seen;
 
-    std::set<std::string> nodes_with_blob_tensors;
-    for (const auto & layer : actual.layers) {
-        if (!layer.blob_id.empty() && !layer.tensor_name.empty()) {
-            nodes_with_blob_tensors.insert(layer.node_id);
-        }
-    }
-    for (const auto & layer : actual.layers) {
-        if (!layer.blob_id.empty() || !layer.tensor_name.empty()) {
-            continue;
-        }
-        if (layer.layer_index != layer_special::embedding &&
-                layer.layer_index != layer_special::output) {
-            continue;
-        }
-        if (!nodes_with_blob_tensors.count(layer.node_id)) {
-            continue;
-        }
-        add_operation(operations, seen, install_action::delete_op,
-                layer.node_id, layer.layer_index);
-    }
+    const semantic_runtime_descriptor rt = build_semantic_runtime_descriptor(manifest);
+
+    std::string entry_node;
+    std::string final_node;
+    const int32_t last_layer = static_cast<int32_t>(manifest.n_layer) - 1;
 
     for (const auto & placement : desired.placements) {
-        const std::string desired_key = layer_node_key(placement.layer_index, placement.node_id);
-        const auto desired_it = actual_by_key.find(desired_key);
-        const bool ready_on_desired = desired_it != actual_by_key.end() &&
-                desired_it->second.state == install_state::ready;
-
-        if (ready_on_desired &&
-                !contains_layer(coverage.missing, placement.layer_index) &&
-                !contains_layer(coverage.corrupted, placement.layer_index)) {
-            continue;
+        if (placement.layer_index == 0) {
+            entry_node = placement.node_id;
         }
-
-        for (const auto & wrong : actual_by_layer[placement.layer_index]) {
-            if (wrong.node_id == placement.node_id) {
-                continue;
-            }
-            if (wrong.state == install_state::ready ||
-                    wrong.state == install_state::corrupted) {
-                add_operation(operations, seen, install_action::delete_op,
-                        wrong.node_id, placement.layer_index);
-            }
-        }
-
-        const layer_byte_range byte_range = manifest_layer_byte_range(manifest, placement.layer_index);
-        const download_operation dl = make_download_op(
-                placement.layer_index, placement.node_id, byte_range, source_url);
-
-        if (contains_layer(coverage.corrupted, placement.layer_index) ||
-                (desired_it != actual_by_key.end() &&
-                 desired_it->second.state == install_state::corrupted)) {
-            add_operation(operations, seen, install_action::repair,
-                    placement.node_id, placement.layer_index, dl);
-            continue;
-        }
-
-        if (!ready_on_desired ||
-                contains_layer(coverage.missing, placement.layer_index)) {
-            add_operation(operations, seen, install_action::download,
-                    placement.node_id, placement.layer_index, dl);
+        if (placement.layer_index == last_layer) {
+            final_node = placement.node_id;
         }
     }
 
-    if (!source_url.empty() && !desired.placements.empty()) {
-        std::string entry_node;
-        std::string final_node;
-        const int32_t last_layer = static_cast<int32_t>(manifest.n_layer) - 1;
-
+    if (entry_node.empty() || final_node.empty()) {
+        int32_t min_layer = INT32_MAX;
+        int32_t max_layer = -1;
         for (const auto & placement : desired.placements) {
-            if (placement.layer_index == 0) {
+            if (placement.layer_index < min_layer) {
+                min_layer  = placement.layer_index;
                 entry_node = placement.node_id;
             }
-            if (placement.layer_index == last_layer) {
+            if (placement.layer_index > max_layer) {
+                max_layer  = placement.layer_index;
                 final_node = placement.node_id;
             }
         }
+    }
 
-        if (entry_node.empty() || final_node.empty()) {
-            int32_t min_layer = INT32_MAX;
-            int32_t max_layer = -1;
-            for (const auto & placement : desired.placements) {
-                if (placement.layer_index < min_layer) {
-                    min_layer  = placement.layer_index;
-                    entry_node = placement.node_id;
-                }
-                if (placement.layer_index > max_layer) {
-                    max_layer  = placement.layer_index;
-                    final_node = placement.node_id;
-                }
-            }
+    std::set<std::string> all_nodes;
+    for (const auto & placement : desired.placements) {
+        all_nodes.insert(placement.node_id);
+    }
+    std::vector<std::string> node_list(all_nodes.begin(), all_nodes.end());
+
+    std::set<std::string> ready_blobs;
+    for (const auto & layer : actual.layers) {
+        if (layer.blob_id.empty() || layer.tensor_name.empty()) {
+            continue;
         }
-
-        if (!entry_node.empty() || !final_node.empty()) {
-            const auto desc = build_architecture_descriptor(manifest);
-
-            std::set<std::string> all_nodes;
-            for (const auto & placement : desired.placements) {
-                all_nodes.insert(placement.node_id);
-            }
-            std::vector<std::string> node_list(all_nodes.begin(), all_nodes.end());
-
-            std::set<std::string> blob_seen;
-            std::set<std::string> ready_blobs;
-            for (const auto & layer : actual.layers) {
-                if (layer.blob_id.empty() || layer.tensor_name.empty()) {
-                    continue;
-                }
-                if (layer.state != install_state::ready) {
-                    continue;
-                }
-                ready_blobs.insert(blob_install_key(
-                        layer.node_id, layer.blob_id, layer.tensor_name));
-            }
-
-            add_semantic_blob_downloads(
-                    operations,
-                    blob_seen,
-                    desc,
-                    manifest,
-                    entry_node,
-                    final_node,
-                    node_list,
-                    source_url,
-                    actual,
-                    ready_blobs);
+        if (layer.state != install_state::ready) {
+            continue;
         }
+        ready_blobs.insert(blob_install_key(
+                layer.node_id, layer.blob_id, layer.tensor_name));
+    }
+
+    add_layer_blob_downloads(
+            operations,
+            blob_seen,
+            rt,
+            desired,
+            actual,
+            coverage,
+            source_url);
+
+    if (!entry_node.empty() || !final_node.empty()) {
+        add_semantic_blob_downloads(
+                operations,
+                blob_seen,
+                rt,
+                entry_node,
+                final_node,
+                node_list,
+                source_url,
+                actual,
+                ready_blobs);
     }
 
     result.plan.operations = std::move(operations);
@@ -586,51 +542,50 @@ bool validate_install_plan(
     std::set<int32_t> planned_download;
     std::set<int32_t> planned_repair;
     for (const auto & op : plan.operations) {
-        const bool semantic_blob = op.layer_index < 0 || !op.download.blob_id.empty();
+        const std::optional<int32_t> op_layer = operation_layer_index(op);
         if (op.action == install_action::download) {
-            if (!semantic_blob && ready_layers.count(op.layer_index)) {
-                error = "download planned for ready layer " + std::to_string(op.layer_index);
+            if (op_layer.has_value() && ready_layers.count(*op_layer)) {
+                error = "download planned for ready layer " + std::to_string(*op_layer);
                 return false;
             }
             if (op.download.tensor_length == 0) {
-                error = "download missing tensor length for layer " + std::to_string(op.layer_index);
+                const std::string layer_label = op_layer.has_value()
+                        ? std::to_string(*op_layer)
+                        : op.download.blob_id;
+                error = "download missing tensor length for layer " + layer_label;
                 return false;
             }
-            if (!semantic_blob) {
-                planned_download.insert(op.layer_index);
+            if (op_layer.has_value()) {
+                planned_download.insert(*op_layer);
             }
         } else if (op.action == install_action::repair) {
-            if (!contains_layer(coverage.corrupted, op.layer_index)) {
-                error = "repair planned for non-corrupted layer " + std::to_string(op.layer_index);
+            if (op_layer.has_value() &&
+                    !contains_layer(coverage.corrupted, *op_layer)) {
+                error = "repair planned for non-corrupted layer " + std::to_string(*op_layer);
                 return false;
             }
-            planned_repair.insert(op.layer_index);
+            if (op_layer.has_value()) {
+                planned_repair.insert(*op_layer);
+            }
             if (op.download.tensor_length == 0) {
-                error = "repair missing tensor length for layer " + std::to_string(op.layer_index);
+                const std::string layer_label = op_layer.has_value()
+                        ? std::to_string(*op_layer)
+                        : op.download.blob_id;
+                error = "repair missing tensor length for layer " + layer_label;
                 return false;
             }
         }
     }
 
     for (int32_t layer : coverage.missing) {
-        bool found = planned_download.count(layer) > 0;
-        if (!found) {
-            for (const auto & op : plan.operations) {
-                if (op.layer_index == layer &&
-                        (op.action == install_action::download || op.action == install_action::repair)) {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if (!found) {
+        if (planned_download.count(layer) == 0) {
             error = "missing layer " + std::to_string(layer) + " has no install operation";
             return false;
         }
     }
 
     for (int32_t layer : coverage.corrupted) {
-        if (!planned_repair.count(layer)) {
+        if (planned_repair.count(layer) == 0) {
             error = "corrupted layer " + std::to_string(layer) + " has no repair operation";
             return false;
         }

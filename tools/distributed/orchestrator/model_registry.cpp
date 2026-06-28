@@ -1,5 +1,8 @@
 #include "model_registry.h"
 
+#include "architecture/semantic_runtime_descriptor.h"
+#include "coverage/runtime_coverage.h"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -376,8 +379,19 @@ bool cluster_model_registry::refresh_coverage(
         actual = *r.actual;
     }
 
-    const coverage_report report = compute_coverage(
+    const coverage_report base = compute_coverage(
             r.layout->desired, actual, online_nodes);
+
+    coverage_report report = base;
+    if (r.manifest.has_value()) {
+        const semantic_runtime_descriptor rt =
+                build_semantic_runtime_descriptor(*r.manifest);
+        const runtime_coverage_report rt_report = compute_runtime_coverage(
+                rt, r.layout->desired, actual, online_nodes);
+        report = rt_report.layer_coverage;
+    } else {
+        report = base;
+    }
     r.coverage = report;
 
     if (out) {

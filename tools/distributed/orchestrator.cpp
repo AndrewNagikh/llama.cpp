@@ -7,6 +7,8 @@
 #include "orchestrator/manifest_builder/manifest_builder.h"
 #include "orchestrator/layout_planner/layout_planner.h"
 #include "orchestrator/coverage/coverage.h"
+#include "orchestrator/coverage/runtime_coverage.h"
+#include "architecture/semantic_runtime_descriptor.h"
 #include "orchestrator/install_planner/install_planner.h"
 #include "orchestrator/optimizer/cluster_optimizer.h"
 #include "node_agent/layer_store/layer_store.h"
@@ -2771,9 +2773,15 @@ int main(int argc, char ** argv) {
 
         const reconciliation_result result = reconcile_layers(
                 record->layout->desired, actual, online_nodes);
-        g_registry.apply_coverage(model_id,
-                compute_coverage(record->layout->desired, actual, online_nodes),
-                record);
+        coverage_report coverage = compute_coverage(
+                record->layout->desired, actual, online_nodes);
+        if (record->manifest.has_value()) {
+            const semantic_runtime_descriptor rt =
+                    build_semantic_runtime_descriptor(*record->manifest);
+            coverage = compute_runtime_coverage(
+                    rt, record->layout->desired, actual, online_nodes).layer_coverage;
+        }
+        g_registry.apply_coverage(model_id, coverage, record);
 
         res.set_content(result.to_json().dump(), "application/json");
     });

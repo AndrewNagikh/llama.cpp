@@ -18,6 +18,8 @@ set(DIST_ARCHITECTURE_SOURCES
     architecture/descriptor_service.cpp
     architecture/install_planning.cpp
     architecture/tensor_plan.cpp
+    architecture/tensor_graph.cpp
+    architecture/semantic_runtime_descriptor.cpp
     architecture/plugins/llama_plugin.cpp
     architecture/plugins/qwen_plugin.cpp
     architecture/plugins/gemma_plugin.cpp
@@ -36,6 +38,7 @@ set(DIST_COMMON_SOURCES
     orchestrator/layout_estimator/layout_estimator.cpp
     orchestrator/optimizer/cluster_optimizer.cpp
     orchestrator/coverage/coverage.cpp
+    orchestrator/coverage/runtime_coverage.cpp
     orchestrator/install_planner/install_planner.cpp
     orchestrator/registry_persistence.cpp
     node_core.cpp
@@ -70,6 +73,7 @@ set(NODE_AGENT_SOURCES
     node_agent/layer_store/layer_checksum.cpp
     node_agent/layer_store/descriptor_materialize.cpp
     node_agent/layer_store/layer_gguf_assembler.cpp
+    node_agent/layer_store/worker_builder.cpp
     node_agent/synchronization/sync_types.cpp
     node_agent/synchronization/synchronization_engine.cpp
     node_agent/synchronization/executors/http_range/http_range_executor.cpp
@@ -139,6 +143,7 @@ target_sources(orchestrator PRIVATE
     node_agent/layer_store/layer_checksum.cpp
     node_agent/layer_store/descriptor_materialize.cpp
     node_agent/layer_store/layer_gguf_assembler.cpp
+    node_agent/layer_store/worker_builder.cpp
     ${VERIFICATION_SOURCES}
 )
 
@@ -225,6 +230,7 @@ if (LLAMA_BUILD_TESTS)
         orchestrator/layout_estimator/layout_estimator.cpp
         orchestrator/optimizer/cluster_optimizer.cpp
         orchestrator/coverage/coverage.cpp
+        orchestrator/coverage/runtime_coverage.cpp
         orchestrator/install_planner/install_planner.cpp
         memory_estimator.cpp
         dist_common.cpp
@@ -606,6 +612,20 @@ if (LLAMA_BUILD_TESTS)
     dist_add_architecture_test(test-qwen-descriptor)
     dist_add_architecture_test(test-gemma-descriptor)
     dist_add_architecture_test(test-deepseek-descriptor)
+
+    dist_add_architecture_test(test-runtime-descriptor)
+    dist_add_architecture_test(test-tensor-graph)
+
+    add_executable(test-worker-builder test-worker-builder.cpp
+        ${ARCHITECTURE_TEST_SOURCES}
+        node_agent/layer_store/layer_store.cpp
+        node_agent/layer_store/layer_checksum.cpp
+        node_agent/layer_store/descriptor_materialize.cpp
+        node_agent/layer_store/layer_gguf_assembler.cpp
+        node_agent/layer_store/worker_builder.cpp)
+    target_include_directories(test-worker-builder PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-worker-builder PRIVATE cxx_std_17)
+    target_link_libraries(test-worker-builder PRIVATE llama llama-common Threads::Threads)
 
     add_executable(test-qwen-materialization test-qwen-materialization.cpp
         ${ARCHITECTURE_TEST_SOURCES}

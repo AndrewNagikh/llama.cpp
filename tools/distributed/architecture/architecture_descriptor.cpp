@@ -1,5 +1,8 @@
 #include "architecture_descriptor.h"
 
+#include "architecture_plugin.h"
+#include "tensor_graph.h"
+
 #include <set>
 
 std::vector<std::string> nodes_for_blob_deploy(
@@ -26,4 +29,11 @@ std::vector<std::string> nodes_for_blob_deploy(
             break;
     }
     return nodes;
+}
+
+architecture_descriptor build_architecture_descriptor(const model_manifest & manifest) {
+    const tensor_graph graph = analyze_tensor_graph(manifest);
+    architecture_descriptor desc = build_descriptor_from_graph(graph);
+    desc.family = select_architecture_plugin(manifest).family();
+    return desc;
 }

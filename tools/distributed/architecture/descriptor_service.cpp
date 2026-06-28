@@ -31,7 +31,3 @@ const architecture_plugin & select_architecture_plugin(const model_manifest & ma
     }
     return *all_plugins().back();
 }
-
-architecture_descriptor build_architecture_descriptor(const model_manifest & manifest) {
-    return select_architecture_plugin(manifest).build_descriptor(manifest);
-}

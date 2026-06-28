@@ -1,10 +1,13 @@
 #include "coverage.h"
 
+#include "architecture/semantic_blob.h"
 #include "dist_common.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <map>
+#include <optional>
 #include <set>
 #include <tuple>
 
@@ -30,14 +33,79 @@ static std::string actual_layer_key(const installed_layer & layer) {
     return layer_key(layer.layer_index, layer.node_id);
 }
 
+static std::optional<int32_t> layer_index_from_blob_id(const std::string & blob_id) {
+    constexpr const char * prefix = "layer:";
+    if (blob_id.rfind(prefix, 0) != 0) {
+        return std::nullopt;
+    }
+    try {
+        return static_cast<int32_t>(std::stoi(blob_id.substr(std::strlen(prefix))));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 static std::map<std::string, installed_layer> index_actual_layers(
         const actual_model_layout & actual) {
     std::map<std::string, installed_layer> indexed;
     for (const auto & layer : actual.layers) {
-        if (layer.layer_index < 0 || layer.node_id.empty()) {
+        if (layer.layer_index >= 0 && !layer.node_id.empty()) {
+            indexed[layer_key(layer.layer_index, layer.node_id)] = layer;
+        }
+    }
+
+    struct layer_blob_agg {
+        int32_t     layer_index = -1;
+        std::string node_id;
+        int         ready_count = 0;
+        int         total_count = 0;
+        bool        any_corrupted = false;
+        uint64_t    size_bytes = 0;
+        std::string device;
+    };
+
+    std::map<std::string, layer_blob_agg> blob_layers;
+    for (const auto & layer : actual.layers) {
+        if (layer.blob_id.empty() || layer.tensor_name.empty() || layer.node_id.empty()) {
             continue;
         }
-        indexed[layer_key(layer.layer_index, layer.node_id)] = layer;
+        const std::optional<int32_t> parsed = layer_index_from_blob_id(layer.blob_id);
+        if (!parsed.has_value()) {
+            continue;
+        }
+        const std::string key = layer_key(*parsed, layer.node_id);
+        layer_blob_agg & agg = blob_layers[key];
+        agg.layer_index = *parsed;
+        agg.node_id     = layer.node_id;
+        agg.total_count++;
+        agg.size_bytes += layer.size_bytes;
+        if (!layer.device.empty()) {
+            agg.device = layer.device;
+        }
+        if (layer.state == install_state::corrupted) {
+            agg.any_corrupted = true;
+        } else if (layer.state == install_state::ready) {
+            agg.ready_count++;
+        }
+    }
+
+    for (const auto & [key, agg] : blob_layers) {
+        if (indexed.count(key)) {
+            continue;
+        }
+        installed_layer layer;
+        layer.layer_index = agg.layer_index;
+        layer.node_id     = agg.node_id;
+        layer.device      = agg.device;
+        layer.size_bytes  = agg.size_bytes;
+        if (agg.any_corrupted) {
+            layer.state = install_state::corrupted;
+        } else if (agg.ready_count > 0 && agg.ready_count == agg.total_count) {
+            layer.state = install_state::ready;
+        } else {
+            layer.state = install_state::missing;
+        }
+        indexed[key] = layer;
     }
     return indexed;
 }

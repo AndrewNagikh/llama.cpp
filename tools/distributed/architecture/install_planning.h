@@ -1,5 +1,6 @@
 #pragma once
 
+#include "architecture/semantic_runtime_descriptor.h"
 #include "architecture_descriptor.h"
 #include "orchestrator/install_planner/install_planner.h"
 
@@ -17,11 +18,19 @@ inline std::string blob_install_key(
 void add_semantic_blob_downloads(
         std::vector<install_operation> & operations,
         std::set<std::string> & seen,
-        const architecture_descriptor & desc,
-        const model_manifest & manifest,
+        const semantic_runtime_descriptor & rt,
         const std::string & entry_node,
         const std::string & final_node,
         const std::vector<std::string> & all_nodes,
         const std::string & source_url,
         const actual_model_layout & actual,
         const std::set<std::string> & ready_blobs = {});
+
+void add_layer_blob_downloads(
+        std::vector<install_operation> & operations,
+        std::set<std::string> & seen,
+        const semantic_runtime_descriptor & rt,
+        const desired_model_layout & desired,
+        const actual_model_layout & actual,
+        const coverage_report & coverage,
+        const std::string & source_url);

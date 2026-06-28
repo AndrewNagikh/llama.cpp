@@ -3,7 +3,6 @@
 #include "coverage/coverage.h"
 #include "layout_planner/layout_planner.h"
 #include "manifest_builder/manifest_builder.h"
-#include "node_agent/layer_store/layer_special.h"
 
 #include "nlohmann/json.hpp"
 

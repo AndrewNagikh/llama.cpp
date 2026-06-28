@@ -1,8 +1,8 @@
 #include "layer_gguf_assembler.h"
 
-#include "architecture/architecture_descriptor.h"
+#include "architecture/semantic_runtime_descriptor.h"
 #include "descriptor_materialize.h"
-#include "architecture/worker_requirement.h"
+#include "worker_builder.h"
 #include "dist_common.h"
 
 #include "httplib.h"
@@ -116,105 +116,9 @@ bool layer_store_materialize_gguf(
         const int32_t layer_end,
         const bool include_embedding,
         const bool include_output) {
-    if (manifest.empty()) {
-        return false;
-    }
-
-    uint64_t file_size = manifest.tensor_data_offset;
-    for (const auto & t : manifest.tensors) {
-        if (t.offset > 0 || t.size_bytes > 0) {
-            file_size = std::max(file_size, t.offset + t.size_bytes);
-        }
-    }
-
-    for (const auto & blob : store.list_layers()) {
-        if (blob.offset_end > file_size) {
-            file_size = blob.offset_end;
-        }
-    }
-
-    if (file_size == 0) {
-        return false;
-    }
-
-    std::vector<uint8_t> file(file_size, 0);
-
-    const auto metadata = store.load_metadata_blob();
-    if (metadata.has_value() && !metadata->empty()) {
-        const size_t n = std::min(metadata->size(), file.size());
-        std::memcpy(file.data(), metadata->data(), n);
-    }
-
-    auto write_layer_blob = [&](const int32_t layer_index) -> bool {
-        if (!store.has_layer(layer_index)) {
-            return false;
-        }
-        const auto blob = store.get_layer(layer_index);
-        if (!blob.has_value()) {
-            return false;
-        }
-        std::vector<uint8_t> data;
-        if (!store.load_layer(layer_index, data) || data.empty()) {
-            return false;
-        }
-        const uint64_t offset = blob->offset_begin > 0 ? blob->offset_begin : 0;
-        return write_at(file, offset, data.data(), data.size());
-    };
-
-    for (int32_t layer = layer_start; layer < layer_end; ++layer) {
-        if (!write_layer_blob(layer)) {
-            return false;
-        }
-    }
-
-    const auto desc = build_architecture_descriptor(manifest);
     const worker_role role = role_from_flags(include_embedding, include_output);
-    const auto plan = materialize_plan_for_worker(
-            desc.worker_requirements, role, layer_start, layer_end);
-
-    std::vector<std::string> required_blobs = plan.required_blobs;
-
-    // Replicated globals (e.g. Llama 3 RoPE table) must be present on every worker GGUF.
-    for (const semantic_blob & blob : desc.blobs) {
-        if (blob.deploy == blob_deploy_target::all_nodes) {
-            required_blobs.push_back(blob.id);
-        }
-    }
-    if (include_embedding) {
-        for (const semantic_blob & blob : desc.blobs) {
-            if (blob.deploy == blob_deploy_target::entry_node ||
-                    blob.deploy == blob_deploy_target::all_nodes) {
-                required_blobs.push_back(blob.id);
-            }
-        }
-    }
-    if (include_output) {
-        for (const semantic_blob & blob : desc.blobs) {
-            if (blob.deploy == blob_deploy_target::final_node ||
-                    blob.role == tensor_semantic_role::output_head ||
-                    blob.role == tensor_semantic_role::output_norm) {
-                required_blobs.push_back(blob.id);
-            }
-        }
-    }
-
-    std::sort(required_blobs.begin(), required_blobs.end());
-    required_blobs.erase(
-            std::unique(required_blobs.begin(), required_blobs.end()),
-            required_blobs.end());
-
+    const semantic_runtime_descriptor rt = build_semantic_runtime_descriptor(manifest);
     std::string err;
-    if (!materialize_descriptor_tensors(store, desc, required_blobs, file, err)) {
-        return false;
-    }
-
-    std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(output_path).parent_path(), ec);
-
-    std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        return false;
-    }
-    out.write(reinterpret_cast<const char *>(file.data()), static_cast<std::streamoff>(file.size()));
-    return static_cast<bool>(out);
+    return materialize_worker_gguf(
+            store, manifest, rt, role, layer_start, layer_end, output_path, err);
 }
