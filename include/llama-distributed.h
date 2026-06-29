@@ -19,6 +19,11 @@ LLAMA_API void llama_set_layer_range(struct llama_context * ctx, int32_t start, 
 // Copied into context; caller may free data after the call.
 LLAMA_API void llama_set_hidden_state(struct llama_context * ctx, const float * data, int32_t n_tokens);
 
+// Read back hidden state previously set via llama_set_hidden_state().
+// Returns number of floats copied into out (0 if none). out may be NULL to query size only.
+LLAMA_API int32_t llama_get_hidden_state_n_tokens(struct llama_context * ctx);
+LLAMA_API int32_t llama_get_hidden_state(struct llama_context * ctx, float * out, int32_t out_nfloats);
+
 // Clear hidden state set by llama_set_hidden_state().
 LLAMA_API void llama_clear_hidden_state(struct llama_context * ctx);
 

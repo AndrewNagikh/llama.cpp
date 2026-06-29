@@ -11,6 +11,9 @@
 #include "architecture/semantic_runtime_descriptor.h"
 #include "orchestrator/install_planner/install_planner.h"
 #include "orchestrator/optimizer/cluster_optimizer.h"
+#include "orchestrator/consistency/cluster_consistency.h"
+#include "orchestrator/consistency/state_snapshot.h"
+#include "orchestrator/consistency/install_journal.h"
 #include "node_agent/layer_store/layer_store.h"
 #include "node_agent/layer_store/layer_gguf_assembler.h"
 #include "verification/verification_pipeline.h"
@@ -31,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <random>
@@ -65,6 +69,8 @@ static std::string g_models_dir;
 static int32_t g_n_ctx = 4096;
 static model_catalog g_catalog;
 static cluster_model_registry g_registry;
+static install_journal g_install_journal(std::filesystem::path{});
+static std::filesystem::path g_snapshot_dir;
 static std::map<std::string, json> g_install_node_results;
 
 struct cluster_sync_job {
@@ -82,6 +88,16 @@ static std::map<std::string, nlohmann::json> g_verify_reports;
 static void persist_registry();
 static void sync_model_state_from_cluster(const std::string & model_id, bool try_infer_layout);
 static void bootstrap_all_models_from_cluster();
+
+static bool poll_installed_layers_from_nodes(
+        const std::string & model_id,
+        actual_model_layout & out,
+        std::set<std::string> & online_nodes);
+static std::string resolve_model_source_url(const dist_model_record & record);
+static bool build_and_store_install_plan(
+        const std::string & model_id,
+        dist_model_record * record,
+        const desired_model_layout * layout_override = nullptr);
 
 static std::string make_id(const char * prefix) {
     static std::mt19937_64 rng{ std::random_device{}() };
@@ -404,6 +420,48 @@ static void coordinate_install_plan_execute(
         if (completed_nodes + failed_nodes == static_cast<int>(node_jobs.size())) {
             if (failed_nodes == 0) {
                 set_sync_job_state(job_id, "completed");
+                actual_model_layout actual;
+                std::set<std::string> online_nodes;
+                poll_installed_layers_from_nodes(model_id, actual, online_nodes);
+                dist_model_record * record = g_registry.find(model_id);
+                if (record) {
+                    g_registry.apply_actual(model_id, actual, record);
+                    g_registry.refresh_coverage(model_id, online_nodes, record);
+                    record = g_registry.find(model_id);
+                    if (record) {
+                        build_and_store_install_plan(model_id, record);
+                        record = g_registry.find(model_id);
+                        if (record && record->coverage.has_value() &&
+                                record->stored_install_plan.has_value()) {
+                            const consistency_check_result check =
+                                    check_cluster_consistency(
+                                            *record,
+                                            actual,
+                                            online_nodes,
+                                            resolve_model_source_url(*record));
+                            if (!check.idempotent) {
+                                fprintf(stderr,
+                                        "orchestrator: post-install not idempotent model=%s ops=%d\n",
+                                        model_id.c_str(),
+                                        check.rebuilt_plan.operation_count);
+                                for (const auto & issue : check.issues) {
+                                    fprintf(stderr, "  %s\n", issue.c_str());
+                                }
+                            }
+                            if (!g_snapshot_dir.empty()) {
+                                std::error_code ec;
+                                std::filesystem::create_directories(g_snapshot_dir, ec);
+                                const auto path = g_snapshot_dir /
+                                        (model_id + "-" + job_id + ".json");
+                                std::ofstream out(path);
+                                if (out) {
+                                    out << check.snapshot.to_json().dump(2);
+                                }
+                            }
+                        }
+                    }
+                    persist_registry();
+                }
             } else {
                 set_sync_job_state(job_id, "failed", "one or more node jobs failed");
             }
@@ -413,11 +471,6 @@ static void coordinate_install_plan_execute(
 
     set_sync_job_state(job_id, "failed", "sync job timed out");
 }
-
-static bool poll_installed_layers_from_nodes(
-        const std::string & model_id,
-        actual_model_layout & out,
-        std::set<std::string> & online_nodes);
 
 static std::map<std::string, dist_node_info> collect_online_nodes_copy() {
     std::map<std::string, dist_node_info> nodes_copy;
@@ -480,7 +533,7 @@ static const desired_model_layout * planning_target_layout(const dist_model_reco
 static bool build_and_store_install_plan(
         const std::string & model_id,
         dist_model_record * record,
-        const desired_model_layout * layout_override = nullptr) {
+        const desired_model_layout * layout_override) {
     if (!record || !record->manifest.has_value()) {
         return false;
     }
@@ -959,6 +1012,82 @@ static bool cache_manifest_metadata(const std::string & model_id, const model_ma
     return layer_store_cache_metadata(store, manifest, source_url);
 }
 
+static std::string layout_entry_node_id(const dist_model_record & record) {
+    if (!record.layout.has_value()) {
+        return {};
+    }
+    for (const auto & placement : record.layout->desired.placements) {
+        if (placement.layer_index == 0) {
+            return placement.node_id;
+        }
+    }
+    int32_t min_layer = INT32_MAX;
+    std::string node_id;
+    for (const auto & placement : record.layout->desired.placements) {
+        if (placement.layer_index < min_layer) {
+            min_layer = placement.layer_index;
+            node_id   = placement.node_id;
+        }
+    }
+    return node_id;
+}
+
+static std::string fetch_entry_worker_tokenizer(
+        const dist_model_record & record,
+        const std::string & dest_path) {
+    const std::string node_id = layout_entry_node_id(record);
+    if (node_id.empty()) {
+        return {};
+    }
+
+    dist_node_info node{};
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        const auto it = g_nodes.find(node_id);
+        if (it == g_nodes.end() || !it->second.online) {
+            return {};
+        }
+        node = it->second;
+    }
+
+    httplib::Client client(node.host.c_str(), node.http_port);
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(600, 0);
+    const std::string path = "/models/" + record.model_id + "/workers/entry";
+
+    std::ofstream out(dest_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return {};
+    }
+
+    bool write_ok = true;
+    const auto result = client.Get(path.c_str(), [&](const char * data, size_t len) {
+        if (!write_ok || len == 0) {
+            return write_ok;
+        }
+        out.write(data, static_cast<std::streamsize>(len));
+        if (!out) {
+            write_ok = false;
+        }
+        return write_ok;
+    });
+    out.close();
+
+    if (!result || result->status != 200 || !write_ok) {
+        std::error_code ec;
+        std::filesystem::remove(dest_path, ec);
+        return {};
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(dest_path, ec) ||
+            std::filesystem::file_size(dest_path, ec) == 0) {
+        std::filesystem::remove(dest_path, ec);
+        return {};
+    }
+    return dest_path;
+}
+
 static std::string resolve_tokenizer_gguf_path(const dist_model_record & record) {
     const std::string local = resolve_model_path(record);
     if (!local.empty()) {
@@ -981,7 +1110,16 @@ static std::string resolve_tokenizer_gguf_path(const dist_model_record & record)
             (store.model_root() / "tokenizer.gguf").string();
     std::error_code ec;
     if (std::filesystem::exists(out, ec)) {
-        return out;
+        const uint64_t meta_size = record.manifest->tensor_data_offset;
+        const auto fsize = std::filesystem::file_size(out, ec);
+        if (!ec && fsize > meta_size) {
+            return out;
+        }
+        std::filesystem::remove(out, ec);
+    }
+
+    if (const std::string fetched = fetch_entry_worker_tokenizer(record, out); !fetched.empty()) {
+        return fetched;
     }
 
     if (layer_store_materialize_gguf(
@@ -1349,6 +1487,9 @@ int main(int argc, char ** argv) {
     if (g_models_dir.empty()) {
         g_models_dir = default_models_dir();
     }
+
+    g_snapshot_dir = std::filesystem::path(g_models_dir) / ".orchestrator" / "snapshots";
+    g_install_journal.set_root_dir(std::filesystem::path(g_models_dir) / ".orchestrator" / "journal");
 
     if (registry_persistence_load(g_models_dir, g_registry)) {
         fprintf(stderr, "orchestrator: restored registry from %s/.orchestrator/registry.json\n",
@@ -2084,10 +2225,27 @@ int main(int argc, char ** argv) {
         ggml_backend_load_all();
         const dist_model_record * record = g_registry.find(session.model);
         std::string tokenizer_path = session.model_path;
-        if (tokenizer_path.empty() && record != nullptr) {
+        auto tokenizer_usable = [&](const std::string & path) -> bool {
+            if (path.empty()) {
+                return false;
+            }
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec)) {
+                return false;
+            }
+            if (record != nullptr && record->manifest.has_value()) {
+                const uint64_t meta_size = record->manifest->tensor_data_offset;
+                const auto fsize = std::filesystem::file_size(path, ec);
+                if (!ec && meta_size > 0 && fsize <= meta_size) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (!tokenizer_usable(tokenizer_path) && record != nullptr) {
             tokenizer_path = resolve_tokenizer_gguf_path(*record);
         }
-        if (tokenizer_path.empty()) {
+        if (!tokenizer_usable(tokenizer_path)) {
             res.status = 503;
             res.set_content(json({
                 { "error", "no tokenizer GGUF available; build manifest and cache metadata first" },
@@ -2096,6 +2254,14 @@ int main(int argc, char ** argv) {
         }
 
         llama_model * model = llama_model_load_from_file(tokenizer_path.c_str(), llama_model_default_params());
+        if (!model && record != nullptr) {
+            std::error_code ec;
+            std::filesystem::remove(tokenizer_path, ec);
+            tokenizer_path = resolve_tokenizer_gguf_path(*record);
+            if (tokenizer_usable(tokenizer_path)) {
+                model = llama_model_load_from_file(tokenizer_path.c_str(), llama_model_default_params());
+            }
+        }
         if (!model) {
             res.status = 500;
             res.set_content(R"({"error":"failed to load model for tokenization"})", "application/json");
@@ -2990,6 +3156,105 @@ int main(int argc, char ** argv) {
             return;
         }
         res.set_content(record->to_json().dump(), "application/json");
+    });
+
+    // POST /models/{model_id}/consistency - Full cluster consistency check.
+    svr.Post(R"(/models/([^/]+)/consistency)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        dist_model_record * record = g_registry.find(model_id);
+        if (!record || !record->layout.has_value() || !record->manifest.has_value()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not ready" } }).dump(), "application/json");
+            return;
+        }
+
+        actual_model_layout actual;
+        std::set<std::string> online_nodes;
+        poll_installed_layers_from_nodes(model_id, actual, online_nodes);
+        g_registry.apply_actual(model_id, actual, record);
+        g_registry.refresh_coverage(model_id, online_nodes, record);
+        record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 500;
+            res.set_content(json({ { "error", "registry lost model" } }).dump(), "application/json");
+            return;
+        }
+
+        build_and_store_install_plan(model_id, record);
+        record = g_registry.find(model_id);
+
+        const consistency_check_result check = check_cluster_consistency(
+                *record,
+                actual,
+                online_nodes,
+                resolve_model_source_url(*record));
+
+        persist_registry();
+
+        res.set_content(check.to_json().dump(), "application/json");
+    });
+
+    // POST /models/{model_id}/reset - Clear node layer stores and registry install state.
+    svr.Post(R"(/models/([^/]+)/reset)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            res.status = 404;
+            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+            return;
+        }
+
+        json body;
+        try {
+            body = req.body.empty() ? json::object() : json::parse(req.body);
+        } catch (...) {
+            body = json::object();
+        }
+        const bool keep_manifest = body.value("keep_manifest", true);
+
+        json node_results = json::object();
+        std::map<std::string, dist_node_info> nodes_copy;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            for (const auto & kv : g_nodes) {
+                if (kv.second.online) {
+                    nodes_copy[kv.first] = kv.second;
+                }
+            }
+        }
+
+        for (const auto & kv : nodes_copy) {
+            httplib::Client client(kv.second.host.c_str(), kv.second.http_port);
+            client.set_connection_timeout(5, 0);
+            client.set_read_timeout(120, 0);
+            const json payload = { { "keep_manifest", keep_manifest } };
+            const auto result = client.Post(
+                    ("/models/" + model_id + "/reset").c_str(),
+                    payload.dump(),
+                    "application/json");
+            if (result && result->status == 200) {
+                try {
+                    node_results[kv.first] = json::parse(result->body);
+                } catch (...) {
+                    node_results[kv.first] = { { "ok", true } };
+                }
+            } else {
+                node_results[kv.first] = {
+                    { "ok", false },
+                    { "status", result ? result->status : 0 },
+                };
+            }
+        }
+
+        g_registry.clear_install_cluster_state(model_id, record);
+        persist_registry();
+
+        res.set_content(json({
+            { "ok", true },
+            { "model_id", model_id },
+            { "keep_manifest", keep_manifest },
+            { "nodes", node_results },
+        }).dump(), "application/json");
     });
 
     // DELETE /models/{model_id} - Remove a registered model.

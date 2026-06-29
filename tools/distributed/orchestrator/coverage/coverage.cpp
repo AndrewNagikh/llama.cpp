@@ -46,7 +46,8 @@ static std::optional<int32_t> layer_index_from_blob_id(const std::string & blob_
 }
 
 static std::map<std::string, installed_layer> index_actual_layers(
-        const actual_model_layout & actual) {
+        const actual_model_layout & actual,
+        const layer_tensor_expectations * layer_tensors = nullptr) {
     std::map<std::string, installed_layer> indexed;
     for (const auto & layer : actual.layers) {
         if (layer.layer_index >= 0 && !layer.node_id.empty()) {
@@ -62,6 +63,7 @@ static std::map<std::string, installed_layer> index_actual_layers(
         bool        any_corrupted = false;
         uint64_t    size_bytes = 0;
         std::string device;
+        std::set<std::string> ready_tensors;
     };
 
     std::map<std::string, layer_blob_agg> blob_layers;
@@ -86,6 +88,7 @@ static std::map<std::string, installed_layer> index_actual_layers(
             agg.any_corrupted = true;
         } else if (layer.state == install_state::ready) {
             agg.ready_count++;
+            agg.ready_tensors.insert(layer.tensor_name);
         }
     }
 
@@ -100,6 +103,22 @@ static std::map<std::string, installed_layer> index_actual_layers(
         layer.size_bytes  = agg.size_bytes;
         if (agg.any_corrupted) {
             layer.state = install_state::corrupted;
+            indexed[key] = layer;
+            continue;
+        }
+
+        int expected_tensors = 0;
+        if (layer_tensors != nullptr) {
+            const auto exp_it = layer_tensors->find(agg.layer_index);
+            if (exp_it != layer_tensors->end()) {
+                expected_tensors = exp_it->second;
+            }
+        }
+
+        if (expected_tensors > 0) {
+            layer.state = static_cast<int>(agg.ready_tensors.size()) >= expected_tensors
+                    ? install_state::ready
+                    : install_state::missing;
         } else if (agg.ready_count > 0 && agg.ready_count == agg.total_count) {
             layer.state = install_state::ready;
         } else {
@@ -312,12 +331,13 @@ reconciliation_result reconciliation_result::from_json(const json & j) {
 coverage_report compute_coverage(
         const desired_model_layout & desired,
         const actual_model_layout & actual,
-        const std::set<std::string> & online_nodes) {
+        const std::set<std::string> & online_nodes,
+        const layer_tensor_expectations * layer_tensors) {
     coverage_report report;
     report.model_id = desired.model_id.empty() ? actual.model_id : desired.model_id;
     report.total_layers = static_cast<int>(desired.placements.size());
 
-    const auto indexed = index_actual_layers(actual);
+    const auto indexed = index_actual_layers(actual, layer_tensors);
     bool node_loss_missing = false;
 
     for (const auto & placement : desired.placements) {

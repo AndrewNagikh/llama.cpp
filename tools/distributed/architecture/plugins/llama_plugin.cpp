@@ -17,10 +17,7 @@ bool llama_architecture_plugin::matches(const model_manifest & manifest) const {
     }
     return arch_prefix_matches(arch, "llama") ||
             arch_prefix_matches(arch, "tinyllama") ||
-            arch_prefix_matches(arch, "mistral") ||
-            arch_prefix_matches(arch, "phi") ||
-            arch_prefix_matches(arch, "deepseek") ||
-            arch_prefix_matches(arch, "smollm");
+            arch_prefix_matches(arch, "mistral");
 }
 
 architecture_descriptor llama_architecture_plugin::build_descriptor(

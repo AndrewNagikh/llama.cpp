@@ -5,6 +5,10 @@
 #include "llama.h"
 #include "split_gen_common.h"
 #include "../transport/split_tcp_wire.h"
+#include "../runtime_debug/debug_hooks.h"
+#include "../runtime_debug/runtime_debug.h"
+#include "../runtime_debug/trace_recorder.h"
+#include "../runtime_debug/hidden_transport.h"
 
 #include <cstdio>
 #include <cstring>
@@ -26,10 +30,19 @@ static bool forward_to_c(
         int32_t pos_start,
         double ms_b,
         const float * hidden,
+        int32_t debug_step,
+        const char * phase,
+        trace_recorder * dbg,
         split_gen3_mid_resp & resp) {
     if (hidden == nullptr && n_tokens > 0) {
         fprintf(stderr, "gen3_b: missing hidden state\n");
         return false;
+    }
+
+    hidden_transport_trace tr_send = dist_debug_transport_send(
+            debug_step, phase, "bc", n_tokens, n_embd, layer_end, pos_start, hidden, 0.0);
+    if (dbg) {
+        dbg->emit_transport(tr_send);
     }
 
     const int64_t t0 = ggml_time_us();
@@ -72,6 +85,13 @@ static bool run_b_layers(
 
     if (n_tokens <= 1) {
         llama_set_hidden_state(ctx, msg.data.data(), n_tokens);
+        {
+            const hidden_state_api_check api = verify_hidden_state_roundtrip(
+                    ctx, msg.data.data(), n_tokens, n_embd);
+            if (!api.ok && dist_debug_transport_dump_enabled()) {
+                fprintf(stderr, "gen3_b: hidden API roundtrip FAIL: %s\n", api.message.c_str());
+            }
+        }
         if (split_gen_decode_hidden(ctx, msg.data.data(), n_tokens, n_embd, pos_start, true) != 0) {
             return false;
         }
@@ -85,6 +105,12 @@ static bool run_b_layers(
         for (int32_t i = 0; i < n_tokens; ++i) {
             const float * in = msg.data.data() + (size_t) i * n_embd;
             llama_set_hidden_state(ctx, in, 1);
+            {
+                const hidden_state_api_check api = verify_hidden_state_roundtrip(ctx, in, 1, n_embd);
+                if (!api.ok && dist_debug_transport_dump_enabled()) {
+                    fprintf(stderr, "gen3_b: hidden API roundtrip FAIL i=%d: %s\n", i, api.message.c_str());
+                }
+            }
             if (split_gen_decode_hidden(ctx, in, 1, n_embd, pos_start + i, true) != 0) {
                 return false;
             }
@@ -166,6 +192,11 @@ int main(int argc, char ** argv) {
 
     llama_set_layer_range(ctx, layer_start, layer_end);
 
+    dist_debug_load_config();
+    dist_debug_reset_recorder("middle");
+    trace_recorder * dbg = dist_debug_recorder();
+    int32_t debug_step   = 0;
+
     const int bc_fd = split_tcp_connect_retry(bc_host, bc_port, 300, 100);
     if (bc_fd < 0) {
         fprintf(stderr, "gen3_b: connect to C failed %s:%d\n", bc_host, bc_port);
@@ -198,6 +229,7 @@ int main(int argc, char ** argv) {
         if (cmd == SPLIT_AB_CMD_RESET) {
             llama_memory_clear(llama_get_memory(ctx), true);
             llama_clear_hidden_state(ctx);
+            debug_step = 0;
             split_ab_send_reset(bc_fd);
             continue;
         }
@@ -213,6 +245,24 @@ int main(int argc, char ** argv) {
             break;
         }
 
+        const char * phase = msg.header.n_tokens > 1 ? "prefill" : "decode";
+        hidden_transport_trace tr_recv = dist_debug_transport_recv(
+                debug_step, phase, "ab",
+                msg.header.n_tokens, msg.header.n_embd, msg.header.layer_end,
+                msg.meta.pos_start, msg.data.data(), 0.0);
+        if (dbg) {
+            dbg->emit_transport(tr_recv);
+        }
+        if (!tr_recv.memcmp_ok && dist_debug_transport_dump_enabled()) {
+            fprintf(stderr, "gen3_b: TCP hidden memcmp FAIL step=%d link=ab\n", debug_step);
+        }
+
+        if (dbg) {
+            dbg->emit_step_begin(debug_step, phase, -1, msg.meta.pos_start, 0);
+            dist_debug_log_position(dbg, debug_step, phase, ctx, msg.meta.pos_start,
+                    msg.header.n_tokens, 1);
+        }
+
         llama_set_layer_range(ctx, layer_start, layer_end);
 
         double ms_b = 0.0;
@@ -222,16 +272,35 @@ int main(int argc, char ** argv) {
             break;
         }
 
+        if (dbg) {
+            dist_debug_log_kv(dbg, debug_step, phase, ctx, 0);
+            if (!out_hidden.empty()) {
+                dbg->emit_hidden(debug_step, phase, out_hidden.data(),
+                        msg.header.n_tokens, n_embd, "middle");
+            }
+        }
+
         split_gen3_mid_resp resp{};
         if (!forward_to_c(bc_fd, msg.header.n_tokens, n_embd, layer_end,
-                msg.meta.pos_start, ms_b, out_hidden.data(), resp)) {
+                msg.meta.pos_start, ms_b, out_hidden.data(),
+                debug_step, phase, dbg, resp)) {
             break;
+        }
+
+        if (dbg) {
+            dist_debug_log_runtime_state(
+                    dbg, debug_step, phase, "middle", ctx, msg.header.n_tokens,
+                    nullptr, nullptr, -1, resp.token_id);
         }
 
         if (!split_gen3_send_mid_resp(ab_fd, resp)) {
             fprintf(stderr, "gen3_b: send mid resp failed\n");
             break;
         }
+        if (dbg && resp.token_id >= 0) {
+            dbg->emit_token_selected(debug_step, phase, resp.token_id, msg.meta.pos_start, false);
+        }
+        debug_step++;
     }
 
 #if !defined(_WIN32)

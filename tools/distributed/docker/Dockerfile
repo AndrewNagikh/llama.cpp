@@ -23,12 +23,21 @@ RUN cmake -S . -B build \
     -DLLAMA_DISTRIBUTED=ON \
     -DGGML_NATIVE=OFF \
     && cmake --build build -j"$(nproc)" \
-        --target orchestrator node_agent split_gen3_a split_gen3_b split_gen3_c
+        --target orchestrator node_agent split_gen3_a split_gen3_b split_gen3_c \
+        mono_reference verify_decode_loop_parity verify_hidden_pipeline verify_logits_pipeline \
+        verify_layer_equivalence verify_hidden_transport verify_runtime_api \
+        verify_final_runtime verify_final_logits verify_decode_graph verify_context_params
 
 RUN mkdir -p /out/lib \
     && find build -name "*.so*" -exec cp -P {} /out/lib \; \
     && cp build/bin/orchestrator build/bin/node_agent \
-       build/bin/split_gen3_a build/bin/split_gen3_b build/bin/split_gen3_c /out/
+       build/bin/split_gen3_a build/bin/split_gen3_b build/bin/split_gen3_c \
+       build/bin/mono_reference build/bin/verify_decode_loop_parity \
+       build/bin/verify_hidden_pipeline build/bin/verify_logits_pipeline \
+       build/bin/verify_layer_equivalence build/bin/verify_hidden_transport \
+       build/bin/verify_runtime_api build/bin/verify_final_runtime \
+       build/bin/verify_final_logits build/bin/verify_decode_graph \
+       build/bin/verify_context_params /out/
 
 FROM docker.io/ubuntu:${UBUNTU_VERSION} AS runtime
 
@@ -39,8 +48,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=build /out/lib/ /app/
 COPY --from=build /out/orchestrator /out/node_agent \
-     /out/split_gen3_a /out/split_gen3_b /out/split_gen3_c /app/
+     /out/split_gen3_a /out/split_gen3_b /out/split_gen3_c \
+     /out/mono_reference /out/verify_decode_loop_parity \
+     /out/verify_hidden_pipeline /out/verify_logits_pipeline \
+     /out/verify_layer_equivalence /out/verify_hidden_transport \
+     /out/verify_runtime_api /out/verify_final_runtime /out/verify_final_logits \
+     /out/verify_decode_graph /out/verify_context_params /app/
 COPY tools/distributed/download_model.py /app/download_model.py
+COPY tools/distributed/docker/merge_runtime_trace.py /app/merge_runtime_trace.py
+COPY tools/distributed/docker/analyze_root_cause.py /app/analyze_root_cause.py
+COPY tools/distributed/docker/run_layer_equivalence.py /app/run_layer_equivalence.py
+COPY tools/distributed/docker/run_runtime_state_verify.py /app/run_runtime_state_verify.py
+COPY tools/distributed/docker/run_final_runtime_verify.py /app/run_final_runtime_verify.py
+COPY tools/distributed/docker/collect_traces.sh /app/collect_traces.sh
 
 ENV LD_LIBRARY_PATH=/app
 ENV MODELS_DIR=/data/models

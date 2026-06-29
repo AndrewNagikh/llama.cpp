@@ -154,6 +154,11 @@ public:
             const std::set<std::string> & online_nodes = {},
             dist_model_record * out = nullptr);
 
+    // Clear install-derived cluster state (actual, coverage, stored plan).
+    bool clear_install_cluster_state(
+            const std::string & model_id,
+            dist_model_record * out = nullptr);
+
 private:
     mutable std::mutex mutex_;
     std::map<std::string, dist_model_record> records_;

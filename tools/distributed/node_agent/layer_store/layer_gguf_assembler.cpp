@@ -108,6 +108,30 @@ bool layer_store_cache_metadata(
     return store.save_metadata_blob(meta);
 }
 
+bool layer_store_materialize_tokenizer_shell(
+        const layer_store & store,
+        const model_manifest & manifest,
+        const std::string & output_path) {
+    if (manifest.empty() || manifest.tensor_data_offset == 0) {
+        return false;
+    }
+    const auto metadata = store.load_metadata_blob();
+    if (!metadata.has_value() || metadata->empty()) {
+        return false;
+    }
+
+    std::vector<uint8_t> file(manifest.tensor_data_offset, 0);
+    const size_t n = std::min(metadata->size(), file.size());
+    std::memcpy(file.data(), metadata->data(), n);
+
+    std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return false;
+    }
+    out.write(reinterpret_cast<const char *>(file.data()), static_cast<std::streamoff>(file.size()));
+    return static_cast<bool>(out);
+}
+
 bool layer_store_materialize_gguf(
         const layer_store & store,
         const model_manifest & manifest,

@@ -88,6 +88,9 @@ public:
     std::optional<std::vector<uint8_t>> load_metadata_blob() const;
     std::optional<uint64_t> metadata_bytes() const;
 
+    // Remove all layer/blob bytes and checksums. Optionally keep manifest + metadata.
+    bool clear_model_storage(bool keep_manifest = false);
+
 private:
     std::filesystem::path root_;
     std::string           model_id_;

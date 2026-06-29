@@ -485,3 +485,32 @@ std::optional<uint64_t> layer_store::metadata_bytes() const {
     }
     return static_cast<uint64_t>(data->size());
 }
+
+bool layer_store::clear_model_storage(const bool keep_manifest) {
+    const auto root = model_root();
+    std::error_code ec;
+
+    if (std::filesystem::exists(layers_dir(), ec)) {
+        std::filesystem::remove_all(layers_dir(), ec);
+    }
+    if (std::filesystem::exists(blobs_dir(), ec)) {
+        std::filesystem::remove_all(blobs_dir(), ec);
+    }
+
+    std::filesystem::remove(root / "checksums.json", ec);
+    std::filesystem::remove(root / "metadata.bin", ec);
+    std::filesystem::remove(root / "tokenizer.gguf", ec);
+    std::filesystem::remove(root / "worker_entry.gguf", ec);
+    std::filesystem::remove(root / "worker_middle.gguf", ec);
+    std::filesystem::remove(root / "worker_final.gguf", ec);
+
+    if (!keep_manifest) {
+        std::filesystem::remove(root / "manifest.json", ec);
+    }
+
+    ensure_dirs();
+    if (!keep_manifest) {
+        return true;
+    }
+    return save_checksums(json::object());
+}

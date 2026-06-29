@@ -5,6 +5,10 @@
 #include "llama.h"
 #include "split_gen_common.h"
 #include "../transport/split_tcp_wire.h"
+#include "../runtime_debug/debug_hooks.h"
+#include "../runtime_debug/runtime_debug.h"
+#include "../runtime_debug/trace_recorder.h"
+#include "../runtime_debug/hidden_transport.h"
 
 #include <cstdio>
 #include <cstring>
@@ -29,12 +33,21 @@ static bool forward_to_peer(
         int32_t n_vocab,
         double ms_a,
         bool next_is_final,
+        int32_t debug_step,
+        const char * phase,
+        trace_recorder * dbg,
         split_gen3_a_resp & resp,
         std::vector<float> & logits_out) {
     const float * hidden = llama_get_embeddings(ctx);
     if (hidden == nullptr && n_tokens > 0) {
         fprintf(stderr, "gen3_a: missing hidden state\n");
         return false;
+    }
+
+    hidden_transport_trace tr_send = dist_debug_transport_send(
+            debug_step, phase, "ab", n_tokens, n_embd, layer_end, pos_start, hidden, 0.0);
+    if (dbg) {
+        dbg->emit_transport(tr_send);
     }
 
     const int64_t t0 = ggml_time_us();
@@ -142,6 +155,11 @@ int main(int argc, char ** argv) {
 
     llama_set_layer_range(ctx, 0, layer_end);
 
+    dist_debug_load_config();
+    dist_debug_reset_recorder("entry");
+    trace_recorder * dbg = dist_debug_recorder();
+    int32_t debug_step   = 0;
+
     const int b_fd = split_tcp_connect_retry(b_host, b_port, 300, 100);
     if (b_fd < 0) {
         fprintf(stderr, "gen3_a: connect to B failed %s:%d\n", b_host, b_port);
@@ -184,6 +202,10 @@ int main(int argc, char ** argv) {
 
         if (req.cmd == SPLIT_GEN_CMD_RESET) {
             llama_memory_clear(llama_get_memory(ctx), true);
+            debug_step = 0;
+            if (dbg) {
+                dbg->emit_step_begin(0, "reset", -1, 0, 0);
+            }
             split_ab_send_reset(b_fd);
             split_gen3_a_resp resp{};
             resp.magic   = SPLIT_GEN_MAGIC;
@@ -195,6 +217,14 @@ int main(int argc, char ** argv) {
 
         const int64_t t0 = ggml_time_us();
         int decode_rc = 0;
+        const char * phase = (req.cmd == SPLIT_GEN_CMD_PREFILL) ? "prefill" : "decode";
+        const int32_t in_tok = tokens_i32.empty() ? -1 : tokens_i32[0];
+
+        if (dbg) {
+            dbg->emit_step_begin(debug_step, phase, in_tok, req.pos_start, 0);
+            dist_debug_log_position(dbg, debug_step, phase, ctx, req.pos_start,
+                    req.cmd == SPLIT_GEN_CMD_PREFILL ? req.n_tokens : 1, 1);
+        }
 
         if (req.cmd == SPLIT_GEN_CMD_PREFILL) {
             std::vector<llama_token> tokens((size_t) req.n_tokens);
@@ -219,10 +249,25 @@ int main(int argc, char ** argv) {
         const int32_t n_out = (req.cmd == SPLIT_GEN_CMD_PREFILL) ? req.n_tokens : 1;
         const int32_t le    = req.layer_end > 0 ? req.layer_end : layer_end;
 
+        if (dbg) {
+            dist_debug_log_kv(dbg, debug_step, phase, ctx, 0);
+            dist_debug_log_hidden_out(dbg, debug_step, phase, ctx, n_out, n_embd, "entry");
+            std::vector<int32_t> pos_buf((size_t) n_out);
+            std::vector<int32_t> tok_buf((size_t) n_out);
+            for (int32_t i = 0; i < n_out; ++i) {
+                pos_buf[(size_t) i] = req.pos_start + i;
+                tok_buf[(size_t) i] = (i < (int32_t) tokens_i32.size()) ? tokens_i32[(size_t) i] : -1;
+            }
+            dist_debug_log_runtime_state(
+                    dbg, debug_step, phase, "entry", ctx, n_out,
+                    tok_buf.data(), pos_buf.data(), -1, in_tok);
+        }
+
         split_gen3_a_resp resp{};
         std::vector<float> logits;
         if (!forward_to_peer(b_fd, ctx, n_out, n_embd, le, req.pos_start,
-                req.include_logits != 0, n_vocab, ms_a, next_is_final, resp, logits)) {
+                req.include_logits != 0, n_vocab, ms_a, next_is_final,
+                debug_step, phase, dbg, resp, logits)) {
             break;
         }
 
@@ -230,6 +275,11 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "gen3_a: send resp failed\n");
             break;
         }
+
+        if (dbg && resp.token_id >= 0) {
+            dbg->emit_token_selected(debug_step, phase, resp.token_id, req.pos_start, false);
+        }
+        debug_step++;
     }
 
 #if !defined(_WIN32)

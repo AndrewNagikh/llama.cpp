@@ -1,0 +1,67 @@
+# Debug overlay: enable runtime trace collection on all nodes.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.debug.yml up --build
+
+services:
+  node-a:
+    command:
+      - /app/node_agent
+      - --listen
+      - 0.0.0.0:9001
+      - --orchestrator
+      - http://orchestrator:9000
+      - --node-id
+      - node-a
+      - --advertise-host
+      - node-a
+      - --models-dir
+      - /data/models
+      - --distributed-debug
+    environment:
+      MODELS_DIR: /data/models
+      LLAMA_DISTRIBUTED_DEBUG: "1"
+      LLAMA_RUNTIME_STATE: "1"
+      LLAMA_DIST_TRANSPORT_DUMP: "1"
+      LLAMA_DIST_TRACE_DIR: /data/models/traces
+      LLAMA_DIST_DUMP_RAW: "0"
+
+  node-b:
+    command:
+      - /app/node_agent
+      - --listen
+      - 0.0.0.0:9002
+      - --orchestrator
+      - http://orchestrator:9000
+      - --node-id
+      - node-b
+      - --advertise-host
+      - node-b
+      - --models-dir
+      - /data/models
+      - --distributed-debug
+    environment:
+      MODELS_DIR: /data/models
+      LLAMA_DISTRIBUTED_DEBUG: "1"
+      LLAMA_RUNTIME_STATE: "1"
+      LLAMA_DIST_TRANSPORT_DUMP: "1"
+      LLAMA_DIST_TRACE_DIR: /data/models/traces
+
+  node-c:
+    command:
+      - /app/node_agent
+      - --listen
+      - 0.0.0.0:9003
+      - --orchestrator
+      - http://orchestrator:9000
+      - --node-id
+      - node-c
+      - --advertise-host
+      - node-c
+      - --models-dir
+      - /data/models
+      - --distributed-debug
+    environment:
+      MODELS_DIR: /data/models
+      LLAMA_DISTRIBUTED_DEBUG: "1"
+      LLAMA_RUNTIME_STATE: "1"
+      LLAMA_DIST_TRANSPORT_DUMP: "1"
+      LLAMA_DIST_TRACE_DIR: /data/models/traces

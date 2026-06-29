@@ -63,7 +63,7 @@ services:
     ports:
       - "9001:9001"
     volumes:
-      - dist-models:/data/models
+      - dist-models-a:/data/models
     networks:
       dist-net:
         aliases:
@@ -94,7 +94,7 @@ services:
     ports:
       - "9002:9002"
     volumes:
-      - dist-models:/data/models
+      - dist-models-b:/data/models
     networks:
       dist-net:
         aliases:
@@ -125,7 +125,7 @@ services:
     ports:
       - "9003:9003"
     volumes:
-      - dist-models:/data/models
+      - dist-models-c:/data/models
     networks:
       dist-net:
         aliases:
@@ -136,6 +136,9 @@ services:
 
 volumes:
   dist-models:
+  dist-models-a:
+  dist-models-b:
+  dist-models-c:
 
 networks:
   dist-net:

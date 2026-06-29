@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -89,11 +90,15 @@ struct reconciliation_result {
     static reconciliation_result from_json(const nlohmann::json & j);
 };
 
+// Expected tensor count per transformer layer (from manifest / semantic blobs).
+using layer_tensor_expectations = std::map<int32_t, int>;
+
 // Compute coverage by comparing desired placements with actual installed layers.
 coverage_report compute_coverage(
         const desired_model_layout & desired,
         const actual_model_layout & actual,
-        const std::set<std::string> & online_nodes = {});
+        const std::set<std::string> & online_nodes = {},
+        const layer_tensor_expectations * layer_tensors = nullptr);
 
 // Build reconciliation action list (missing / corrupted layer indices).
 reconciliation_result reconcile_layers(

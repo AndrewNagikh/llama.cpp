@@ -389,6 +389,9 @@ bool cluster_model_registry::refresh_coverage(
         const runtime_coverage_report rt_report = compute_runtime_coverage(
                 rt, r.layout->desired, actual, online_nodes);
         report = rt_report.layer_coverage;
+        if (!rt_report.fully_ready() && report.state == coverage_state::ready) {
+            report.state = coverage_state::partial;
+        }
     } else {
         report = base;
     }
@@ -515,6 +518,26 @@ bool cluster_model_registry::refresh_pending_coverage(
 
     if (out) {
         *out = it->second;
+    }
+    return true;
+}
+
+bool cluster_model_registry::clear_install_cluster_state(
+        const std::string & model_id,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    dist_model_record & r = it->second;
+    r.actual.reset();
+    r.coverage.reset();
+    r.stored_install_plan.reset();
+
+    if (out) {
+        *out = r;
     }
     return true;
 }

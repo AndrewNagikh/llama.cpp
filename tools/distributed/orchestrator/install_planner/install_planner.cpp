@@ -2,6 +2,7 @@
 
 #include "architecture/install_planning.h"
 #include "architecture/semantic_runtime_descriptor.h"
+#include "coverage/runtime_coverage.h"
 
 #include <algorithm>
 #include <cctype>
@@ -406,6 +407,17 @@ install_plan_build_result build_install_plan(
     std::set<std::string> blob_seen;
 
     const semantic_runtime_descriptor rt = build_semantic_runtime_descriptor(manifest);
+
+    // Task 9.9 — idempotent fast path: fully ready layout needs zero operations.
+    {
+        const runtime_coverage_report rt_cov = compute_runtime_coverage(
+                rt, desired, actual, {});
+        if (rt_cov.fully_ready()) {
+            result.success = true;
+            finalize_plan(result.plan);
+            return result;
+        }
+    }
 
     std::string entry_node;
     std::string final_node;

@@ -22,3 +22,9 @@ bool layer_store_materialize_gguf(
         int32_t layer_end,
         bool include_embedding,
         bool include_output);
+
+// Metadata-only GGUF shell for orchestrator tokenization (no weight blobs required).
+bool layer_store_materialize_tokenizer_shell(
+        const layer_store & store,
+        const model_manifest & manifest,
+        const std::string & output_path);

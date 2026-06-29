@@ -1,15 +1,42 @@
 #include "runtime_coverage.h"
 
+#include "architecture/semantic_blob.h"
 #include "architecture/semantic_runtime_descriptor.h"
 
 #include <algorithm>
 #include <climits>
+#include <cstring>
 #include <map>
 #include <set>
 
 using json = nlohmann::json;
 
 namespace {
+
+layer_tensor_expectations expectations_from_rt(const semantic_runtime_descriptor & rt) {
+    layer_tensor_expectations out;
+    for (const semantic_blob & blob : rt.blobs) {
+        if (blob.role != tensor_semantic_role::transformer_layer || blob.tensors.empty()) {
+            continue;
+        }
+        const std::optional<int32_t> layer_index = [&]() -> std::optional<int32_t> {
+            constexpr const char * prefix = "layer:";
+            if (blob.id.rfind(prefix, 0) != 0) {
+                return std::nullopt;
+            }
+            try {
+                return static_cast<int32_t>(std::stoi(blob.id.substr(std::strlen(prefix))));
+            } catch (...) {
+                return std::nullopt;
+            }
+        }();
+        if (!layer_index.has_value()) {
+            continue;
+        }
+        out[*layer_index] = static_cast<int>(blob.tensors.size());
+    }
+    return out;
+}
 
 std::string layout_entry_final(
         const desired_model_layout & desired,
@@ -105,7 +132,10 @@ runtime_coverage_report compute_runtime_coverage(
         const actual_model_layout & actual,
         const std::set<std::string> & online_nodes) {
     runtime_coverage_report report;
-    report.layer_coverage = compute_coverage(desired, actual, online_nodes);
+    const layer_tensor_expectations expectations = expectations_from_rt(rt);
+    const layer_tensor_expectations * exp_ptr =
+            expectations.empty() ? nullptr : &expectations;
+    report.layer_coverage = compute_coverage(desired, actual, online_nodes, exp_ptr);
 
     if (rt.empty() || desired.placements.empty()) {
         report.storage_state = coverage_state::empty;

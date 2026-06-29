@@ -1195,6 +1195,23 @@ void llama_context::clear_hidden_state() {
     hidden_state_n_tokens = 0;
 }
 
+int32_t llama_context::get_hidden_state_n_tokens() const {
+    return hidden_state_n_tokens;
+}
+
+int32_t llama_context::get_hidden_state(float * out, const int32_t out_nfloats) const {
+    const int32_t n = hidden_state_n_tokens * (int32_t) model.hparams.n_embd;
+    if (n <= 0) {
+        return 0;
+    }
+    if (out == nullptr || out_nfloats <= 0) {
+        return n;
+    }
+    const int32_t ncopy = std::min(n, out_nfloats);
+    std::memcpy(out, hidden_state_inp.data(), (size_t) ncopy * sizeof(float));
+    return ncopy;
+}
+
 bool llama_context::is_layer_partial_out() const {
     const int32_t end = cparams.layer_end < 0 ? (int32_t) model.hparams.n_layer() : cparams.layer_end;
     return end < (int32_t) model.hparams.n_layer();
@@ -3795,6 +3812,20 @@ void llama_set_hidden_state(llama_context * ctx, const float * data, int32_t n_t
 
 void llama_clear_hidden_state(llama_context * ctx) {
     ctx->clear_hidden_state();
+}
+
+int32_t llama_get_hidden_state_n_tokens(llama_context * ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    return ctx->get_hidden_state_n_tokens();
+}
+
+int32_t llama_get_hidden_state(llama_context * ctx, float * out, const int32_t out_nfloats) {
+    if (!ctx) {
+        return 0;
+    }
+    return ctx->get_hidden_state(out, out_nfloats);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

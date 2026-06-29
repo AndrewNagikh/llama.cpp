@@ -17,6 +17,8 @@
 
 #include "ggml-backend.h"
 #include "transport/split_tcp_wire.h"
+#include "runtime_debug/runtime_debug.h"
+#include "runtime_debug/trace_recorder.h"
 
 #include <chrono>
 #include <cctype>
@@ -24,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
@@ -94,7 +97,7 @@ static uint64_t file_size_or_zero(const std::string & path) {
 static void usage(const char * prog) {
     fprintf(stderr,
             "usage: %s --listen HOST:PORT --orchestrator URL "
-            "[--model PATH] [--node-id ID] [--advertise-host IP] [--models-dir DIR] [--verify-materialization] [--rebenchmark]\n"
+            "[--model PATH] [--node-id ID] [--advertise-host IP] [--models-dir DIR] [--verify-materialization] [--rebenchmark] [--distributed-debug]\n"
             "  Layer-first mode: omit --model; workers load GGUF assembled from synced layers.\n"
             "example: %s --listen 0.0.0.0:9001 --orchestrator http://10.0.0.1:9000 --advertise-host 10.0.0.2\n",
             prog, prog);
@@ -119,6 +122,8 @@ static bool parse_args(int argc, char ** argv, std::string & listen, std::string
             g_verify_materialization = true;
         } else if (strcmp(argv[i], "--rebenchmark") == 0) {
             rebenchmark = true;
+        } else if (strcmp(argv[i], "--distributed-debug") == 0) {
+            setenv("LLAMA_DISTRIBUTED_DEBUG", "1", 1);
         } else {
             return false;
         }
@@ -376,6 +381,11 @@ static bool run_local_pipeline_generate(
         return false;
     }
 
+    dist_debug_load_config();
+    dist_debug_set_worker("pipeline", g_node_id);
+    trace_recorder * dbg = dist_debug_recorder();
+    int32_t debug_step   = 0;
+
     int ctrl_fd = split_tcp_connect_retry("127.0.0.1", g_pipeline_ctrl_port, 300, 100);
     if (ctrl_fd < 0) {
         err = "failed to connect to local pipeline ctrl port";
@@ -383,12 +393,18 @@ static bool run_local_pipeline_generate(
     }
 
     split_gen3_a_resp resp{};
+    if (dbg) {
+        dbg->emit_step_begin(debug_step, "reset", -1, 0, 0);
+    }
     if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_RESET, 0, 0, layer_end, nullptr, resp)) {
         err = "reset failed";
         close(ctrl_fd);
         return false;
     }
 
+    if (dbg) {
+        dbg->emit_step_begin(debug_step, "prefill", -1, 0, 0);
+    }
     if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_PREFILL, (int32_t) prompt_tokens.size(), 0,
             layer_end, prompt_tokens.data(), resp)) {
         err = "prefill failed";
@@ -403,11 +419,19 @@ static bool run_local_pipeline_generate(
     }
 
     out_tokens.push_back(resp.token_id);
+    if (dbg) {
+        dbg->emit_token_selected(debug_step, "prefill", resp.token_id,
+                (int32_t) prompt_tokens.size() - 1, false);
+    }
+    debug_step++;
     int32_t cur = resp.token_id;
 
     const int n_prompt = (int) prompt_tokens.size();
     for (int step = 1; step < max_new; ++step) {
         const int32_t pos = n_prompt + step - 1;
+        if (dbg) {
+            dbg->emit_step_begin(debug_step, "decode", cur, pos, 0);
+        }
         if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur, resp)) {
             err = "decode failed at step " + std::to_string(step);
             close(ctrl_fd);
@@ -420,6 +444,10 @@ static bool run_local_pipeline_generate(
         }
         cur = resp.token_id;
         out_tokens.push_back(cur);
+        if (dbg) {
+            dbg->emit_token_selected(debug_step, "decode", cur, pos, false);
+        }
+        debug_step++;
     }
 
     pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_SHUTDOWN, 0, 0, layer_end, nullptr, resp);
@@ -487,6 +515,18 @@ static bool start_worker(
     }
 
     if (pid == 0) {
+        if (dist_debug_enabled()) {
+            setenv("LLAMA_DISTRIBUTED_DEBUG", "1", 1);
+            if (!cfg.session_id.empty()) {
+                setenv("LLAMA_DIST_SESSION_ID", cfg.session_id.c_str(), 1);
+            }
+            setenv("LLAMA_DIST_WORKER_ID", dist_role_name(cfg.role).c_str(), 1);
+            setenv("LLAMA_DIST_NODE_ID", g_node_id.c_str(), 1);
+            if (!g_models_dir.empty()) {
+                const std::string trace_dir = g_models_dir + "/traces";
+                setenv("LLAMA_DIST_TRACE_DIR", trace_dir.c_str(), 1);
+            }
+        }
         std::vector<char *> cargs;
         cargs.reserve(args.size() + 1);
         for (auto & a : args) {
@@ -544,15 +584,13 @@ static std::string configure_materialize_worker_gguf(
 
     if (g_verify_materialization) {
         std::string verr;
-        const bool include_embedding = (cfg.role == DIST_ROLE_ENTRY);
-        const bool include_output    = (cfg.role == DIST_ROLE_FINAL);
-        if (!verify_worker_materialization(
+        const worker_role role = dist_role_to_worker_role(cfg.role);
+        if (!verify_worker_materialization_for_role(
                     store,
                     *manifest,
+                    role,
                     cfg.layer_start,
                     cfg.layer_end,
-                    include_embedding,
-                    include_output,
                     verr)) {
             err = "materialization verification failed: " + verr;
             return {};
@@ -605,6 +643,9 @@ int main(int argc, char ** argv) {
     if (g_node_id.empty()) {
         g_node_id = bind_host + ":" + std::to_string(http_port);
     }
+
+    dist_debug_load_config();
+    dist_debug_set_worker("node_agent", g_node_id);
 
     if (!g_model_path.empty()) {
         fprintf(stderr, "node_agent: running benchmark on %s\n", g_model_path.c_str());
@@ -729,6 +770,10 @@ int main(int argc, char ** argv) {
         const dist_configure_req cfg = parse_configure(body);
         std::string worker_model = g_model_path;
         std::string err;
+
+        if (dist_debug_enabled() && !cfg.session_id.empty()) {
+            dist_debug_set_session(cfg.session_id);
+        }
 
         if (!cfg.model_id.empty()) {
             const std::string materialized = configure_materialize_worker_gguf(cfg, err);
@@ -920,6 +965,53 @@ int main(int argc, char ** argv) {
     });
 
     // POST /models/{model_id}/install/execute - Run Synchronization Engine locally.
+    // POST /models/{model_id}/reset - Clear local layer store bytes.
+    svr.Get(R"(/models/([^/]+)/workers/entry)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+        layer_store store = get_layer_store(model_id);
+        const std::filesystem::path path = store.model_root() / "worker_entry.gguf";
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) {
+            res.status = 404;
+            res.set_content(json({ { "error", "worker_entry.gguf not found" } }).dump(), "application/json");
+            return;
+        }
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            res.status = 500;
+            res.set_content(json({ { "error", "failed to read worker_entry.gguf" } }).dump(), "application/json");
+            return;
+        }
+        std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        res.set_content(std::move(body), "application/octet-stream");
+    });
+
+    svr.Post(R"(/models/([^/]+)/reset)", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string model_id = req.matches[1];
+
+        json body;
+        try {
+            body = req.body.empty() ? json::object() : json::parse(req.body);
+        } catch (...) {
+            body = json::object();
+        }
+        const bool keep_manifest = body.value("keep_manifest", true);
+
+        layer_store store = get_layer_store(model_id);
+        if (!store.clear_model_storage(keep_manifest)) {
+            res.status = 500;
+            res.set_content(json({ { "ok", false }, { "error", "clear failed" } }).dump(), "application/json");
+            return;
+        }
+
+        res.set_content(json({
+            { "ok", true },
+            { "model_id", model_id },
+            { "keep_manifest", keep_manifest },
+            { "node_id", g_node_id },
+        }).dump(), "application/json");
+    });
+
     svr.Post(R"(/models/([^/]+)/install/execute)", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.matches[1];
 

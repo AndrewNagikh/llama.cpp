@@ -9,20 +9,79 @@ set(DIST_TRANSPORT_SOURCES
     ${DIST_TRANSPORT_DIR}/split_tcp_wire.cpp
 )
 
+set(DIST_RUNTIME_DEBUG_SOURCES
+    runtime_debug/runtime_debug.cpp
+    runtime_debug/tensor_stats.cpp
+    runtime_debug/trace_recorder.cpp
+    runtime_debug/debug_hooks.cpp
+    runtime_debug/layer_trace.cpp
+    runtime_debug/runtime_state.cpp
+    runtime_debug/hidden_transport.cpp
+    verification/verification_common.cpp
+    verification/deps/sha256/sha256.c
+)
+
+set(DIST_STATE_VERIFY_SOURCES
+    verification/runtime_api_verify.cpp
+    verification/decode_state_parity.cpp
+)
+
+set(DIST_FINAL_VERIFY_SOURCES
+    verification/final_runtime_verify.cpp
+    verification/context_params_verify.cpp
+    verification/decode_graph_verify.cpp
+    verification/runtime_cache_verify.cpp
+)
+
+set(DIST_TRANSPORT_VERIFY_SOURCES
+    verification/hidden_transport_verify.cpp
+    ${DIST_TRANSPORT_SOURCES}
+)
+
+set(DIST_LAYER_VERIFY_SOURCES
+    verification/layer_runner.cpp
+    verification/layer_equivalence.cpp
+    verification/graph_equivalence.cpp
+)
+
+set(DIST_RUNTIME_VERIFY_SOURCES
+    verification/monolithic_trace.cpp
+    verification/decode_loop_parity.cpp
+    verification/hidden_pipeline_parity.cpp
+    verification/logits_compare.cpp
+    ${DIST_LAYER_VERIFY_SOURCES}
+    ${DIST_STATE_VERIFY_SOURCES}
+    ${DIST_FINAL_VERIFY_SOURCES}
+    ${DIST_RUNTIME_DEBUG_SOURCES}
+)
+
 set(DIST_ARCHITECTURE_SOURCES
     architecture/semantic_blob.cpp
     architecture/semantic_roles.cpp
     architecture/worker_requirement.cpp
     architecture/architecture_descriptor.cpp
+    architecture/architecture_plugin.cpp
     architecture/blob_builder.cpp
     architecture/descriptor_service.cpp
     architecture/install_planning.cpp
     architecture/tensor_plan.cpp
     architecture/tensor_graph.cpp
     architecture/semantic_runtime_descriptor.cpp
+    runtime/architecture_descriptor/blob_requirements.cpp
+    runtime/architecture_descriptor/distributed_runtime_descriptor.cpp
     architecture/plugins/llama_plugin.cpp
     architecture/plugins/qwen_plugin.cpp
     architecture/plugins/gemma_plugin.cpp
+    architecture/plugins/phi_plugin.cpp
+    architecture/plugins/smol_plugin.cpp
+    architecture/plugins/deepseek_plugin.cpp
+)
+
+set(DIST_CONSISTENCY_SOURCES
+    orchestrator/consistency/state_snapshot.cpp
+    orchestrator/consistency/install_journal.cpp
+    orchestrator/consistency/store_verifier.cpp
+    orchestrator/consistency/cluster_consistency.cpp
 )
 
 set(DIST_COMMON_SOURCES
@@ -55,6 +114,7 @@ set(DIST_PLANNER_SOURCES
 
 set(DIST_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/orchestrator
     ${CMAKE_CURRENT_SOURCE_DIR}/verification
@@ -79,6 +139,8 @@ set(NODE_AGENT_SOURCES
     node_agent/synchronization/executors/http_range/http_range_executor.cpp
     orchestrator/install_planner/install_planner.cpp
     orchestrator/manifest_builder/manifest_builder.cpp
+    orchestrator/coverage/coverage.cpp
+    orchestrator/coverage/runtime_coverage.cpp
     ${DIST_ARCHITECTURE_SOURCES}
 )
 
@@ -102,6 +164,7 @@ set(VERIFICATION_SOURCES
     verification/verification_pipeline.cpp
     verification/layer_store_populate.cpp
     verification/worker_verify.cpp
+    verification/verification_suite.cpp
 )
 
 function(dist_add_verify_exe name main_source)
@@ -130,13 +193,14 @@ function(dist_add_test_exe name main_source)
 endfunction()
 
 function(dist_add_worker name main_source)
-    add_executable(${name} ${main_source} ${DIST_TRANSPORT_SOURCES})
+    add_executable(${name} ${main_source} ${DIST_TRANSPORT_SOURCES} ${DIST_RUNTIME_DEBUG_SOURCES})
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common Threads::Threads)
 endfunction()
 
 dist_add_exe_light(node_agent node_agent.cpp)
-target_sources(node_agent PRIVATE ${DIST_TRANSPORT_SOURCES} verification/worker_verify.cpp verification/verification_common.cpp verification/deps/sha256/sha256.c)
+target_sources(node_agent PRIVATE ${DIST_TRANSPORT_SOURCES} ${DIST_RUNTIME_DEBUG_SOURCES}
+    verification/worker_verify.cpp)
 dist_add_exe(orchestrator orchestrator.cpp)
 target_sources(orchestrator PRIVATE
     node_agent/layer_store/layer_store.cpp
@@ -144,6 +208,7 @@ target_sources(orchestrator PRIVATE
     node_agent/layer_store/descriptor_materialize.cpp
     node_agent/layer_store/layer_gguf_assembler.cpp
     node_agent/layer_store/worker_builder.cpp
+    ${DIST_CONSISTENCY_SOURCES}
     ${VERIFICATION_SOURCES}
 )
 
@@ -154,6 +219,70 @@ dist_add_verify_exe(layer_verify layer_verify.cpp)
 dist_add_verify_exe(materialization_verify materialization_verify_tool.cpp)
 dist_add_verify_exe(logits_compare logits_compare_tool.cpp)
 dist_add_verify_exe(hidden_state_compare hidden_state_compare_tool.cpp)
+
+add_executable(architecture-report architecture_report_tool.cpp
+    ${DIST_ARCHITECTURE_SOURCES}
+    orchestrator/manifest_builder/manifest_builder.cpp
+    verification/verification_suite.cpp
+    dist_common.cpp)
+target_include_directories(architecture-report PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(architecture-report PRIVATE cxx_std_17)
+target_link_libraries(architecture-report PRIVATE llama llama-common Threads::Threads)
+
+add_executable(mono_reference mono_reference_tool.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+target_include_directories(mono_reference PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(mono_reference PRIVATE cxx_std_17)
+target_link_libraries(mono_reference PRIVATE llama llama-common Threads::Threads)
+
+add_executable(verify_decode_loop_parity verify_decode_loop_parity.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+target_include_directories(verify_decode_loop_parity PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(verify_decode_loop_parity PRIVATE cxx_std_17)
+target_link_libraries(verify_decode_loop_parity PRIVATE llama llama-common Threads::Threads)
+
+add_executable(verify_hidden_pipeline verify_hidden_pipeline_tool.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+target_include_directories(verify_hidden_pipeline PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(verify_hidden_pipeline PRIVATE cxx_std_17)
+target_link_libraries(verify_hidden_pipeline PRIVATE llama llama-common Threads::Threads)
+
+add_executable(verify_logits_pipeline verify_logits_pipeline_tool.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+target_include_directories(verify_logits_pipeline PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(verify_logits_pipeline PRIVATE cxx_std_17)
+target_link_libraries(verify_logits_pipeline PRIVATE llama llama-common Threads::Threads)
+
+add_executable(verify_layer_equivalence verify_layer_equivalence_tool.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+target_include_directories(verify_layer_equivalence PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(verify_layer_equivalence PRIVATE cxx_std_17)
+target_link_libraries(verify_layer_equivalence PRIVATE llama llama-common Threads::Threads)
+
+add_executable(verify_hidden_transport verify_hidden_transport_tool.cpp ${DIST_RUNTIME_VERIFY_SOURCES} ${DIST_TRANSPORT_VERIFY_SOURCES})
+target_include_directories(verify_hidden_transport PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(verify_hidden_transport PRIVATE cxx_std_17)
+target_link_libraries(verify_hidden_transport PRIVATE llama llama-common Threads::Threads)
+
+add_executable(verify_runtime_api verify_runtime_api_tool.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+target_include_directories(verify_runtime_api PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(verify_runtime_api PRIVATE cxx_std_17)
+target_link_libraries(verify_runtime_api PRIVATE llama llama-common Threads::Threads)
+
+add_executable(verify_final_runtime verify_final_runtime_tool.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+target_include_directories(verify_final_runtime PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(verify_final_runtime PRIVATE cxx_std_17)
+target_link_libraries(verify_final_runtime PRIVATE llama llama-common Threads::Threads)
+
+add_executable(verify_final_logits verify_final_logits_tool.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+target_include_directories(verify_final_logits PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(verify_final_logits PRIVATE cxx_std_17)
+target_link_libraries(verify_final_logits PRIVATE llama llama-common Threads::Threads)
+
+add_executable(verify_decode_graph verify_decode_graph_tool.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+target_include_directories(verify_decode_graph PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(verify_decode_graph PRIVATE cxx_std_17)
+target_link_libraries(verify_decode_graph PRIVATE llama llama-common Threads::Threads)
+
+add_executable(verify_context_params verify_context_params_tool.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+target_include_directories(verify_context_params PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(verify_context_params PRIVATE cxx_std_17)
+target_link_libraries(verify_context_params PRIVATE llama llama-common Threads::Threads)
 
 dist_add_worker(split_gen3_a ${DIST_WORKERS_DIR}/split_gen3_a.cpp)
 dist_add_worker(split_gen3_b ${DIST_WORKERS_DIR}/split_gen3_b.cpp)
@@ -232,6 +361,7 @@ if (LLAMA_BUILD_TESTS)
         orchestrator/coverage/coverage.cpp
         orchestrator/coverage/runtime_coverage.cpp
         orchestrator/install_planner/install_planner.cpp
+        ${DIST_CONSISTENCY_SOURCES}
         memory_estimator.cpp
         dist_common.cpp
     )
@@ -484,6 +614,7 @@ if (LLAMA_BUILD_TESTS)
         orchestrator/install_planner/install_planner.cpp
         orchestrator/manifest_builder/manifest_builder.cpp
         ${DIST_ARCHITECTURE_SOURCES}
+        ${DIST_CONSISTENCY_SOURCES}
         dist_common.cpp
     )
     set(SYNC_AGENT_LINK_LIBS cpp-httplib llama Threads::Threads)
@@ -566,6 +697,33 @@ if (LLAMA_BUILD_TESTS)
     dist_add_optimizer_test(test-node-loss)
     dist_add_optimizer_test(test-memory-change)
 
+    # Task 9.9 — cluster state consistency & install idempotency
+    macro(dist_add_consistency_test name)
+        add_executable(${name} ${name}.cpp
+            ${MODEL_REGISTRY_SOURCES}
+            node_agent/layer_store/layer_store.cpp
+            node_agent/layer_store/layer_checksum.cpp
+            node_agent/layer_store/descriptor_materialize.cpp
+            node_agent/layer_store/layer_gguf_assembler.cpp
+            node_agent/layer_store/worker_builder.cpp)
+        target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
+        target_compile_features(${name} PRIVATE cxx_std_17)
+        target_link_libraries(${name} PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+    endmacro()
+
+    dist_add_consistency_test(test-install-idempotency)
+    dist_add_consistency_test(test-store-consistency)
+    dist_add_consistency_test(test-coverage-consistency)
+    dist_add_consistency_test(test-registry-consistency)
+
+    add_executable(test-sync-state-machine test-sync-state-machine.cpp
+        orchestrator/consistency/install_journal.cpp
+        orchestrator/coverage/coverage.cpp
+        dist_common.cpp)
+    target_include_directories(test-sync-state-machine PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-sync-state-machine PRIVATE cxx_std_17)
+    target_link_libraries(test-sync-state-machine PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
+
     macro(dist_add_verify_test name)
         add_executable(${name} ${name}.cpp ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES} dist_common.cpp memory_estimator.cpp)
         target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
@@ -609,6 +767,9 @@ if (LLAMA_BUILD_TESTS)
     dist_add_architecture_test(test-llama-plugin)
     dist_add_architecture_test(test-qwen-plugin)
     dist_add_architecture_test(test-gemma-plugin)
+    dist_add_architecture_test(test-phi-plugin)
+    dist_add_architecture_test(test-smol-plugin)
+    dist_add_architecture_test(test-deepseek-plugin)
     dist_add_architecture_test(test-qwen-descriptor)
     dist_add_architecture_test(test-gemma-descriptor)
     dist_add_architecture_test(test-deepseek-descriptor)
@@ -641,4 +802,125 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-qwen-materialization PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(test-qwen-materialization PRIVATE cxx_std_17)
     target_link_libraries(test-qwen-materialization PRIVATE llama llama-common Threads::Threads)
+
+    # Task 9.8.3 — runtime debug framework tests
+    add_executable(test-runtime-trace test-runtime-trace.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-runtime-trace PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-trace PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-trace PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-decode-loop-parity test-decode-loop-parity.cpp
+        verification/decode_loop_parity.cpp
+        runtime_debug/tensor_stats.cpp
+        verification/verification_common.cpp
+        verification/deps/sha256/sha256.c)
+    target_include_directories(test-decode-loop-parity PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-decode-loop-parity PRIVATE cxx_std_17)
+    target_link_libraries(test-decode-loop-parity PRIVATE Threads::Threads)
+
+    add_executable(test-hidden-parity test-hidden-parity.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-hidden-parity PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-hidden-parity PRIVATE cxx_std_17)
+    target_link_libraries(test-hidden-parity PRIVATE llama llama-common Threads::Threads)
+
+    # Task 9.8.4 — layer boundary verification
+    add_executable(test-layer-boundary test-layer-boundary.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-layer-boundary PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-layer-boundary PRIVATE cxx_std_17)
+    target_link_libraries(test-layer-boundary PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-layer-equivalence test-layer-equivalence.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-layer-equivalence PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-layer-equivalence PRIVATE cxx_std_17)
+    target_link_libraries(test-layer-equivalence PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-graph-equivalence test-graph-equivalence.cpp
+        verification/graph_equivalence.cpp
+        verification/layer_runner.cpp
+        runtime_debug/tensor_stats.cpp
+        runtime_debug/layer_trace.cpp
+        verification/verification_common.cpp
+        verification/deps/sha256/sha256.c)
+    target_include_directories(test-graph-equivalence PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-graph-equivalence PRIVATE cxx_std_17)
+    target_link_libraries(test-graph-equivalence PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-attention-equivalence test-attention-equivalence.cpp
+        verification/graph_equivalence.cpp
+        verification/layer_runner.cpp
+        runtime_debug/tensor_stats.cpp
+        runtime_debug/layer_trace.cpp
+        verification/verification_common.cpp
+        verification/deps/sha256/sha256.c)
+    target_include_directories(test-attention-equivalence PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-attention-equivalence PRIVATE cxx_std_17)
+    target_link_libraries(test-attention-equivalence PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-rope-equivalence test-rope-equivalence.cpp
+        verification/graph_equivalence.cpp
+        verification/layer_runner.cpp
+        runtime_debug/tensor_stats.cpp
+        runtime_debug/layer_trace.cpp
+        verification/verification_common.cpp
+        verification/deps/sha256/sha256.c)
+    target_include_directories(test-rope-equivalence PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-rope-equivalence PRIVATE cxx_std_17)
+    target_link_libraries(test-rope-equivalence PRIVATE llama llama-common Threads::Threads)
+
+    # Task 9.8.5 — runtime state parity
+    add_executable(test-runtime-state test-runtime-state.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-runtime-state PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-state PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-state PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-hidden-transport test-hidden-transport.cpp ${DIST_RUNTIME_VERIFY_SOURCES} ${DIST_TRANSPORT_VERIFY_SOURCES})
+    target_include_directories(test-hidden-transport PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-hidden-transport PRIVATE cxx_std_17)
+    target_link_libraries(test-hidden-transport PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-runtime-api-verify test-runtime-api-verify.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-runtime-api-verify PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-api-verify PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-api-verify PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-decode-state-parity test-decode-state-parity.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-decode-state-parity PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-decode-state-parity PRIVATE cxx_std_17)
+    target_link_libraries(test-decode-state-parity PRIVATE llama llama-common Threads::Threads)
+
+    # Task 9.8.6 — final runtime isolation
+    add_executable(test-final-runtime test-final-runtime.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-final-runtime PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-final-runtime PRIVATE cxx_std_17)
+    target_link_libraries(test-final-runtime PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-hidden-injection test-hidden-injection.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-hidden-injection PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-hidden-injection PRIVATE cxx_std_17)
+    target_link_libraries(test-hidden-injection PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-final-logits test-final-logits.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-final-logits PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-final-logits PRIVATE cxx_std_17)
+    target_link_libraries(test-final-logits PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-decode-graph test-decode-graph.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-decode-graph PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-decode-graph PRIVATE cxx_std_17)
+    target_link_libraries(test-decode-graph PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-context-params test-context-params.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-context-params PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-context-params PRIVATE cxx_std_17)
+    target_link_libraries(test-context-params PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-runtime-api test-runtime-api.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-runtime-api PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-api PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-api PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-runtime-cache test-runtime-cache.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+    target_include_directories(test-runtime-cache PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-cache PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-cache PRIVATE llama llama-common Threads::Threads)
 endif()

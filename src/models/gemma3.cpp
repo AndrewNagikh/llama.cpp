@@ -87,11 +87,17 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    const int32_t layer_start = cparams.layer_start;
+    const int32_t layer_end   = cparams.layer_end < 0 ? (int32_t) n_layer : cparams.layer_end;
 
-    // important: do not normalize weights for raw embeddings input (i.e. encoded image embeddings)
-    inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
-    cb(inpL, "inp_scaled", -1);
+    if (layer_start > 0) {
+        inpL = build_inp_hidden();
+    } else {
+        inpL = build_inp_embd(model.tok_embd);
+        // important: do not normalize weights for raw embeddings input (i.e. encoded image embeddings)
+        inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
+        cb(inpL, "inp_scaled", -1);
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -108,7 +114,11 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    GGML_ASSERT(layer_start >= 0);
+    GGML_ASSERT(layer_start <= layer_end);
+    GGML_ASSERT(layer_end <= n_layer);
+
+    for (int il = layer_start; il < layer_end; ++il) {
         float freq_base_l  = 0.0f;
         float freq_scale_l = 0.0f;
 
@@ -157,7 +167,7 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
                     model.layers[il].wo, NULL, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == layer_end - 1 && inp_out_ids) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -199,24 +209,32 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
     }
     cur = inpL;
 
-    cur = build_norm(cur,
-            model.output_norm, NULL,
-            LLM_NORM_RMS, -1);
+    const bool partial = layer_end < n_layer;
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+    if (!partial) {
+        cur = build_norm(cur,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, -1);
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
 
-    if (hparams.f_final_logit_softcapping) {
-        cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
-        cur = ggml_tanh(ctx0, cur);
-        cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+        // lm_head
+        cur = build_lora_mm(model.output, cur, model.output_s);
+
+        if (hparams.f_final_logit_softcapping) {
+            cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
+            cur = ggml_tanh(ctx0, cur);
+            cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+        }
+
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    } else {
+        cb(cur, "partial_out", -1);
+        res->t_embd   = cur;
+        res->t_logits = nullptr;
     }
-
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
 }

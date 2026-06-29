@@ -119,6 +119,8 @@ struct llama_context {
     void set_layer_range(int32_t start, int32_t end);
     void set_hidden_state(const float * data, int32_t n_tokens);
     void clear_hidden_state();
+    int32_t get_hidden_state_n_tokens() const;
+    int32_t get_hidden_state(float * out, int32_t out_nfloats) const;
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 

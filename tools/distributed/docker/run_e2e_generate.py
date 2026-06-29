@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Docker E2E: register → sync → generate for TinyLlama, Llama 3.2, Qwen 2.5.
+"""Docker E2E: register → sync → generate across architecture families.
 
 Uses all 3 Docker nodes (node-a/b/c). Retries sync until layer coverage is complete,
-then session create + generate.
+then session create + generate for models marked full_e2e=true.
 
 Usage:
   ORCHESTRATOR=http://127.0.0.1:9000 python3 docker/run_e2e_generate.py
   ORCHESTRATOR=http://127.0.0.1:9000 python3 docker/run_e2e_generate.py --model tinyllama-1.1b
+  ORCHESTRATOR=http://127.0.0.1:9000 python3 docker/run_e2e_generate.py --family gemma
 """
 
 from __future__ import annotations
@@ -29,20 +30,58 @@ MODELS = [
     {
         "label": "TinyLlama",
         "model_id": "tinyllama-1.1b",
+        "family": "llama",
         "repository": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
         "filename": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        "full_e2e": True,
     },
     {
         "label": "Llama3.2",
         "model_id": "llama-3.2-1b",
+        "family": "llama",
         "repository": "hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF",
         "filename": "llama-3.2-1b-instruct-q4_k_m.gguf",
+        "full_e2e": True,
     },
     {
         "label": "Qwen2.5",
         "model_id": "qwen2.5-1.5b",
+        "family": "qwen",
         "repository": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
         "filename": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        "full_e2e": True,
+    },
+    {
+        "label": "Gemma3",
+        "model_id": "gemma-3-1b",
+        "family": "gemma",
+        "repository": "lmstudio-community/gemma-3-1b-it-GGUF",
+        "filename": "gemma-3-1b-it-Q4_K_M.gguf",
+        "full_e2e": True,
+    },
+    {
+        "label": "Phi3.5",
+        "model_id": "phi-3.5-mini",
+        "family": "phi",
+        "repository": "bartowski/Phi-3.5-mini-instruct-GGUF",
+        "filename": "Phi-3.5-mini-instruct-Q4_K_M.gguf",
+        "full_e2e": False,
+    },
+    {
+        "label": "SmolLM2",
+        "model_id": "smollm2-1.7b",
+        "family": "smollm",
+        "repository": "HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF",
+        "filename": "smollm2-1.7b-instruct-q4_k_m.gguf",
+        "full_e2e": False,
+    },
+    {
+        "label": "DeepSeekDistill",
+        "model_id": "deepseek-r1-distill-qwen-1.5b",
+        "family": "deepseek",
+        "repository": "unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF",
+        "filename": "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf",
+        "full_e2e": False,
     },
 ]
 
@@ -130,10 +169,21 @@ def layers_complete(cov: dict) -> bool:
     ready = cov.get("ready_layers", 0)
     total = cov.get("total_layers", 0)
     missing = cov.get("missing_layers", 0)
-    return total > 0 and ready == total and missing == 0
+    state = cov.get("state", "")
+    return (
+        total > 0
+        and ready == total
+        and missing == 0
+        and state == "READY"
+    )
 
 
-def sync_until_ready(model_id: str, max_rounds: int = 5) -> tuple[bool, str, dict]:
+def install_plan_empty(model_id: str) -> bool:
+    status, plan = http("POST", f"/models/{model_id}/install-plan", timeout=120)
+    return status == 200 and plan.get("operation_count", 0) == 0
+
+
+def sync_until_ready(model_id: str, max_rounds: int = 8) -> tuple[bool, str, dict]:
     last_cov: dict = {}
     for round_i in range(max_rounds):
         last_cov = refresh_coverage(model_id)
@@ -142,7 +192,7 @@ def sync_until_ready(model_id: str, max_rounds: int = 5) -> tuple[bool, str, dic
             f"({last_cov.get('ready_layers', 0)}/{last_cov.get('total_layers', 0)} layers, "
             f"missing={last_cov.get('missing_layers', 0)})")
 
-        if layers_complete(last_cov):
+        if layers_complete(last_cov) and install_plan_empty(model_id):
             return True, state, last_cov
 
         status, plan = http("POST", f"/models/{model_id}/install-plan", timeout=120)
@@ -158,16 +208,19 @@ def sync_until_ready(model_id: str, max_rounds: int = 5) -> tuple[bool, str, dic
             return False, out.get("error", json.dumps(out)), last_cov
         ok, err = wait_job(out.get("job_id", ""), timeout_s=3600)
         if not ok:
-            return False, err, last_cov
+            log(f"    install job failed: {err[:120]}, retrying...")
+            continue
 
     last_cov = refresh_coverage(model_id)
-    ok = layers_complete(last_cov)
+    ok = layers_complete(last_cov) and install_plan_empty(model_id)
     return ok, last_cov.get("state", ""), last_cov
 
 
 def pipeline_model(cfg: dict) -> tuple[bool, str]:
     mid = cfg["model_id"]
     log(f"\n=== {cfg['label']} ({mid}) ===")
+
+    http("POST", f"/models/{mid}/reset", {"keep_manifest": False}, timeout=180)
 
     status, out = http("POST", "/models/register", {
         "model_id": mid,
@@ -203,6 +256,10 @@ def pipeline_model(cfg: dict) -> tuple[bool, str]:
         missing = cov.get("missing", [])
         return False, f"sync/coverage: {detail} missing_layers={missing[:8]}"
 
+    if not cfg.get("full_e2e", True):
+        log(f"    sync-only PASS (family={cfg.get('family', '?')})")
+        return True, "sync-only"
+
     status, out = http("POST", "/session/create", {"model": mid, "n_ctx": 512}, timeout=300)
     if status != 200:
         pipeline = out.get("layout", out.get("pipeline", ""))
@@ -230,6 +287,9 @@ def pipeline_model(cfg: dict) -> tuple[bool, str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", help="Run one model_id only")
+    parser.add_argument("--family", help="Run all models in a family (llama, qwen, gemma, ...)")
+    parser.add_argument("--full-e2e-only", action="store_true",
+                        help="Only models with full distributed generate")
     args = parser.parse_args()
 
     load_hf_token()
@@ -245,6 +305,13 @@ def main() -> int:
         if not models:
             log(f"Unknown model: {args.model}")
             return 2
+    elif args.family:
+        models = [m for m in MODELS if m.get("family") == args.family]
+        if not models:
+            log(f"Unknown family: {args.family}")
+            return 2
+    if args.full_e2e_only:
+        models = [m for m in models if m.get("full_e2e", True)]
 
     results: list[tuple[str, bool, str]] = []
     for cfg in models:
