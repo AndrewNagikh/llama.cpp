@@ -1643,8 +1643,11 @@ int main(int argc, char ** argv) {
             g_nodes[node.node_id] = node;
         }
 
-        bootstrap_all_models_from_cluster();
+        // Only resync models when membership or capacity changed. Running bootstrap on
+        // every heartbeat (every 5s per node) blocks the HTTP thread pool and makes
+        // other nodes fail registration when a slow/unreachable node joins.
         if (cluster_changed) {
+            bootstrap_all_models_from_cluster();
             trigger_cluster_optimization_async();
         }
 
