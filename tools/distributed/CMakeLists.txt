@@ -204,6 +204,7 @@ target_sources(node_agent PRIVATE ${DIST_TRANSPORT_SOURCES} ${DIST_RUNTIME_DEBUG
     verification/worker_verify.cpp)
 dist_add_exe(orchestrator orchestrator.cpp)
 target_sources(orchestrator PRIVATE
+    dist_http_fetch.cpp
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
     node_agent/layer_store/descriptor_materialize.cpp
@@ -605,6 +606,7 @@ if (LLAMA_BUILD_TESTS)
     target_link_libraries(test-install-plan-update PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
 
     set(SYNC_AGENT_SOURCES
+        dist_http_fetch.cpp
         node_agent/layer_store/layer_store.cpp
         node_agent/layer_store/layer_checksum.cpp
         node_agent/layer_store/descriptor_materialize.cpp
