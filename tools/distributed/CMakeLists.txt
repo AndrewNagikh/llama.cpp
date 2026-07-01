@@ -129,6 +129,7 @@ set(DIST_INCLUDE_DIRS
 )
 
 set(NODE_AGENT_SOURCES
+    dist_http_fetch.cpp
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
     node_agent/layer_store/descriptor_materialize.cpp

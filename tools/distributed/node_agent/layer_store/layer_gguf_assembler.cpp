@@ -2,13 +2,10 @@
 
 #include "architecture/semantic_runtime_descriptor.h"
 #include "descriptor_materialize.h"
+#include "dist_http_fetch.h"
 #include "worker_builder.h"
-#include "dist_common.h"
-
-#include "httplib.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -21,48 +18,7 @@ static bool fetch_bytes(
         const uint64_t offset,
         const uint64_t length,
         std::vector<uint8_t> & out) {
-    if (length == 0) {
-        return false;
-    }
-    if (source_url.rfind("file://", 0) == 0) {
-        const std::string path = source_url.substr(7);
-        std::ifstream in(path, std::ios::binary);
-        if (!in) {
-            return false;
-        }
-        in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-        out.resize(static_cast<size_t>(length));
-        in.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(length));
-        return static_cast<bool>(in);
-    }
-
-    httplib::Headers headers = {
-        { "User-Agent", "distributed-llama-node-agent/0.1" },
-        { "Accept", "*/*" },
-    };
-    const std::string token = dist_hf_token();
-    if (!token.empty()) {
-        headers.emplace("Authorization", "Bearer " + token);
-    }
-
-    const uint64_t end = offset + length - 1;
-    char range_buf[80];
-    snprintf(range_buf, sizeof(range_buf), "bytes=%llu-%llu",
-            static_cast<unsigned long long>(offset),
-            static_cast<unsigned long long>(end));
-    headers.emplace("Range", range_buf);
-
-    httplib::Client cli(source_url.c_str());
-    cli.set_connection_timeout(30, 0);
-    cli.set_read_timeout(300, 0);
-    cli.set_follow_location(true);
-
-    const auto res = cli.Get(source_url.c_str(), headers);
-    if (!res || (res->status != 200 && res->status != 206)) {
-        return false;
-    }
-    out.assign(res->body.begin(), res->body.end());
-    return !out.empty();
+    return dist_http_get_range(source_url, offset, length, out);
 }
 
 static bool write_at(std::vector<uint8_t> & file, const uint64_t offset, const uint8_t * data, const size_t len) {

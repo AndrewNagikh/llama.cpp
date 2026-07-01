@@ -1,101 +1,18 @@
 #include "http_range_executor.h"
 
-#include "dist_common.h"
+#include "dist_http_fetch.h"
 #include "node_agent/layer_store/layer_checksum.h"
 
-#include "httplib.h"
-
-#include <algorithm>
-#include <cstdio>
-#include <fstream>
 #include <vector>
 
 namespace {
 
-static bool read_file_range(
-        const std::string & path,
-        uint64_t offset,
-        uint64_t length,
-        std::vector<uint8_t> & out) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        return false;
-    }
-    in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    if (!in) {
-        return false;
-    }
-    out.resize(static_cast<size_t>(length));
-    in.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(length));
-    return static_cast<bool>(in) || in.gcount() == static_cast<std::streamsize>(length);
-}
-
-static bool http_range_fetch(
-        const std::string & url,
-        uint64_t offset,
-        uint64_t length,
-        std::vector<uint8_t> & out) {
-    if (length == 0) {
-        return false;
-    }
-
-    httplib::Headers headers = {
-        { "User-Agent", "distributed-llama-node-agent/0.1" },
-        { "Accept", "*/*" },
-    };
-
-    const std::string token = dist_hf_token();
-    if (!token.empty()) {
-        headers.emplace("Authorization", "Bearer " + token);
-    }
-
-    httplib::Client cli(url.c_str());
-    cli.set_connection_timeout(30, 0);
-    cli.set_read_timeout(900, 0);
-    cli.set_follow_location(true);
-
-    constexpr uint64_t chunk_size = 32 * 1024 * 1024;
-    out.clear();
-    out.reserve(static_cast<size_t>(length));
-
-    for (uint64_t pos = 0; pos < length; pos += chunk_size) {
-        const uint64_t chunk_len = std::min(chunk_size, length - pos);
-        const uint64_t chunk_end = offset + pos + chunk_len - 1;
-
-        char range_buf[80];
-        snprintf(range_buf, sizeof(range_buf), "bytes=%llu-%llu",
-                static_cast<unsigned long long>(offset + pos),
-                static_cast<unsigned long long>(chunk_end));
-
-        httplib::Headers chunk_headers = headers;
-        chunk_headers.emplace("Range", range_buf);
-
-        const auto res = cli.Get(url.c_str(), chunk_headers);
-        if (!res || (res->status != 200 && res->status != 206)) {
-            return false;
-        }
-
-        out.insert(out.end(), res->body.begin(), res->body.end());
-        if (res->body.size() < chunk_len && res->status == 206) {
-            return false;
-        }
-    }
-
-    if (out.size() < length) {
-        out.resize(static_cast<size_t>(length));
-    }
-    return out.size() >= length;
-}
-
 static bool fetch_range(
         const std::string & source_url,
-        uint64_t offset,
-        uint64_t length,
+        const uint64_t offset,
+        const uint64_t length,
         std::vector<uint8_t> & out) {
-    if (source_url.rfind("file://", 0) == 0) {
-        return read_file_range(source_url.substr(7), offset, length, out);
-    }
-    return http_range_fetch(source_url, offset, length, out);
+    return dist_http_get_range(source_url, offset, length, out);
 }
 
 } // namespace
