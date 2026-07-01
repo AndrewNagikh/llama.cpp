@@ -438,6 +438,19 @@ std::string dist_hf_token() {
     return {};
 }
 
+int dist_sync_parallelism() {
+    if (const char * env = std::getenv("DIST_SYNC_PARALLELISM")) {
+        try {
+            const int n = std::stoi(env);
+            if (n > 0 && n <= 32) {
+                return n;
+            }
+        } catch (...) {
+        }
+    }
+    return 4;
+}
+
 int64_t dist_now_unix() {
     return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());

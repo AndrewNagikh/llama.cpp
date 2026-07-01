@@ -1,8 +1,10 @@
 #include "synchronization_engine.h"
 
+#include "dist_common.h"
 #include "executors/http_range/http_range_executor.h"
 #include "node_agent/layer_store/layer_gguf_assembler.h"
 
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <random>
@@ -128,9 +130,15 @@ void synchronization_engine::run_job(
         it->second.state = sync_job_state::running;
     }
 
-    bool any_failed = false;
+    std::atomic<bool> any_failed{false};
+    std::atomic<size_t> next_index{0};
+    std::mutex store_mu;
 
-    for (size_t i = 0; i < operations.size(); ++i) {
+    const int worker_count = std::max(1, std::min(
+            dist_sync_parallelism(),
+            static_cast<int>(operations.size())));
+
+    auto run_one = [&](const size_t i) {
         const install_operation & op = operations[i];
 
         {
@@ -146,6 +154,7 @@ void synchronization_engine::run_job(
 
         executor_result result;
         if (op.action == install_action::delete_op) {
+            std::lock_guard<std::mutex> lock(store_mu);
             result = execute_delete(op, store);
         } else if (op.action == install_action::verify) {
             {
@@ -155,19 +164,24 @@ void synchronization_engine::run_job(
                     it->second.operations[i].state = sync_operation_state::verifying;
                 }
             }
+            std::lock_guard<std::mutex> lock(store_mu);
             result = execute_verify(op, store);
         } else if (op.action == install_action::download || op.action == install_action::repair) {
-            result = executor_->execute(op, store);
-            if (result.success) {
-                std::lock_guard<std::mutex> lock(mu_);
-                auto it = jobs_.find(job_id);
-                if (it != jobs_.end() && i < it->second.operations.size()) {
-                    it->second.operations[i].state = sync_operation_state::verifying;
+            std::vector<uint8_t> body;
+            std::string fetch_error;
+            if (!http_range_download_executor::fetch_body(op.download, body, fetch_error)) {
+                result.success = false;
+                result.error   = fetch_error;
+            } else {
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    auto it = jobs_.find(job_id);
+                    if (it != jobs_.end() && i < it->second.operations.size()) {
+                        it->second.operations[i].state = sync_operation_state::verifying;
+                    }
                 }
-                if (!verify_operation_stored(op, store)) {
-                    result.success = false;
-                    result.error   = "verification failed after download";
-                }
+                std::lock_guard<std::mutex> lock(store_mu);
+                result = http_range_download_executor::store_body(op, store, std::move(body));
             }
         } else {
             result.error = "unsupported install action";
@@ -180,16 +194,35 @@ void synchronization_engine::run_job(
                 return;
             }
             if (i >= it->second.operations.size()) {
-                continue;
+                return;
             }
             if (result.success) {
                 it->second.operations[i].state = sync_operation_state::ready;
             } else {
                 it->second.operations[i].state = sync_operation_state::failed;
                 it->second.operations[i].error = result.error;
-                any_failed = true;
+                any_failed.store(true);
             }
         }
+    };
+
+    auto worker = [&]() {
+        for (;;) {
+            const size_t i = next_index.fetch_add(1);
+            if (i >= operations.size()) {
+                return;
+            }
+            run_one(i);
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(worker_count));
+    for (int w = 0; w < worker_count; ++w) {
+        workers.emplace_back(worker);
+    }
+    for (auto & t : workers) {
+        t.join();
     }
 
     std::lock_guard<std::mutex> lock(mu_);
@@ -197,7 +230,7 @@ void synchronization_engine::run_job(
     if (it == jobs_.end()) {
         return;
     }
-    if (any_failed) {
+    if (any_failed.load()) {
         it->second.state = sync_job_state::failed;
         it->second.error = "one or more operations failed";
     } else {

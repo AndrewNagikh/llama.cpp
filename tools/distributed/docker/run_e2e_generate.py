@@ -121,7 +121,26 @@ def http(method: str, path: str, body: dict | None = None, timeout: int = 120) -
         return e.code, payload
 
 
-def wait_job(job_id: str, timeout_s: int = 3600) -> tuple[bool, str]:
+def job_progress_line(job: dict) -> str:
+    nodes = job.get("nodes", {})
+    if not nodes:
+        return ""
+    parts = []
+    for nid, nd in sorted(nodes.items()):
+        if isinstance(nd, dict):
+            ready = nd.get("ready_count")
+            total = nd.get("total_count")
+            state = nd.get("state", nd.get("status", ""))
+            if ready is not None and total is not None:
+                parts.append(f"{nid}={ready}/{total}")
+            elif state:
+                parts.append(f"{nid}={state}")
+    return " ".join(parts)
+
+
+def wait_job(job_id: str, timeout_s: int | None = None) -> tuple[bool, str]:
+    if timeout_s is None:
+        timeout_s = int(os.environ.get("SYNC_JOB_TIMEOUT_S", "1800"))
     log(f"    ... job {job_id} (timeout {timeout_s}s)")
     deadline = time.time() + timeout_s
     last_log = 0.0
@@ -129,10 +148,11 @@ def wait_job(job_id: str, timeout_s: int = 3600) -> tuple[bool, str]:
         status, job = http("GET", f"/jobs/{job_id}", timeout=30)
         if status == 200:
             state = job.get("state", "")
-            if time.time() - last_log > 30:
-                nodes = job.get("nodes", {})
+            if time.time() - last_log > 15:
+                progress = job_progress_line(job)
                 failed = job.get("error", "")
-                log(f"    ... job state={state} nodes={len(nodes)}" +
+                log(f"    ... job state={state}" +
+                    (f" {progress}" if progress else "") +
                     (f" err={failed[:60]}" if failed else ""))
                 last_log = time.time()
             if state == "completed":
@@ -206,7 +226,7 @@ def sync_until_ready(model_id: str, max_rounds: int = 8) -> tuple[bool, str, dic
         status, out = http("POST", f"/models/{model_id}/install/execute", timeout=120)
         if status != 200:
             return False, out.get("error", json.dumps(out)), last_cov
-        ok, err = wait_job(out.get("job_id", ""), timeout_s=3600)
+        ok, err = wait_job(out.get("job_id", ""))
         if not ok:
             log(f"    install job failed: {err[:120]}, retrying...")
             continue

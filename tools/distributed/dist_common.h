@@ -157,4 +157,7 @@ std::string dist_normalize_device(const std::string & backend, bool has_gpu);
 // Hugging Face token for discovery/downloads (HF_TOKEN, HUGGINGFACE_HUB_TOKEN, ~/.cache/huggingface/token).
 std::string dist_hf_token();
 
+// Concurrent install operations per node (DIST_SYNC_PARALLELISM, default 4).
+int dist_sync_parallelism();
+
 int64_t dist_now_unix();
