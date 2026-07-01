@@ -179,65 +179,74 @@ def sync_until_ready(model_id: str, max_rounds: int = 20) -> tuple[bool, str, di
     return ok, last_cov.get("state", ""), last_cov, time.time() - t0
 
 
-def run_scale_test(cfg: dict) -> dict:
+def run_scale_test(cfg: dict, generate_only: bool = False) -> dict:
     mid = cfg["model_id"]
     report: dict = {"model_id": mid, "label": cfg["label"], "timings": {}, "ok": False}
 
     log(f"\n{'='*60}\nScale test: {cfg['label']} ({mid})\n{'='*60}")
 
-    t = time.time()
-    http("POST", f"/models/{mid}/reset", {"keep_manifest": False}, timeout=180)
-    report["timings"]["reset_s"] = round(time.time() - t, 1)
+    if not generate_only:
+        t = time.time()
+        http("POST", f"/models/{mid}/reset", {"keep_manifest": False}, timeout=180)
+        report["timings"]["reset_s"] = round(time.time() - t, 1)
 
-    t = time.time()
-    http("POST", "/models/register", {
-        "model_id": mid,
-        "display_name": cfg["label"],
-        "source": "huggingface",
-        "repository": cfg["repository"],
-        "filename": cfg["filename"],
-        "revision": "main",
-    })
-    for step, path in [("discover", f"/models/{mid}/discover"), ("manifest", f"/models/{mid}/manifest")]:
-        status, out = http("POST", path, {}, timeout=300)
+        t = time.time()
+        http("POST", "/models/register", {
+            "model_id": mid,
+            "display_name": cfg["label"],
+            "source": "huggingface",
+            "repository": cfg["repository"],
+            "filename": cfg["filename"],
+            "revision": "main",
+        })
+        for step, path in [("discover", f"/models/{mid}/discover"), ("manifest", f"/models/{mid}/manifest")]:
+            status, out = http("POST", path, {}, timeout=300)
+            if status != 200:
+                report["error"] = f"{step}: {out}"
+                return report
+        report["timings"]["discover_manifest_s"] = round(time.time() - t, 1)
+
+        status, rec = http("GET", f"/models/{mid}", timeout=30)
+        rec = rec or {}
+        manifest = rec.get("manifest", {})
+        report["architecture"] = manifest.get("architecture", "?")
+        report["n_layer"] = manifest.get("n_layer", 0)
+        report["n_embd"] = manifest.get("n_embd", 0)
+        report["tensor_count"] = len(manifest.get("tensors", []))
+        log(f"  manifest: arch={report['architecture']} layers={report['n_layer']} "
+            f"embd={report['n_embd']} tensors={report['tensor_count']}")
+
+        t = time.time()
+        status, layout = http("POST", f"/models/{mid}/layout", {"force": True}, timeout=120)
         if status != 200:
-            report["error"] = f"{step}: {out}"
+            report["error"] = f"layout: {layout}"
             return report
-    report["timings"]["discover_manifest_s"] = round(time.time() - t, 1)
+        status, rec = http("GET", f"/models/{mid}", timeout=30)
+        rec = rec or {}
+        desired = (rec.get("layout") or {}).get("desired", {})
+        placements = desired.get("placements", [])
+        report["timings"]["layout_s"] = round(time.time() - t, 1)
+        report["placements"] = len(placements)
+        nodes_used = sorted({p.get("node", p.get("node_id", "")) for p in placements})
+        report["layout_nodes"] = nodes_used
+        mem_mb = desired.get("total_required_memory", layout.get("total_required_memory", 0)) // 1024 // 1024
+        report["total_required_memory_mb"] = mem_mb
+        log(f"  layout: {len(placements)} placements, nodes={nodes_used}, mem={mem_mb}MB")
 
-    status, rec = http("GET", f"/models/{mid}", timeout=30)
-    rec = rec or {}
-    manifest = rec.get("manifest", {})
-    report["architecture"] = manifest.get("architecture", "?")
-    report["n_layer"] = manifest.get("n_layer", 0)
-    report["n_embd"] = manifest.get("n_embd", 0)
-    report["tensor_count"] = len(manifest.get("tensors", []))
-    log(f"  manifest: arch={report['architecture']} layers={report['n_layer']} "
-        f"embd={report['n_embd']} tensors={report['tensor_count']}")
-
-    t = time.time()
-    status, layout = http("POST", f"/models/{mid}/layout", {"force": True}, timeout=120)
-    if status != 200:
-        report["error"] = f"layout: {layout}"
-        return report
-    status, rec = http("GET", f"/models/{mid}", timeout=30)
-    rec = rec or {}
-    desired = (rec.get("layout") or {}).get("desired", {})
-    placements = desired.get("placements", [])
-    report["timings"]["layout_s"] = round(time.time() - t, 1)
-    report["placements"] = len(placements)
-    nodes_used = sorted({p.get("node", p.get("node_id", "")) for p in placements})
-    report["layout_nodes"] = nodes_used
-    mem_mb = desired.get("total_required_memory", layout.get("total_required_memory", 0)) // 1024 // 1024
-    report["total_required_memory_mb"] = mem_mb
-    log(f"  layout: {len(placements)} placements, nodes={nodes_used}, mem={mem_mb}MB")
-
-    ok, detail, cov, sync_s = sync_until_ready(mid)
-    report["timings"]["sync_s"] = round(sync_s, 1)
-    report["coverage"] = cov
-    if not ok:
-        report["error"] = f"sync: {detail}"
-        return report
+        ok, detail, cov, sync_s = sync_until_ready(mid)
+        report["timings"]["sync_s"] = round(sync_s, 1)
+        report["coverage"] = cov
+        if not ok:
+            report["error"] = f"sync: {detail}"
+            return report
+    else:
+        log("  skip reset/sync — generate only (coverage must be READY)")
+        status, out = http("POST", f"/models/{mid}/coverage/refresh", timeout=120)
+        cov = coverage_from_refresh(out) if status == 200 else {}
+        if not layers_complete(cov):
+            report["error"] = f"coverage not ready: {cov.get('state', '?')}"
+            return report
+        report["coverage"] = cov
 
     t = time.time()
     status, out = http("POST", "/session/create", {"model": mid, "n_ctx": 512}, timeout=600)
@@ -280,6 +289,8 @@ def run_scale_test(cfg: dict) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="qwen3-8b")
+    parser.add_argument("--generate-only", action="store_true",
+                        help="Skip reset/sync; run session+generate on READY model")
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
@@ -296,7 +307,7 @@ def main() -> int:
         log(f"Unknown model: {args.model}")
         return 2
 
-    report = run_scale_test(cfg)
+    report = run_scale_test(cfg, generate_only=args.generate_only)
 
     log(f"\n{'='*60}\nRESULT: {'PASS' if report.get('ok') else 'FAIL'}")
     if report.get("error"):
