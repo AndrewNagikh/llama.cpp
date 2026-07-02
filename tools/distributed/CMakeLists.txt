@@ -9,6 +9,10 @@ set(DIST_TRANSPORT_SOURCES
     ${DIST_TRANSPORT_DIR}/split_tcp_wire.cpp
 )
 
+set(DIST_PLATFORM_SOURCES
+    dist_process.cpp
+)
+
 set(DIST_RUNTIME_DEBUG_SOURCES
     runtime_debug/runtime_debug.cpp
     runtime_debug/tensor_stats.cpp
@@ -129,6 +133,7 @@ set(DIST_INCLUDE_DIRS
 )
 
 set(NODE_AGENT_SOURCES
+    ${DIST_PLATFORM_SOURCES}
     dist_http_fetch.cpp
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
@@ -168,35 +173,46 @@ set(VERIFICATION_SOURCES
     verification/verification_suite.cpp
 )
 
+function(dist_link_platform_libs target)
+    if (WIN32)
+        target_link_libraries(${target} PRIVATE ws2_32)
+    endif()
+endfunction()
+
 function(dist_add_verify_exe name main_source)
     add_executable(${name} ${main_source} ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES} dist_common.cpp memory_estimator.cpp)
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(${name} PRIVATE cxx_std_17)
     target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
+    dist_link_platform_libs(${name})
 endfunction()
 
 function(dist_add_exe name main_source)
     add_executable(${name} ${main_source} ${DIST_COMMON_SOURCES} ${DIST_PLANNER_SOURCES})
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
+    dist_link_platform_libs(${name})
 endfunction()
 
 function(dist_add_exe_light name main_source)
     add_executable(${name} ${main_source} dist_common.cpp model_catalog.cpp ${DIST_PLANNER_SOURCES} ${DIST_BENCHMARK_SOURCES} ${NODE_AGENT_SOURCES})
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
+    dist_link_platform_libs(${name})
 endfunction()
 
 function(dist_add_test_exe name main_source)
     add_executable(${name} ${main_source} dist_common.cpp model_catalog.cpp ${DIST_PLANNER_SOURCES} ${DIST_TRANSPORT_SOURCES})
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
+    dist_link_platform_libs(${name})
 endfunction()
 
 function(dist_add_worker name main_source)
     add_executable(${name} ${main_source} ${DIST_TRANSPORT_SOURCES} ${DIST_RUNTIME_DEBUG_SOURCES})
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common Threads::Threads)
+    dist_link_platform_libs(${name})
 endfunction()
 
 dist_add_exe_light(node_agent node_agent.cpp)
@@ -204,6 +220,7 @@ target_sources(node_agent PRIVATE ${DIST_TRANSPORT_SOURCES} ${DIST_RUNTIME_DEBUG
     verification/worker_verify.cpp)
 dist_add_exe(orchestrator orchestrator.cpp)
 target_sources(orchestrator PRIVATE
+    ${DIST_PLATFORM_SOURCES}
     dist_http_fetch.cpp
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
@@ -316,7 +333,7 @@ if (LLAMA_BUILD_TESTS)
     dist_add_test_exe(test-split-materialized-2stage test-split-materialized-2stage.cpp)
     target_sources(test-split-materialized-2stage PRIVATE ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES})
 
-    add_executable(test-node-benchmark test-node-benchmark.cpp ${DIST_BENCHMARK_SOURCES})
+    add_executable(test-node-benchmark test-node-benchmark.cpp ${DIST_PLATFORM_SOURCES} ${DIST_BENCHMARK_SOURCES})
     target_include_directories(test-node-benchmark PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-node-benchmark PRIVATE llama llama-common Threads::Threads)
 
@@ -606,6 +623,7 @@ if (LLAMA_BUILD_TESTS)
     target_link_libraries(test-install-plan-update PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
 
     set(SYNC_AGENT_SOURCES
+        ${DIST_PLATFORM_SOURCES}
         dist_http_fetch.cpp
         node_agent/layer_store/layer_store.cpp
         node_agent/layer_store/layer_checksum.cpp

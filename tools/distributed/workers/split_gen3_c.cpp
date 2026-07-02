@@ -14,15 +14,12 @@
 #include <cstring>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
-
 static void usage(const char * prog) {
     fprintf(stderr, "usage: %s MODEL --bc-port PORT [--layer-start N]\n", prog);
 }
 
 int main(int argc, char ** argv) {
+    split_tcp_init();
     if (argc < 2) {
         usage(argv[0]);
         return 1;
@@ -89,9 +86,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "gen3_c: waiting bc_port=%d layer_start=%d\n", bc_port, layer_start);
 
     const int bc_fd = split_tcp_accept(listen_fd);
-#if !defined(_WIN32)
-    close(listen_fd);
-#endif
+    split_tcp_close(listen_fd);
     if (bc_fd < 0) {
         fprintf(stderr, "gen3_c: accept failed\n");
         return 1;
@@ -199,9 +194,7 @@ int main(int argc, char ** argv) {
         debug_step++;
     }
 
-#if !defined(_WIN32)
-    close(bc_fd);
-#endif
+    split_tcp_close(bc_fd);
 
     llama_sampler_free(smpl);
     llama_free(ctx);

@@ -14,10 +14,6 @@
 #include <cstring>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
-
 static void usage(const char * prog) {
     fprintf(stderr, "usage: %s MODEL --ctrl-port PORT --b-port PORT [--layer-end N]\n", prog);
 }
@@ -95,6 +91,7 @@ static bool forward_to_peer(
 }
 
 int main(int argc, char ** argv) {
+    split_tcp_init();
     if (argc < 2) {
         usage(argv[0]);
         return 1;
@@ -175,9 +172,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "gen3_a: ready ctrl_port=%d layer_end=%d\n", ctrl_port, layer_end);
 
     const int ctrl_fd = split_tcp_accept(listen_fd);
-#if !defined(_WIN32)
-    close(listen_fd);
-#endif
+    split_tcp_close(listen_fd);
     if (ctrl_fd < 0) {
         fprintf(stderr, "gen3_a: ctrl accept failed\n");
         return 1;
@@ -282,10 +277,8 @@ int main(int argc, char ** argv) {
         debug_step++;
     }
 
-#if !defined(_WIN32)
-    close(ctrl_fd);
-    close(b_fd);
-#endif
+    split_tcp_close(ctrl_fd);
+    split_tcp_close(b_fd);
 
     llama_free(ctx);
     llama_model_free(model);

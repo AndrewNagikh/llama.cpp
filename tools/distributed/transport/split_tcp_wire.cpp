@@ -5,10 +5,14 @@
 #include <cstring>
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 typedef int socklen_t;
+static bool g_wsa_started = false;
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -17,6 +21,28 @@ typedef int socklen_t;
 #include <sys/time.h>
 #include <unistd.h>
 #endif
+
+void split_tcp_init() {
+#if defined(_WIN32)
+    if (!g_wsa_started) {
+        WSADATA wsa{};
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
+            g_wsa_started = true;
+        }
+    }
+#endif
+}
+
+void split_tcp_close(const int fd) {
+    if (fd < 0) {
+        return;
+    }
+#if defined(_WIN32)
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+}
 
 static bool io_send_all(int fd, const void * data, size_t size) {
     auto * base = (const uint8_t *) data;
@@ -78,6 +104,7 @@ bool split_tcp_recv_all(int fd, void * data, size_t size) {
 }
 
 int split_tcp_listen_host(const char * host, int port) {
+    split_tcp_init();
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
@@ -95,23 +122,17 @@ int split_tcp_listen_host(const char * host, int port) {
     } else if (strcmp(host, "0.0.0.0") == 0 || strcmp(host, "*") == 0) {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     } else if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-#if !defined(_WIN32)
-        close(fd);
-#endif
+        split_tcp_close(fd);
         return -1;
     }
 
     if (bind(fd, (sockaddr *) &addr, sizeof(addr)) != 0) {
-#if !defined(_WIN32)
-        close(fd);
-#endif
+        split_tcp_close(fd);
         return -1;
     }
 
     if (listen(fd, 8) != 0) {
-#if !defined(_WIN32)
-        close(fd);
-#endif
+        split_tcp_close(fd);
         return -1;
     }
 
@@ -163,11 +184,7 @@ int split_tcp_connect(const char * host, int port) {
             return fd;
         }
 
-#if !defined(_WIN32)
-        close(fd);
-#else
-        closesocket(fd);
-#endif
+        split_tcp_close(fd);
         fd = -1;
     }
 
@@ -176,16 +193,19 @@ int split_tcp_connect(const char * host, int port) {
 }
 
 int split_tcp_connect_retry(const char * host, int port, int retries, int delay_ms) {
+    split_tcp_init();
     for (int i = 0; i < retries; ++i) {
         const int fd = split_tcp_connect(host, port);
         if (fd >= 0) {
             return fd;
         }
-#if !defined(_WIN32)
         if (i + 1 < retries) {
+#if defined(_WIN32)
+            Sleep((DWORD) delay_ms);
+#else
             usleep((useconds_t) delay_ms * 1000);
-        }
 #endif
+        }
     }
     return -1;
 }

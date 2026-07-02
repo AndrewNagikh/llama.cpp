@@ -1,6 +1,7 @@
 #include "dist_http_fetch.h"
 
 #include "dist_common.h"
+#include "dist_process.h"
 
 #include "httplib.h"
 
@@ -163,6 +164,11 @@ static bool httplib_range_get(
 #endif
 
 #if !defined(_WIN32)
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 static bool curl_range_get(
         const std::string & url,
         const uint64_t offset,
@@ -178,71 +184,28 @@ static bool curl_range_get(
             static_cast<unsigned long long>(offset + length - 1));
 
     const std::string token = dist_hf_token();
-    std::string auth_hdr;
+    std::vector<std::string> argv = {
+        "curl", "-sfL", "--max-time", "900", "--range", range_buf,
+        "-H", "User-Agent: distributed-llama-node-agent/0.1",
+    };
     if (!token.empty()) {
-        auth_hdr = "Authorization: Bearer " + token;
+        argv.push_back("-H");
+        argv.push_back("Authorization: Bearer " + token);
     }
+    argv.push_back(url);
 
-    int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        return false;
-    }
+#if defined(_WIN32)
+    argv[0] = "curl.exe";
+#endif
 
-    const pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return false;
-    }
-
-    if (pid == 0) {
-        close(pipefd[0]);
-        if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
-            _exit(127);
-        }
-        close(pipefd[1]);
-
-        if (token.empty()) {
-            const char * argv[] = {
-                "curl", "-sfL", "--max-time", "900", "--range", range_buf,
-                "-H", "User-Agent: distributed-llama-node-agent/0.1",
-                url.c_str(), nullptr,
-            };
-            execvp("curl", const_cast<char * const *>(argv));
-        } else {
-            const char * argv[] = {
-                "curl", "-sfL", "--max-time", "900", "--range", range_buf,
-                "-H", "User-Agent: distributed-llama-node-agent/0.1",
-                "-H", auth_hdr.c_str(),
-                url.c_str(), nullptr,
-            };
-            execvp("curl", const_cast<char * const *>(argv));
-        }
-        _exit(127);
-    }
-
-    close(pipefd[1]);
-    out.clear();
-    out.reserve(static_cast<size_t>(length));
-
-    char buf[65536];
-    ssize_t nread = 0;
-    while ((nread = read(pipefd[0], buf, sizeof(buf))) > 0) {
-        out.insert(out.end(), buf, buf + nread);
-    }
-    close(pipefd[0]);
-
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        return false;
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    std::string err;
+    const int rc = dist_process_run_capture_stdout(argv, out, err);
+    if (rc != 0) {
         out.clear();
         return false;
     }
     return out.size() >= length;
 }
-#endif
 
 } // namespace
 
@@ -269,11 +232,6 @@ bool dist_http_get_range(
     }
 #endif
 
-#if !defined(_WIN32)
     fprintf(stderr, "node_agent: HTTPS via curl fallback (%s)\n", parsed.host.c_str());
     return curl_range_get(url, offset, length, out);
-#else
-    (void) parsed;
-    return false;
-#endif
 }

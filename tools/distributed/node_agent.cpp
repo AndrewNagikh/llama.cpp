@@ -1,4 +1,5 @@
 #include "dist_common.h"
+#include "dist_process.h"
 #include "model_catalog.h"
 #include "node_benchmark.h"
 #include "node_agent/layer_store/layer_store.h"
@@ -35,12 +36,6 @@
 #include <thread>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <signal.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
-
 using json = nlohmann::json;
 
 static std::string g_model_path;
@@ -48,9 +43,9 @@ static std::string g_node_id;
 static int32_t g_n_layer = 0;
 static int32_t g_n_embd  = 0;
 static BenchmarkResult g_benchmark{};
-static pid_t g_entry_worker_pid  = 0;
-static pid_t g_middle_worker_pid = 0;
-static pid_t g_final_worker_pid  = 0;
+static dist_child_process g_entry_worker{};
+static dist_child_process g_middle_worker{};
+static dist_child_process g_final_worker{};
 static int g_pipeline_ctrl_port = 0;
 static int g_pipeline_layer_end = 0;
 static model_store g_model_store;
@@ -123,7 +118,7 @@ static bool parse_args(int argc, char ** argv, std::string & listen, std::string
         } else if (strcmp(argv[i], "--rebenchmark") == 0) {
             rebenchmark = true;
         } else if (strcmp(argv[i], "--distributed-debug") == 0) {
-            setenv("LLAMA_DISTRIBUTED_DEBUG", "1", 1);
+            dist_set_env("LLAMA_DISTRIBUTED_DEBUG", "1");
         } else {
             return false;
         }
@@ -131,8 +126,8 @@ static bool parse_args(int argc, char ** argv, std::string & listen, std::string
     if (g_models_dir.empty()) {
         if (const char * env = std::getenv("MODELS_DIR")) {
             g_models_dir = env;
-        } else if (const char * home = std::getenv("HOME")) {
-            g_models_dir = std::string(home) + "/.distributed-llm/models";
+        } else {
+            g_models_dir = dist_home_dir() + "/.distributed-llm/models";
         }
     }
     return !listen.empty() && !orchestrator.empty();
@@ -179,7 +174,7 @@ static void start_model_download(
                  downloader_script = std::move(downloader_script)]() {
         const std::string progress_path = output_path + ".progress.json";
         const std::string command =
-                "python3 " + shell_quote(downloader_script) +
+                dist_python_cmd() + " " + shell_quote(downloader_script) +
                 " --repo " + shell_quote(repo) +
                 " --file " + shell_quote(file) +
                 " --output " + shell_quote(output_path) +
@@ -325,25 +320,23 @@ static bool register_with_orchestrator(
     return true;
 }
 
-#if !defined(_WIN32)
-
-static pid_t * worker_pid_slot(const dist_node_role role) {
+static dist_child_process * worker_proc_slot(const dist_node_role role) {
     switch (role) {
-        case DIST_ROLE_ENTRY:  return &g_entry_worker_pid;
-        case DIST_ROLE_MIDDLE: return &g_middle_worker_pid;
-        case DIST_ROLE_FINAL:  return &g_final_worker_pid;
+        case DIST_ROLE_ENTRY:  return &g_entry_worker;
+        case DIST_ROLE_MIDDLE: return &g_middle_worker;
+        case DIST_ROLE_FINAL:  return &g_final_worker;
         default:               return nullptr;
     }
 }
 
 static void stop_worker_for_role(const dist_node_role role) {
-    pid_t * slot = worker_pid_slot(role);
-    if (!slot || *slot <= 0) {
+    dist_child_process * slot = worker_proc_slot(role);
+    if (!slot || slot->pid == 0) {
         return;
     }
-    kill(*slot, SIGTERM);
-    waitpid(*slot, nullptr, 0);
-    *slot = 0;
+    dist_process_kill(*slot);
+    dist_process_reap(*slot);
+    *slot = {};
     if (role == DIST_ROLE_ENTRY) {
         g_pipeline_ctrl_port = 0;
         g_pipeline_layer_end = 0;
@@ -398,7 +391,7 @@ static bool run_local_pipeline_generate(
     }
     if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_RESET, 0, 0, layer_end, nullptr, resp)) {
         err = "reset failed";
-        close(ctrl_fd);
+        split_tcp_close(ctrl_fd);
         return false;
     }
 
@@ -408,13 +401,13 @@ static bool run_local_pipeline_generate(
     if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_PREFILL, (int32_t) prompt_tokens.size(), 0,
             layer_end, prompt_tokens.data(), resp)) {
         err = "prefill failed";
-        close(ctrl_fd);
+        split_tcp_close(ctrl_fd);
         return false;
     }
 
     if (resp.token_id < 0) {
         err = "prefill returned error from pipeline";
-        close(ctrl_fd);
+        split_tcp_close(ctrl_fd);
         return false;
     }
 
@@ -434,12 +427,12 @@ static bool run_local_pipeline_generate(
         }
         if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur, resp)) {
             err = "decode failed at step " + std::to_string(step);
-            close(ctrl_fd);
+            split_tcp_close(ctrl_fd);
             return false;
         }
         if (resp.token_id < 0) {
             err = "pipeline error at step " + std::to_string(step);
-            close(ctrl_fd);
+            split_tcp_close(ctrl_fd);
             return false;
         }
         cur = resp.token_id;
@@ -451,7 +444,7 @@ static bool run_local_pipeline_generate(
     }
 
     pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_SHUTDOWN, 0, 0, layer_end, nullptr, resp);
-    close(ctrl_fd);
+    split_tcp_close(ctrl_fd);
     return true;
 }
 
@@ -467,12 +460,13 @@ static bool start_worker(
         return false;
     }
 
-    const std::string dir = agent_bin;
+    const std::string suffix = dist_exe_suffix();
+    const std::string dir    = agent_bin;
     std::string bin;
     std::vector<std::string> args;
 
     if (cfg.role == DIST_ROLE_ENTRY) {
-        bin = dir + "split_gen3_a";
+        bin = dist_join_path(dir, "split_gen3_a" + suffix);
         args = {
             bin, model_path,
             "--ctrl-port", std::to_string(cfg.ctrl_port),
@@ -485,7 +479,7 @@ static bool start_worker(
             args.push_back("--next-final");
         }
     } else if (cfg.role == DIST_ROLE_MIDDLE) {
-        bin = dir + "split_gen3_b";
+        bin = dist_join_path(dir, "split_gen3_b" + suffix);
         args = {
             bin, model_path,
             "--ab-port", std::to_string(cfg.peer_port),
@@ -496,7 +490,7 @@ static bool start_worker(
             "--bind", cfg.peer_bind,
         };
     } else if (cfg.role == DIST_ROLE_FINAL) {
-        bin = dir + "split_gen3_c";
+        bin = dist_join_path(dir, "split_gen3_c" + suffix);
         args = {
             bin, model_path,
             "--bc-port", std::to_string(cfg.peer_port),
@@ -508,43 +502,30 @@ static bool start_worker(
         return false;
     }
 
-    const pid_t pid = fork();
-    if (pid < 0) {
-        err = "fork failed";
+    if (dist_debug_enabled()) {
+        dist_set_env("LLAMA_DISTRIBUTED_DEBUG", "1");
+        if (!cfg.session_id.empty()) {
+            dist_set_env("LLAMA_DIST_SESSION_ID", cfg.session_id.c_str());
+        }
+        dist_set_env("LLAMA_DIST_WORKER_ID", dist_role_name(cfg.role).c_str());
+        dist_set_env("LLAMA_DIST_NODE_ID", g_node_id.c_str());
+        if (!g_models_dir.empty()) {
+            const std::string trace_dir = g_models_dir + "/traces";
+            dist_set_env("LLAMA_DIST_TRACE_DIR", trace_dir.c_str());
+        }
+    }
+
+    dist_child_process child{};
+    if (!dist_process_spawn(args, child, err)) {
         return false;
     }
 
-    if (pid == 0) {
-        if (dist_debug_enabled()) {
-            setenv("LLAMA_DISTRIBUTED_DEBUG", "1", 1);
-            if (!cfg.session_id.empty()) {
-                setenv("LLAMA_DIST_SESSION_ID", cfg.session_id.c_str(), 1);
-            }
-            setenv("LLAMA_DIST_WORKER_ID", dist_role_name(cfg.role).c_str(), 1);
-            setenv("LLAMA_DIST_NODE_ID", g_node_id.c_str(), 1);
-            if (!g_models_dir.empty()) {
-                const std::string trace_dir = g_models_dir + "/traces";
-                setenv("LLAMA_DIST_TRACE_DIR", trace_dir.c_str(), 1);
-            }
-        }
-        std::vector<char *> cargs;
-        cargs.reserve(args.size() + 1);
-        for (auto & a : args) {
-            cargs.push_back(a.data());
-        }
-        cargs.push_back(nullptr);
-        execv(cargs[0], cargs.data());
-        _exit(127);
+    if (dist_child_process * slot = worker_proc_slot(cfg.role)) {
+        *slot = child;
     }
-
-    if (pid_t * slot = worker_pid_slot(cfg.role)) {
-        *slot = pid;
-    }
-    usleep(300000);
+    dist_sleep_ms(300);
     return true;
 }
-
-#endif
 
 static worker_role dist_role_to_worker_role(const dist_node_role role) {
     switch (role) {
@@ -646,6 +627,7 @@ int main(int argc, char ** argv) {
 
     dist_debug_load_config();
     dist_debug_set_worker("node_agent", g_node_id);
+    split_tcp_init();
 
     if (!g_model_path.empty()) {
         fprintf(stderr, "node_agent: running benchmark on %s\n", g_model_path.c_str());
@@ -743,21 +725,16 @@ int main(int argc, char ** argv) {
     svr.Get("/status", [](const httplib::Request &, httplib::Response & res) {
         res.set_content(json({
             { "node_id", g_node_id },
-            { "worker_pid", (int) g_entry_worker_pid },
+            { "worker_pid", (int) g_entry_worker.pid },
             { "workers", {
-                { "entry", (int) g_entry_worker_pid },
-                { "middle", (int) g_middle_worker_pid },
-                { "final", (int) g_final_worker_pid },
+                { "entry", (int) g_entry_worker.pid },
+                { "middle", (int) g_middle_worker.pid },
+                { "final", (int) g_final_worker.pid },
             }},
         }).dump(), "application/json");
     });
 
     svr.Post("/configure", [agent_bin](const httplib::Request & req, httplib::Response & res) {
-#if defined(_WIN32)
-        res.status = 501;
-        res.set_content(R"({"error":"configure unsupported on Windows"})", "application/json");
-        return;
-#else
         json body;
         try {
             body = json::parse(req.body);
@@ -806,17 +783,11 @@ int main(int argc, char ** argv) {
         res.set_content(json({
             { "ok", true },
             { "role", dist_role_name(cfg.role) },
-            { "worker_pid", (int) (worker_pid_slot(cfg.role) ? *worker_pid_slot(cfg.role) : 0) },
+            { "worker_pid", (int) (worker_proc_slot(cfg.role) ? worker_proc_slot(cfg.role)->pid : 0) },
         }).dump(), "application/json");
-#endif
     });
 
     svr.Post("/pipeline/generate", [](const httplib::Request & req, httplib::Response & res) {
-#if defined(_WIN32)
-        res.status = 501;
-        res.set_content(R"({"ok":false,"error":"pipeline generate unsupported on Windows"})", "application/json");
-        return;
-#else
         json body;
         try {
             body = json::parse(req.body);
@@ -861,13 +832,10 @@ int main(int argc, char ** argv) {
             tokens_json.push_back(t);
         }
         res.set_content(json({ { "ok", true }, { "tokens", tokens_json } }).dump(), "application/json");
-#endif
     });
 
     svr.Post("/shutdown", [](const httplib::Request &, httplib::Response & res) {
-#if !defined(_WIN32)
         stop_all_workers();
-#endif
         res.set_content(R"({"ok":true})", "application/json");
     });
 
@@ -1173,14 +1141,10 @@ int main(int argc, char ** argv) {
 
     if (!svr.listen(bind_host.c_str(), http_port)) {
         fprintf(stderr, "node_agent: failed to bind %s:%d\n", bind_host.c_str(), http_port);
-#if !defined(_WIN32)
         stop_all_workers();
-#endif
         return 1;
     }
 
-#if !defined(_WIN32)
     stop_all_workers();
-#endif
     return 0;
 }

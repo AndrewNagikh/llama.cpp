@@ -1,6 +1,7 @@
 #include "node_benchmark.h"
 
 #include "dist_common.h"
+#include "dist_process.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "llama.h"
@@ -16,10 +17,7 @@
 #include <thread>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
+#include <filesystem>
 
 using json = nlohmann::json;
 
@@ -28,11 +26,7 @@ float dist_compute_benchmark_score(const float decode_tps, const float prefill_t
 }
 
 std::string dist_benchmark_cache_path() {
-    const char * home = std::getenv("HOME");
-    if (home == nullptr || home[0] == '\0') {
-        return ".distributed-llm/benchmark.json";
-    }
-    return std::string(home) + "/.distributed-llm/benchmark.json";
+    return dist_home_dir() + "/.distributed-llm/benchmark.json";
 }
 
 std::string dist_compute_model_hash(const std::string & model_path) {
@@ -54,15 +48,17 @@ std::string dist_compute_model_hash(const std::string & model_path) {
         }
     }
 
-#if !defined(_WIN32)
-    struct stat st{};
-    if (stat(model_path.c_str(), &st) == 0) {
-        hash ^= static_cast<uint64_t>(st.st_size);
+    std::error_code ec;
+    const auto fsize = std::filesystem::file_size(model_path, ec);
+    if (!ec) {
+        hash ^= static_cast<uint64_t>(fsize);
         hash *= prime;
-        hash ^= static_cast<uint64_t>(st.st_mtime);
-        hash *= prime;
+        const auto mtime = std::filesystem::last_write_time(model_path, ec);
+        if (!ec) {
+            hash ^= static_cast<uint64_t>(mtime.time_since_epoch().count());
+            hash *= prime;
+        }
     }
-#endif
 
     char out[32];
     snprintf(out, sizeof(out), "%016llx", (unsigned long long) hash);
@@ -70,17 +66,14 @@ std::string dist_compute_model_hash(const std::string & model_path) {
 }
 
 static bool ensure_cache_dir(const std::string & path) {
-    const auto slash = path.rfind('/');
+    const auto slash = path.find_last_of("/\\");
     if (slash == std::string::npos) {
         return true;
     }
     const std::string dir = path.substr(0, slash);
-#if !defined(_WIN32)
-    if (mkdir(dir.c_str(), 0755) == 0 || errno == EEXIST) {
-        return true;
-    }
-#endif
-    return false;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return !ec;
 }
 
 bool dist_load_benchmark_cache(const std::string & model_path, BenchmarkResult & out) {

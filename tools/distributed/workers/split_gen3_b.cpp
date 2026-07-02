@@ -14,10 +14,6 @@
 #include <cstring>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
-
 static void usage(const char * prog) {
     fprintf(stderr, "usage: %s MODEL --ab-port PORT --bc-port PORT [--layer-start N] [--layer-end N]\n", prog);
 }
@@ -127,6 +123,7 @@ static bool run_b_layers(
 }
 
 int main(int argc, char ** argv) {
+    split_tcp_init();
     if (argc < 2) {
         usage(argv[0]);
         return 1;
@@ -206,9 +203,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "gen3_b: ready ab_port=%d layer=[%d,%d)\n", ab_port, layer_start, layer_end);
 
     const int ab_fd = split_tcp_accept(listen_fd);
-#if !defined(_WIN32)
-    close(listen_fd);
-#endif
+    split_tcp_close(listen_fd);
     if (ab_fd < 0) {
         fprintf(stderr, "gen3_b: accept failed\n");
         return 1;
@@ -303,10 +298,8 @@ int main(int argc, char ** argv) {
         debug_step++;
     }
 
-#if !defined(_WIN32)
-    close(ab_fd);
-    close(bc_fd);
-#endif
+    split_tcp_close(ab_fd);
+    split_tcp_close(bc_fd);
 
     llama_free(ctx);
     llama_model_free(model);

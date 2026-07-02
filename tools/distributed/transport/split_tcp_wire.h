@@ -61,6 +61,9 @@ struct split_tcp_perf {
     size_t nbytes     = 0;
 };
 
+void split_tcp_init();
+void split_tcp_close(int fd);
+
 int  split_tcp_listen(int port);
 int  split_tcp_listen_host(const char * host, int port);
 int  split_tcp_accept(int listen_fd);
