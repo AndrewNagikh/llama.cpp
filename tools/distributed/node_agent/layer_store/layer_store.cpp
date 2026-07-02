@@ -303,20 +303,29 @@ std::filesystem::path layer_store::blobs_dir() const {
     return model_root() / "blobs";
 }
 
-std::string layer_store::safe_tensor_filename(const std::string & tensor_name) {
-    std::string safe = tensor_name;
+std::string layer_store::safe_path_component(const std::string & name) {
+    std::string safe = name;
     for (char & c : safe) {
+#if defined(_WIN32)
+        if (c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+            c = '_';
+        }
+#endif
         if (c == '/' || c == '\\') {
             c = '_';
         }
     }
-    return safe + ".bin";
+    return safe;
+}
+
+std::string layer_store::safe_tensor_filename(const std::string & tensor_name) {
+    return safe_path_component(tensor_name) + ".bin";
 }
 
 std::filesystem::path layer_store::blob_tensor_path(
         const std::string & blob_id,
         const std::string & tensor_name) const {
-    return blobs_dir() / blob_id / safe_tensor_filename(tensor_name);
+    return blobs_dir() / safe_path_component(blob_id) / safe_tensor_filename(tensor_name);
 }
 
 bool layer_store::store_blob_tensor(
@@ -331,7 +340,7 @@ bool layer_store::store_blob_tensor(
     }
 
     std::error_code ec;
-    std::filesystem::create_directories(blobs_dir() / blob_id, ec);
+    std::filesystem::create_directories(blobs_dir() / safe_path_component(blob_id), ec);
     if (ec) {
         return false;
     }
@@ -359,7 +368,7 @@ bool layer_store::store_blob_tensor(
         { "offset_end", offset_begin + len },
         { "size_bytes", len },
         { "checksum", stored_checksum },
-        { "path", (std::filesystem::path("blobs") / blob_id / safe_tensor_filename(tensor_name)).string() },
+        { "path", (std::filesystem::path("blobs") / safe_path_component(blob_id) / safe_tensor_filename(tensor_name)).string() },
     };
     return save_checksums(checksums);
 }

@@ -23,6 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 ENV_FILE = ROOT / ".env"
+REPO_ENV_FILE = Path(__file__).resolve().parents[4] / ".env"
 
 ORCH = os.environ.get("ORCHESTRATOR", "http://127.0.0.1:9000")
 
@@ -49,6 +50,14 @@ MODELS = [
         "family": "qwen",
         "repository": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
         "filename": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        "full_e2e": True,
+    },
+    {
+        "label": "Qwen3-8B",
+        "model_id": "qwen3-8b",
+        "family": "qwen",
+        "repository": "unsloth/Qwen3-8B-GGUF",
+        "filename": "Qwen3-8B-Q4_K_M.gguf",
         "full_e2e": True,
     },
     {
@@ -93,8 +102,10 @@ def log(msg: str) -> None:
 def load_hf_token() -> None:
     if os.environ.get("HF_TOKEN"):
         return
-    if ENV_FILE.is_file():
-        for line in ENV_FILE.read_text().splitlines():
+    for path in (ENV_FILE, REPO_ENV_FILE):
+        if not path.is_file():
+            continue
+        for line in path.read_text().splitlines():
             if line.strip().startswith("HF_TOKEN="):
                 os.environ["HF_TOKEN"] = line.split("=", 1)[1].strip()
                 return

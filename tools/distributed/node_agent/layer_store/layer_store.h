@@ -99,5 +99,6 @@ private:
     bool save_checksums(const nlohmann::json & checksums) const;
     nlohmann::json load_checksums() const;
     static std::string layer_filename(int32_t layer_index);
+    static std::string safe_path_component(const std::string & name);
     static std::string safe_tensor_filename(const std::string & tensor_name);
 };

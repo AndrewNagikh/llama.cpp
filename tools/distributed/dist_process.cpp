@@ -120,6 +120,50 @@ static std::string build_win_command_line(const std::vector<std::string> & argv)
     return oss.str();
 }
 
+static std::string dist_resolve_win_executable(const std::string & exe) {
+    if (exe.find('\\') != std::string::npos || exe.find('/') != std::string::npos) {
+        return exe;
+    }
+    const char * path_env = std::getenv("PATH");
+    if (!path_env) {
+        return exe;
+    }
+    std::string path = path_env;
+    for (size_t start = 0; start < path.size();) {
+        const size_t end = path.find(';', start);
+        std::string dir  = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!dir.empty()) {
+            const std::string candidate = dist_join_path(dir, exe);
+            const DWORD attr = GetFileAttributesA(candidate.c_str());
+            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                return candidate;
+            }
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    const std::string system32 = dist_join_path(
+            std::getenv("WINDIR") ? std::getenv("WINDIR") : "C:\\Windows",
+            "System32");
+    const std::string system_curl = dist_join_path(system32, exe);
+    const DWORD sys_attr = GetFileAttributesA(system_curl.c_str());
+    if (sys_attr != INVALID_FILE_ATTRIBUTES && !(sys_attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        return system_curl;
+    }
+    return exe;
+}
+
+static std::vector<std::string> dist_resolve_win_argv(const std::vector<std::string> & argv) {
+    if (argv.empty()) {
+        return argv;
+    }
+    std::vector<std::string> resolved = argv;
+    resolved[0] = dist_resolve_win_executable(argv[0]);
+    return resolved;
+}
+
 bool dist_process_spawn(
         const std::vector<std::string> & argv,
         dist_child_process & out,
@@ -130,7 +174,8 @@ bool dist_process_spawn(
         return false;
     }
 
-    std::string cmdline = build_win_command_line(argv);
+    std::vector<std::string> win_argv = dist_resolve_win_argv(argv);
+    std::string cmdline = build_win_command_line(win_argv);
     std::vector<char> cmdline_buf(cmdline.begin(), cmdline.end());
     cmdline_buf.push_back('\0');
 
@@ -139,7 +184,7 @@ bool dist_process_spawn(
     PROCESS_INFORMATION pi{};
 
     if (!CreateProcessA(
-            argv[0].c_str(),
+            win_argv[0].c_str(),
             cmdline_buf.data(),
             nullptr,
             nullptr,
@@ -202,7 +247,8 @@ int dist_process_run_capture_stdout(
     }
     SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
 
-    std::string cmdline = build_win_command_line(argv);
+    std::vector<std::string> win_argv = dist_resolve_win_argv(argv);
+    std::string cmdline = build_win_command_line(win_argv);
     std::vector<char> cmdline_buf(cmdline.begin(), cmdline.end());
     cmdline_buf.push_back('\0');
 
@@ -215,7 +261,7 @@ int dist_process_run_capture_stdout(
 
     PROCESS_INFORMATION pi{};
     if (!CreateProcessA(
-            argv[0].c_str(),
+            win_argv[0].c_str(),
             cmdline_buf.data(),
             nullptr,
             nullptr,

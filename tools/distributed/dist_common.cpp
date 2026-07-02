@@ -1,4 +1,5 @@
 #include "dist_common.h"
+#include "dist_process.h"
 
 #include "ggml-backend.h"
 #include "nlohmann/json.hpp"
@@ -419,11 +420,20 @@ std::string dist_hf_token() {
     }
 
     const char * home = std::getenv("HOME");
+#if defined(_WIN32)
+    if (!home) {
+        home = std::getenv("USERPROFILE");
+    }
+#endif
     if (!home) {
         return {};
     }
 
+#if defined(_WIN32)
+    const std::string path = dist_join_path(dist_join_path(home, ".cache"), "huggingface\\token");
+#else
     const std::string path = std::string(home) + "/.cache/huggingface/token";
+#endif
     std::ifstream in(path);
     if (!in) {
         return {};

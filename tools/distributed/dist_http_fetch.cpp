@@ -13,7 +13,12 @@
 #include <string>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -192,19 +197,86 @@ static bool curl_range_get(
         argv.push_back("-H");
         argv.push_back("Authorization: Bearer " + token);
     }
-    argv.push_back(url);
 
 #if defined(_WIN32)
     argv[0] = "curl.exe";
-#endif
+
+    char temp_dir[MAX_PATH] = {};
+    char temp_file[MAX_PATH] = {};
+    if (GetTempPathA(MAX_PATH, temp_dir) == 0) {
+        fprintf(stderr, "node_agent: curl temp path failed\n");
+        return false;
+    }
+    if (GetTempFileNameA(temp_dir, "nag", 0, temp_file) == 0) {
+        fprintf(stderr, "node_agent: curl temp file failed\n");
+        return false;
+    }
+    argv.push_back("-o");
+    argv.push_back(temp_file);
+    argv.push_back(url);
+
+    std::vector<uint8_t> discard;
+    std::string err;
+    const int rc = dist_process_run_capture_stdout(argv, discard, err);
+    if (rc != 0) {
+        DeleteFileA(temp_file);
+        fprintf(stderr,
+                "node_agent: curl range fetch failed rc=%d err=%s\n",
+                rc,
+                err.empty() ? "(none)" : err.c_str());
+        out.clear();
+        return false;
+    }
+
+    std::ifstream in(temp_file, std::ios::binary | std::ios::ate);
+    DeleteFileA(temp_file);
+    if (!in) {
+        fprintf(stderr, "node_agent: curl temp read failed\n");
+        out.clear();
+        return false;
+    }
+    const std::streamoff file_size = in.tellg();
+    if (file_size < static_cast<std::streamoff>(length)) {
+        fprintf(stderr,
+                "node_agent: curl short read got=%lld want=%llu\n",
+                static_cast<long long>(file_size),
+                static_cast<unsigned long long>(length));
+        out.clear();
+        return false;
+    }
+    in.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(length));
+    in.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(length));
+    if (!in) {
+        fprintf(stderr, "node_agent: curl temp read incomplete\n");
+        out.clear();
+        return false;
+    }
+    return true;
+#else
+    argv.push_back(url);
 
     std::string err;
     const int rc = dist_process_run_capture_stdout(argv, out, err);
     if (rc != 0) {
+        fprintf(stderr,
+                "node_agent: curl range fetch failed rc=%d bytes=%zu err=%s\n",
+                rc,
+                out.size(),
+                err.empty() ? "(none)" : err.c_str());
         out.clear();
         return false;
     }
-    return out.size() >= length;
+    if (out.size() < length) {
+        fprintf(stderr,
+                "node_agent: curl short read got=%zu want=%llu\n",
+                out.size(),
+                static_cast<unsigned long long>(length));
+        out.clear();
+        return false;
+    }
+    return true;
+#endif
 }
 
 } // namespace
