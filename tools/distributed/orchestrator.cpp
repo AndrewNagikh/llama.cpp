@@ -1,4 +1,5 @@
 #include "dist_common.h"
+#include "dist_rss_probe.h"
 #include "layer_planner.h"
 #include "memory_estimator.h"
 #include "model_catalog.h"
@@ -107,13 +108,18 @@ static llama_model * session_get_tokenizer(
     if (!tokenizer_usable(tokenizer_path)) {
         return nullptr;
     }
-    llama_model * model = llama_model_load_from_file(tokenizer_path.c_str(), llama_model_default_params());
+    dist_rss_log_stage("tokenizer_load_before", record ? record->model_id.c_str() : nullptr);
+    llama_model_params mparams = llama_model_default_params();
+    llama_model * model = llama_model_load_from_file(tokenizer_path.c_str(), mparams);
+    dist_rss_log_stage("tokenizer_load_after", record ? record->model_id.c_str() : nullptr);
     if (!model && record != nullptr) {
         std::error_code ec;
         std::filesystem::remove(tokenizer_path, ec);
         tokenizer_path = resolve_tokenizer_gguf_path(*record);
         if (tokenizer_usable(tokenizer_path)) {
+            dist_rss_log_stage("tokenizer_load_retry_before", record->model_id.c_str());
             model = llama_model_load_from_file(tokenizer_path.c_str(), llama_model_default_params());
+            dist_rss_log_stage("tokenizer_load_retry_after", record->model_id.c_str());
         }
     }
     if (model) {
@@ -1066,7 +1072,9 @@ static model_memory_requirements get_model_memory_for_record(
     // Prefer a local GGUF matching the registry filename.
     const std::string path = resolve_model_path(record);
     if (!path.empty()) {
+        dist_rss_log_stage("estimate_model_memory_file_before", record.model_id.c_str());
         model_memory_requirements mem = estimate_model_memory(path, n_ctx);
+        dist_rss_log_stage("estimate_model_memory_file_after", record.model_id.c_str());
         if (mem.valid()) {
             mem.model_id = record.model_id;
             return mem;
@@ -1186,6 +1194,7 @@ static std::string fetch_entry_worker_tokenizer(
 }
 
 static std::string resolve_tokenizer_gguf_path(const dist_model_record & record) {
+    dist_rss_scope rss("resolve_tokenizer", record.model_id.c_str());
     const std::string local = resolve_model_path(record);
     if (!local.empty()) {
         return local;
@@ -1216,9 +1225,11 @@ static std::string resolve_tokenizer_gguf_path(const dist_model_record & record)
     }
 
     if (const std::string fetched = fetch_entry_worker_tokenizer(record, out); !fetched.empty()) {
+        dist_rss_log_stage("fetch_entry_worker_tokenizer", record.model_id.c_str());
         return fetched;
     }
 
+    dist_rss_log_stage("materialize_gguf_before", record.model_id.c_str());
     if (layer_store_materialize_gguf(
                 store,
                 *record.manifest,
@@ -1227,6 +1238,7 @@ static std::string resolve_tokenizer_gguf_path(const dist_model_record & record)
                 0,
                 false,
                 false)) {
+        dist_rss_log_stage("materialize_gguf_after", record.model_id.c_str());
         return out;
     }
     return {};
@@ -1598,6 +1610,10 @@ int main(int argc, char ** argv) {
                 g_models_dir.c_str());
     }
 
+    dist_rss_set_baseline(dist_process_rss_bytes());
+    dist_rss_log_stage("startup");
+    fprintf(stderr, "orchestrator: RSS diagnostics enabled (log prefix: orchestrator: RSS)\n");
+
     std::string bind_host;
     int port = 0;
     if (!dist_parse_host_port(listen, bind_host, port)) {
@@ -1618,6 +1634,18 @@ int main(int argc, char ** argv) {
 
     svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
         res.set_content(R"({"status":"ok"})", "application/json");
+    });
+
+    svr.Get("/debug/rss", [](const httplib::Request &, httplib::Response & res) {
+        const uint64_t rss = dist_process_rss_bytes();
+        const int64_t delta = static_cast<int64_t>(rss) - static_cast<int64_t>(dist_rss_baseline_bytes());
+        res.set_content(json({
+            { "rss_bytes", rss },
+            { "rss_mb", rss / (1024.0 * 1024.0) },
+            { "baseline_bytes", dist_rss_baseline_bytes() },
+            { "baseline_delta_bytes", delta },
+            { "baseline_delta_mb", static_cast<double>(delta) / (1024.0 * 1024.0) },
+        }).dump(), "application/json");
     });
 
     svr.Post("/register", [](const httplib::Request & req, httplib::Response & res) {
@@ -1868,6 +1896,8 @@ int main(int argc, char ** argv) {
             res.set_content(json({ { "error", "model id required" } }).dump(), "application/json");
             return;
         }
+
+        dist_rss_scope rss("session_create", model_id.c_str());
 
         const dist_model_record * record = g_registry.find(model_id);
         if (!record) {
@@ -2331,6 +2361,8 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        dist_rss_scope rss("generate", session.model.c_str());
+
         ggml_backend_load_all();
         const dist_model_record * record = g_registry.find(session.model);
         std::string tokenizer_path;
@@ -2528,6 +2560,7 @@ int main(int argc, char ** argv) {
 
         dist_model_record incoming = dist_model_record_from_json(body);
         const std::string model_id = incoming.model_id;
+        dist_rss_scope rss("register", model_id.c_str());
 
         if (dist_model_record * existing = g_registry.find(model_id)) {
             dist_model_record merged = *existing;
@@ -2749,6 +2782,7 @@ int main(int argc, char ** argv) {
     // POST /models/{model_id}/discover - Trigger remote discovery for a model.
     svr.Post(R"(/models/([^/]+)/discover)", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.matches[1];
+        dist_rss_scope rss("discover", model_id.c_str());
 
         dist_model_record * record = g_registry.find(model_id);
         if (!record) {
@@ -2789,6 +2823,7 @@ int main(int argc, char ** argv) {
     // POST /models/{model_id}/manifest - Build GGUF manifest (metadata only).
     svr.Post(R"(/models/([^/]+)/manifest)", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.matches[1];
+        dist_rss_scope rss("manifest", model_id.c_str());
 
         dist_model_record * record = g_registry.find(model_id);
         if (!record) {
@@ -2851,6 +2886,7 @@ int main(int argc, char ** argv) {
     // Pass {"force": true} to recompute layout from the planner.
     svr.Post(R"(/models/([^/]+)/layout)", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.matches[1];
+        dist_rss_scope rss("layout", model_id.c_str());
 
         dist_model_record * record = g_registry.find(model_id);
         if (!record) {
@@ -3038,6 +3074,7 @@ int main(int argc, char ** argv) {
     // POST /models/{model_id}/coverage/refresh - Poll nodes and recompute coverage.
     svr.Post(R"(/models/([^/]+)/coverage/refresh)", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.matches[1];
+        dist_rss_scope rss("coverage", model_id.c_str());
 
         dist_model_record * record = g_registry.find(model_id);
         if (!record) {
@@ -3134,6 +3171,7 @@ int main(int argc, char ** argv) {
     // POST /models/{model_id}/install-plan - Build install plan from registry state.
     svr.Post(R"(/models/([^/]+)/install-plan)", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.matches[1];
+        dist_rss_scope rss("install_plan", model_id.c_str());
 
         dist_model_record * record = g_registry.find(model_id);
         if (!record) {

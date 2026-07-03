@@ -227,6 +227,7 @@ target_sources(orchestrator PRIVATE
     node_agent/layer_store/descriptor_materialize.cpp
     node_agent/layer_store/layer_gguf_assembler.cpp
     node_agent/layer_store/worker_builder.cpp
+    dist_rss_probe.cpp
     ${DIST_CONSISTENCY_SOURCES}
     ${VERIFICATION_SOURCES}
 )
