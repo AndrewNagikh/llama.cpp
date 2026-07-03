@@ -48,6 +48,34 @@ static dist_child_process g_middle_worker{};
 static dist_child_process g_final_worker{};
 static int g_pipeline_ctrl_port = 0;
 static int g_pipeline_layer_end = 0;
+
+struct node_runtime_stats {
+    int configure_count        = 0;
+    int materialization_count  = 0;
+    int worker_spawn_count     = 0;
+    int pipeline_generate_count = 0;
+    int kv_cache_reset_count   = 0;
+    int context_create_count   = 0;
+    int runtime_load_count     = 0;
+    int materialization_generation = 0;
+};
+
+static node_runtime_stats g_runtime_stats;
+
+static json node_runtime_stats_json() {
+    return {
+        { "configure_count", g_runtime_stats.configure_count },
+        { "materialization_count", g_runtime_stats.materialization_count },
+        { "worker_spawn_count", g_runtime_stats.worker_spawn_count },
+        { "pipeline_generate_count", g_runtime_stats.pipeline_generate_count },
+        { "kv_cache_reset_count", g_runtime_stats.kv_cache_reset_count },
+        { "context_create_count", g_runtime_stats.context_create_count },
+        { "runtime_load_count", g_runtime_stats.runtime_load_count },
+        { "materialization_generation", g_runtime_stats.materialization_generation },
+        { "materialized", g_runtime_stats.materialization_count > 0 },
+        { "runtime_loaded", g_runtime_stats.runtime_load_count > 0 },
+    };
+}
 static model_store g_model_store;
 static std::mutex g_model_store_mu;
 static std::set<std::string> g_active_downloads;
@@ -368,7 +396,8 @@ static bool run_local_pipeline_generate(
         int max_new,
         int layer_end,
         std::vector<int32_t> & out_tokens,
-        std::string & err) {
+        std::string & err,
+        json * timing_out = nullptr) {
     if (g_pipeline_ctrl_port <= 0) {
         err = "pipeline not configured";
         return false;
@@ -379,6 +408,10 @@ static bool run_local_pipeline_generate(
     trace_recorder * dbg = dist_debug_recorder();
     int32_t debug_step   = 0;
 
+    g_runtime_stats.pipeline_generate_count++;
+    g_runtime_stats.context_create_count++;
+
+    const auto t_total0 = std::chrono::steady_clock::now();
     int ctrl_fd = split_tcp_connect_retry("127.0.0.1", g_pipeline_ctrl_port, 300, 100);
     if (ctrl_fd < 0) {
         err = "failed to connect to local pipeline ctrl port";
@@ -394,15 +427,20 @@ static bool run_local_pipeline_generate(
         split_tcp_close(ctrl_fd);
         return false;
     }
+    g_runtime_stats.kv_cache_reset_count++;
 
-    if (dbg) {
-        dbg->emit_step_begin(debug_step, "prefill", -1, 0, 0);
-    }
+    const auto t_prefill0 = std::chrono::steady_clock::now();
     if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_PREFILL, (int32_t) prompt_tokens.size(), 0,
             layer_end, prompt_tokens.data(), resp)) {
         err = "prefill failed";
         split_tcp_close(ctrl_fd);
         return false;
+    }
+
+    const auto t_first_token = std::chrono::steady_clock::now();
+
+    if (dbg) {
+        dbg->emit_step_begin(debug_step, "prefill", -1, 0, 0);
     }
 
     if (resp.token_id < 0) {
@@ -445,6 +483,20 @@ static bool run_local_pipeline_generate(
 
     pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_SHUTDOWN, 0, 0, layer_end, nullptr, resp);
     split_tcp_close(ctrl_fd);
+
+    const auto t_total1 = std::chrono::steady_clock::now();
+    if (timing_out) {
+        const double prefill_ms = std::chrono::duration<double, std::milli>(t_first_token - t_prefill0).count();
+        const double total_ms = std::chrono::duration<double, std::milli>(t_total1 - t_total0).count();
+        const double decode_ms = std::max(0.0, total_ms - prefill_ms);
+        *timing_out = {
+            { "prefill_ms", prefill_ms },
+            { "ttft_ms", prefill_ms },
+            { "decode_ms", decode_ms },
+            { "total_ms", total_ms },
+            { "generated_tokens", (int) out_tokens.size() },
+        };
+    }
     return true;
 }
 
@@ -523,6 +575,7 @@ static bool start_worker(
     if (dist_child_process * slot = worker_proc_slot(cfg.role)) {
         *slot = child;
     }
+    g_runtime_stats.worker_spawn_count++;
     dist_sleep_ms(300);
     return true;
 }
@@ -600,6 +653,8 @@ static std::string configure_materialize_worker_gguf(
             cfg.layer_start,
             cfg.layer_end,
             role_name.c_str());
+    g_runtime_stats.materialization_count++;
+    g_runtime_stats.materialization_generation++;
     return out_path;
 }
 
@@ -731,6 +786,7 @@ int main(int argc, char ** argv) {
                 { "middle", (int) g_middle_worker.pid },
                 { "final", (int) g_final_worker.pid },
             }},
+            { "runtime_stats", node_runtime_stats_json() },
         }).dump(), "application/json");
     });
 
@@ -774,6 +830,8 @@ int main(int argc, char ** argv) {
             res.set_content(json({ { "ok", false }, { "error", err } }).dump(), "application/json");
             return;
         }
+        g_runtime_stats.configure_count++;
+        g_runtime_stats.runtime_load_count++;
 
         if (cfg.role == DIST_ROLE_ENTRY) {
             g_pipeline_ctrl_port = cfg.ctrl_port;
@@ -820,7 +878,8 @@ int main(int argc, char ** argv) {
 
         std::vector<int32_t> out_tokens;
         std::string err;
-        if (!run_local_pipeline_generate(prompt_tokens, max_tokens, layer_end, out_tokens, err)) {
+        json timing = json::object();
+        if (!run_local_pipeline_generate(prompt_tokens, max_tokens, layer_end, out_tokens, err, &timing)) {
             res.status = 500;
             res.set_content(json({ { "ok", false }, { "error", err }, { "tokens", json::array() } }).dump(),
                     "application/json");
@@ -831,7 +890,7 @@ int main(int argc, char ** argv) {
         for (const int32_t t : out_tokens) {
             tokens_json.push_back(t);
         }
-        res.set_content(json({ { "ok", true }, { "tokens", tokens_json } }).dump(), "application/json");
+        res.set_content(json({ { "ok", true }, { "tokens", tokens_json }, { "timing", timing } }).dump(), "application/json");
     });
 
     svr.Post("/shutdown", [](const httplib::Request &, httplib::Response & res) {

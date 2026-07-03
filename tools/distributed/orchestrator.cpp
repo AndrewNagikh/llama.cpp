@@ -50,6 +50,8 @@
 
 using json = nlohmann::json;
 
+static std::string resolve_tokenizer_gguf_path(const dist_model_record & record);
+
 struct dist_session {
     std::string session_id;
     std::string model;
@@ -59,7 +61,102 @@ struct dist_session {
     int entry_ctrl_port = 0;
     int entry_layer_end = 0;
     bool active         = false;
+    llama_model * tokenizer_model = nullptr;
+    int tokenizer_init_count = 0;
+    int generate_count       = 0;
+    int configure_count      = 0;
+    int64_t created_at_ms    = 0;
 };
+
+static void session_free_tokenizer(dist_session & session) {
+    if (session.tokenizer_model) {
+        llama_model_free(session.tokenizer_model);
+        session.tokenizer_model = nullptr;
+    }
+}
+
+static llama_model * session_get_tokenizer(
+        dist_session & session,
+        const dist_model_record * record,
+        std::string & tokenizer_path_out) {
+    if (session.tokenizer_model) {
+        tokenizer_path_out = session.model_path;
+        return session.tokenizer_model;
+    }
+    std::string tokenizer_path = session.model_path;
+    auto tokenizer_usable = [&](const std::string & path) -> bool {
+        if (path.empty()) {
+            return false;
+        }
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) {
+            return false;
+        }
+        if (record != nullptr && record->manifest.has_value()) {
+            const uint64_t meta_size = record->manifest->tensor_data_offset;
+            const auto fsize = std::filesystem::file_size(path, ec);
+            if (!ec && meta_size > 0 && fsize <= meta_size) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!tokenizer_usable(tokenizer_path) && record != nullptr) {
+        tokenizer_path = resolve_tokenizer_gguf_path(*record);
+    }
+    if (!tokenizer_usable(tokenizer_path)) {
+        return nullptr;
+    }
+    llama_model * model = llama_model_load_from_file(tokenizer_path.c_str(), llama_model_default_params());
+    if (!model && record != nullptr) {
+        std::error_code ec;
+        std::filesystem::remove(tokenizer_path, ec);
+        tokenizer_path = resolve_tokenizer_gguf_path(*record);
+        if (tokenizer_usable(tokenizer_path)) {
+            model = llama_model_load_from_file(tokenizer_path.c_str(), llama_model_default_params());
+        }
+    }
+    if (model) {
+        session.tokenizer_model = model;
+        session.model_path = tokenizer_path;
+        session.tokenizer_init_count++;
+    }
+    tokenizer_path_out = tokenizer_path;
+    return model;
+}
+
+static json session_debug_json(const dist_session & session) {
+    json workers = json::array();
+    for (const auto & stage : session.pipeline) {
+        httplib::Client cli(stage.host.c_str(), stage.http_port);
+        cli.set_connection_timeout(3, 0);
+        cli.set_read_timeout(5, 0);
+        json node_status = json::object();
+        if (const auto res = cli.Get("/status")) {
+            if (res->status == 200) {
+                try {
+                    node_status = json::parse(res->body);
+                } catch (...) {}
+            }
+        }
+        workers.push_back({
+            { "node_id", stage.node_id },
+            { "role", dist_role_name(stage.role) },
+            { "host", stage.host },
+            { "port", stage.http_port },
+            { "status", node_status },
+        });
+    }
+    return {
+        { "session_id", session.session_id },
+        { "model", session.model },
+        { "active", session.active },
+        { "tokenizer_init_count", session.tokenizer_init_count },
+        { "generate_count", session.generate_count },
+        { "configure_count", session.configure_count },
+        { "workers", workers },
+    };
+}
 
 static std::mutex g_mu;
 static std::map<std::string, dist_node_info> g_nodes;
@@ -1360,6 +1457,7 @@ static bool setup_pipeline(
     session.entry_ctrl_port  = stages[0].ctrl_port;
     session.entry_layer_end  = stages[0].layer_end;
     session.active           = true;
+    session.configure_count  = (int) n_stages;
     return true;
 }
 
@@ -1399,7 +1497,8 @@ static bool run_generation(
         const std::vector<llama_token> & prompt,
         int max_new,
         std::vector<llama_token> & out_tokens,
-        std::string & err) {
+        std::string & err,
+        json * timing_out = nullptr) {
     if (session.pipeline.empty()) {
         err = "empty pipeline";
         return false;
@@ -1448,6 +1547,9 @@ static bool run_generation(
         }
         for (const auto & t : j.at("tokens")) {
             out_tokens.push_back((llama_token) t.get<int>());
+        }
+        if (timing_out && j.contains("timing")) {
+            *timing_out = j["timing"];
         }
         return true;
     } catch (...) {
@@ -1886,6 +1988,8 @@ int main(int argc, char ** argv) {
 
         {
             std::lock_guard<std::mutex> lock(g_mu);
+            session.created_at_ms = (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
             g_sessions[session.session_id] = session;
         }
 
@@ -2207,6 +2311,8 @@ int main(int argc, char ** argv) {
         const std::string prompt     = body.value("prompt", SPLIT_GEN_PROMPT);
         const int max_tokens         = body.value("max_tokens", DIST_MAX_NEW_TOKENS);
 
+        const auto t_request_start = std::chrono::steady_clock::now();
+
         dist_session session{};
         {
             std::lock_guard<std::mutex> lock(g_mu);
@@ -2227,47 +2333,13 @@ int main(int argc, char ** argv) {
 
         ggml_backend_load_all();
         const dist_model_record * record = g_registry.find(session.model);
-        std::string tokenizer_path = session.model_path;
-        auto tokenizer_usable = [&](const std::string & path) -> bool {
-            if (path.empty()) {
-                return false;
-            }
-            std::error_code ec;
-            if (!std::filesystem::exists(path, ec)) {
-                return false;
-            }
-            if (record != nullptr && record->manifest.has_value()) {
-                const uint64_t meta_size = record->manifest->tensor_data_offset;
-                const auto fsize = std::filesystem::file_size(path, ec);
-                if (!ec && meta_size > 0 && fsize <= meta_size) {
-                    return false;
-                }
-            }
-            return true;
-        };
-        if (!tokenizer_usable(tokenizer_path) && record != nullptr) {
-            tokenizer_path = resolve_tokenizer_gguf_path(*record);
-        }
-        if (!tokenizer_usable(tokenizer_path)) {
+        std::string tokenizer_path;
+        llama_model * model = session_get_tokenizer(session, record, tokenizer_path);
+        if (!model) {
             res.status = 503;
             res.set_content(json({
                 { "error", "no tokenizer GGUF available; build manifest and cache metadata first" },
             }).dump(), "application/json");
-            return;
-        }
-
-        llama_model * model = llama_model_load_from_file(tokenizer_path.c_str(), llama_model_default_params());
-        if (!model && record != nullptr) {
-            std::error_code ec;
-            std::filesystem::remove(tokenizer_path, ec);
-            tokenizer_path = resolve_tokenizer_gguf_path(*record);
-            if (tokenizer_usable(tokenizer_path)) {
-                model = llama_model_load_from_file(tokenizer_path.c_str(), llama_model_default_params());
-            }
-        }
-        if (!model) {
-            res.status = 500;
-            res.set_content(R"({"error":"failed to load model for tokenization"})", "application/json");
             return;
         }
 
@@ -2276,7 +2348,18 @@ int main(int argc, char ** argv) {
 
         std::vector<llama_token> tokens;
         std::string err;
-        const bool ok = run_generation(session, prompt_tokens, max_tokens, tokens, err);
+        json pipeline_timing = json::object();
+        const bool ok = run_generation(session, prompt_tokens, max_tokens, tokens, err, &pipeline_timing);
+
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            auto it = g_sessions.find(session_id);
+            if (it != g_sessions.end()) {
+                it->second.tokenizer_model = session.tokenizer_model;
+                it->second.tokenizer_init_count = session.tokenizer_init_count;
+                it->second.generate_count++;
+            }
+        }
 
         json out_tokens = json::array();
         std::string text;
@@ -2285,7 +2368,29 @@ int main(int argc, char ** argv) {
             text += split_gen_token_text(vocab, t);
         }
 
-        llama_model_free(model);
+        const auto t_request_end = std::chrono::steady_clock::now();
+        const double total_ms = std::chrono::duration<double, std::milli>(t_request_end - t_request_start).count();
+        const int prompt_tokens_n = (int) prompt_tokens.size();
+        const int generated_n = (int) tokens.size();
+
+        json timing = pipeline_timing;
+        if (!timing.contains("total_ms")) {
+            timing["total_ms"] = total_ms;
+        }
+        if (!timing.contains("ttft_ms") && timing.contains("prefill_ms")) {
+            timing["ttft_ms"] = timing["prefill_ms"];
+        }
+        if (!timing.contains("decode_ms") && generated_n > 1 && timing.contains("total_ms")) {
+            const double ttft = timing.value("ttft_ms", timing.value("prefill_ms", 0.0));
+            timing["decode_ms"] = std::max(0.0, timing["total_ms"].get<double>() - ttft);
+        }
+        if (generated_n > 0 && timing.contains("decode_ms")) {
+            const double decode_ms = timing["decode_ms"].get<double>();
+            const int decode_tokens = std::max(1, generated_n - 1);
+            timing["decode_tokens_per_sec"] = decode_ms > 0 ? (decode_tokens * 1000.0 / decode_ms) : 0.0;
+        }
+        timing["prompt_tokens"] = prompt_tokens_n;
+        timing["generated_tokens"] = generated_n;
 
         if (!ok) {
             res.status = 503;
@@ -2293,6 +2398,7 @@ int main(int argc, char ** argv) {
                 { "error", err },
                 { "tokens", out_tokens },
                 { "text", text },
+                { "timing", timing },
             }).dump(), "application/json");
             return;
         }
@@ -2302,7 +2408,24 @@ int main(int argc, char ** argv) {
             { "tokens", out_tokens },
             { "text", text },
             { "count", tokens.size() },
+            { "timing", timing },
+            { "session_stats", {
+                { "tokenizer_init_count", session.tokenizer_init_count },
+                { "generate_count", session.generate_count + 1 },
+            }},
         }).dump(), "application/json");
+    });
+
+    svr.Get(R"(/session/([^/]+))", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string session_id = req.matches[1];
+        std::lock_guard<std::mutex> lock(g_mu);
+        const auto it = g_sessions.find(session_id);
+        if (it == g_sessions.end()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "session not found" } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(session_debug_json(it->second).dump(), "application/json");
     });
 
     svr.Delete(R"(/session/([^/]+))", [](const httplib::Request & req, httplib::Response & res) {
@@ -2310,7 +2433,12 @@ int main(int argc, char ** argv) {
         bool removed = false;
         {
             std::lock_guard<std::mutex> lock(g_mu);
-            removed = g_sessions.erase(session_id) > 0;
+            const auto it = g_sessions.find(session_id);
+            if (it != g_sessions.end()) {
+                session_free_tokenizer(it->second);
+                g_sessions.erase(it);
+                removed = true;
+            }
         }
         if (!removed) {
             res.status = 404;
@@ -2338,7 +2466,12 @@ int main(int argc, char ** argv) {
         bool removed = false;
         {
             std::lock_guard<std::mutex> lock(g_mu);
-            removed = g_sessions.erase(session_id) > 0;
+            const auto it = g_sessions.find(session_id);
+            if (it != g_sessions.end()) {
+                session_free_tokenizer(it->second);
+                g_sessions.erase(it);
+                removed = true;
+            }
         }
         if (!removed) {
             res.status = 404;
