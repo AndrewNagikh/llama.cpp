@@ -6,6 +6,9 @@
 #include "node_agent/layer_store/worker_builder.h"
 #include "node_agent/layer_store/layer_gguf_assembler.h"
 #include "architecture/semantic_runtime_descriptor.h"
+#include "architecture/worker_requirement.h"
+#include "runtime/runtime_role.h"
+#include "runtime/runtime_worker_bind.h"
 #include "verification/worker_verify.h"
 #include "node_agent/synchronization/synchronization_engine.h"
 #include "orchestrator/install_planner/install_planner.h"
@@ -64,13 +67,38 @@ struct node_runtime_stats {
 
 static node_runtime_stats g_runtime_stats;
 static std::string g_entry_worker_gguf;
+static std::string g_tokenizer_service_gguf;
+static std::string g_embedding_service_gguf;
+static std::string g_output_service_gguf;
+static bool g_sampler_service_ready = false;
 static llama_model * g_entry_tokenizer = nullptr;
+static llama_model * g_tokenizer_service_model = nullptr;
+
+static void free_tokenizer_service() {
+    if (g_tokenizer_service_model) {
+        llama_model_free(g_tokenizer_service_model);
+        g_tokenizer_service_model = nullptr;
+    }
+}
 
 static void free_entry_tokenizer() {
     if (g_entry_tokenizer) {
         llama_model_free(g_entry_tokenizer);
         g_entry_tokenizer = nullptr;
     }
+}
+
+static const llama_vocab * tokenizer_service_vocab() {
+    if (!g_tokenizer_service_model && !g_tokenizer_service_gguf.empty()) {
+        ggml_backend_load_all();
+        llama_model_params params = llama_model_default_params();
+        params.vocab_only = true;
+        g_tokenizer_service_model = llama_model_load_from_file(g_tokenizer_service_gguf.c_str(), params);
+        if (g_tokenizer_service_model) {
+            g_runtime_stats.tokenizer_init_count = 1;
+        }
+    }
+    return g_tokenizer_service_model ? llama_model_get_vocab(g_tokenizer_service_model) : nullptr;
 }
 
 static const llama_vocab * entry_node_vocab() {
@@ -615,6 +643,7 @@ static worker_role dist_role_to_worker_role(const dist_node_role role) {
 
 static std::string configure_materialize_worker_gguf(
         const dist_configure_req & cfg,
+        const json & body,
         std::string & err) {
     if (cfg.model_id.empty()) {
         err = "model_id required for layer-first configure";
@@ -631,18 +660,32 @@ static std::string configure_materialize_worker_gguf(
     if (!store.metadata_bytes().has_value() && !cfg.source_url.empty()) {
         layer_store_cache_metadata(store, *manifest, cfg.source_url);
     }
-    if (!store.metadata_bytes().has_value()) {
+
+    worker_role role = dist_role_to_worker_role(cfg.role);
+    if (body.contains("runtime_role")) {
+        const runtime_role rt = runtime_role_from_string(body.value("runtime_role", ""));
+        if (rt == runtime_role::pipeline_stage && cfg.role != DIST_ROLE_UNCONFIGURED) {
+            role = dist_role_to_worker_role(cfg.role);
+        } else if (rt != runtime_role::unassigned) {
+            role = worker_role_from_runtime_role(rt);
+        }
+    }
+
+    if (role == worker_role::sampler) {
+        g_sampler_service_ready = true;
+        return {};
+    }
+
+    if (role != worker_role::tokenizer && !store.metadata_bytes().has_value()) {
         err = "metadata.bin missing in layer store; run install/sync first";
         return {};
     }
 
-    const worker_role role          = dist_role_to_worker_role(cfg.role);
-    const std::string role_name     = dist_role_name(cfg.role);
+    const std::string role_name = worker_role_to_string(role);
     const semantic_runtime_descriptor rt = build_semantic_runtime_descriptor(*manifest);
 
     if (g_verify_materialization) {
         std::string verr;
-        const worker_role role = dist_role_to_worker_role(cfg.role);
         if (!verify_worker_materialization_for_role(
                     store,
                     *manifest,
@@ -655,28 +698,66 @@ static std::string configure_materialize_worker_gguf(
         }
     }
 
-    const std::string out_path =
+    const bool force_materialize = body.value("force_materialize", false) ||
+            std::getenv("DIST_RUNTIME_FORCE_MATERIALIZE") != nullptr;
+    const bool bind_only         = body.value("bind_only", false);
+
+    const runtime_bind_result bind = runtime_bind_worker(
+            store, *manifest, role, cfg.layer_start, cfg.layer_end);
+    if (!bind.success && !bind.tensors_ready) {
+        err = bind.error.empty() ? "layer store bind failed" : bind.error;
+        return {};
+    }
+
+    if (!force_materialize && bind.cached_gguf_ready && !bind.worker_gguf_path.empty()) {
+        fprintf(stderr,
+                "node_agent: using cached %s role=%s layers=[%d,%d)\n",
+                bind.worker_gguf_path.c_str(),
+                role_name.c_str(),
+                cfg.layer_start,
+                cfg.layer_end);
+        return bind.worker_gguf_path;
+    }
+
+    if (bind_only) {
+        if (!bind.tensors_ready) {
+            err = bind.error.empty() ? "tensors not ready in layer store" : bind.error;
+            return {};
+        }
+        if (!bind.materialize_required && !bind.worker_gguf_path.empty()) {
+            return bind.worker_gguf_path;
+        }
+        err.clear();
+        return {};
+    }
+
+    std::string out_path =
             (store.model_root() / ("worker_" + role_name + ".gguf")).string();
 
-    if (!materialize_worker_gguf(
-                store,
-                *manifest,
-                rt,
-                role,
-                cfg.layer_start,
-                cfg.layer_end,
-                out_path,
-                err)) {
+    if (role == worker_role::tokenizer) {
+        if (!layer_store_materialize_tokenizer_shell(store, *manifest, out_path)) {
+            err = "failed to materialize tokenizer shell";
+            return {};
+        }
+    } else if (!materialize_worker_gguf(
+                       store,
+                       *manifest,
+                       rt,
+                       role,
+                       cfg.layer_start,
+                       cfg.layer_end,
+                       out_path,
+                       err)) {
         err = "failed to assemble GGUF from layer store for role " + role_name + ": " + err;
         return {};
     }
 
     fprintf(stderr,
-            "node_agent: materialized %s from layers [%d,%d) role=%s\n",
+            "node_agent: materialized %s role=%s layers=[%d,%d)\n",
             out_path.c_str(),
+            role_name.c_str(),
             cfg.layer_start,
-            cfg.layer_end,
-            role_name.c_str());
+            cfg.layer_end);
     g_runtime_stats.materialization_count++;
     g_runtime_stats.materialization_generation++;
     return out_path;
@@ -814,6 +895,158 @@ int main(int argc, char ** argv) {
         }).dump(), "application/json");
     });
 
+    svr.Post("/runtime/tokenizer/configure", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        const std::string path = body.value("worker_gguf", "");
+        if (path.empty()) {
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"worker_gguf required"})", "application/json");
+            return;
+        }
+        g_tokenizer_service_gguf = path;
+        free_tokenizer_service();
+        const bool ready = tokenizer_service_vocab() != nullptr;
+        res.set_content(json({
+            { "ok", ready },
+            { "tokenizer_ready", ready },
+        }).dump(), "application/json");
+    });
+
+    svr.Post("/runtime/tokenizer/tokenize", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        const std::string prompt = body.value("prompt", "");
+        const llama_vocab * vocab = tokenizer_service_vocab();
+        if (!vocab) {
+            res.status = 503;
+            res.set_content(R"({"ok":false,"error":"tokenizer service not configured"})", "application/json");
+            return;
+        }
+        const std::vector<llama_token> toks = split_gen_tokenize(vocab, prompt);
+        json tokens = json::array();
+        for (const llama_token t : toks) {
+            tokens.push_back((int32_t) t);
+        }
+        res.set_content(json({ { "ok", true }, { "tokens", tokens } }).dump(), "application/json");
+    });
+
+    svr.Post("/runtime/tokenizer/detokenize", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        const llama_vocab * vocab = tokenizer_service_vocab();
+        if (!vocab || !body.contains("tokens") || !body["tokens"].is_array()) {
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"tokenizer or tokens missing"})", "application/json");
+            return;
+        }
+        std::string text;
+        for (const auto & t : body["tokens"]) {
+            text += split_gen_token_text(vocab, (llama_token) t.get<int32_t>());
+        }
+        res.set_content(json({ { "ok", true }, { "text", text } }).dump(), "application/json");
+    });
+
+    svr.Post("/runtime/bind", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        dist_configure_req cfg = parse_configure(body);
+        if (cfg.model_id.empty()) {
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"model_id required"})", "application/json");
+            return;
+        }
+        layer_store store = get_layer_store(cfg.model_id);
+        const auto manifest = store.load_manifest();
+        if (!manifest.has_value()) {
+            res.status = 404;
+            res.set_content(R"({"ok":false,"error":"manifest not found"})", "application/json");
+            return;
+        }
+        worker_role role = dist_role_to_worker_role(cfg.role);
+        if (body.contains("runtime_role")) {
+            const runtime_role rt = runtime_role_from_string(body.value("runtime_role", ""));
+            if (rt == runtime_role::pipeline_stage && cfg.role != DIST_ROLE_UNCONFIGURED) {
+                role = dist_role_to_worker_role(cfg.role);
+            } else if (rt != runtime_role::unassigned) {
+                role = worker_role_from_runtime_role(rt);
+            }
+        }
+        const runtime_bind_result bind = runtime_bind_worker(
+                store, *manifest, role, cfg.layer_start, cfg.layer_end);
+        res.set_content(json({
+            { "ok", bind.success || bind.tensors_ready },
+            { "tensors_ready", bind.tensors_ready },
+            { "cached_gguf_ready", bind.cached_gguf_ready },
+            { "materialize_required", bind.materialize_required },
+            { "worker_gguf", bind.worker_gguf_path },
+            { "error", bind.error },
+        }).dump(), "application/json");
+    });
+
+    svr.Post("/runtime/embedding/configure", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        const std::string path = body.value("worker_gguf", "");
+        g_embedding_service_gguf = path;
+        res.set_content(json({
+            { "ok", !path.empty() },
+            { "embedding_ready", !path.empty() },
+        }).dump(), "application/json");
+    });
+
+    svr.Post("/runtime/output/configure", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        const std::string path = body.value("worker_gguf", "");
+        g_output_service_gguf = path;
+        res.set_content(json({
+            { "ok", !path.empty() },
+            { "output_ready", !path.empty() },
+        }).dump(), "application/json");
+    });
+
+    svr.Post("/runtime/sampler/configure", [](const httplib::Request &, httplib::Response & res) {
+        g_sampler_service_ready = true;
+        res.set_content(json({ { "ok", true }, { "sampler_ready", true } }).dump(), "application/json");
+    });
+
     svr.Post("/runtime/prepare", [](const httplib::Request & req, httplib::Response & res) {
         json body;
         try {
@@ -827,8 +1060,10 @@ int main(int argc, char ** argv) {
         const auto t0 = std::chrono::steady_clock::now();
         dist_configure_req cfg = parse_configure(body);
         std::string err;
-        const std::string worker_gguf = configure_materialize_worker_gguf(cfg, err);
-        if (worker_gguf.empty()) {
+        const std::string rt_role = body.value("runtime_role", "");
+        const std::string worker_gguf = configure_materialize_worker_gguf(cfg, body, err);
+        const bool is_sampler = rt_role == "sampler";
+        if (worker_gguf.empty() && !err.empty()) {
             res.status = 500;
             res.set_content(json({
                 { "status", "error" },
@@ -837,12 +1072,51 @@ int main(int argc, char ** argv) {
             }).dump(), "application/json");
             return;
         }
+        if (worker_gguf.empty() && !is_sampler) {
+            res.status = 500;
+            res.set_content(json({
+                { "status", "error" },
+                { "runtime_ready", false },
+                { "error", "prepare produced no worker artifact" },
+            }).dump(), "application/json");
+            return;
+        }
 
         bool tokenizer_ready = false;
-        if (cfg.role == DIST_ROLE_ENTRY) {
+        if (rt_role == "tokenizer") {
+            g_tokenizer_service_gguf = worker_gguf;
+            free_tokenizer_service();
+            tokenizer_ready = tokenizer_service_vocab() != nullptr;
+        } else if (rt_role == "embedding") {
+            g_embedding_service_gguf = worker_gguf;
+        } else if (rt_role == "output_head") {
+            g_output_service_gguf = worker_gguf;
+        } else if (is_sampler) {
+            g_sampler_service_ready = true;
+        } else if (cfg.role == DIST_ROLE_ENTRY) {
             g_entry_worker_gguf = worker_gguf;
             free_entry_tokenizer();
             tokenizer_ready = entry_node_vocab() != nullptr;
+        }
+
+        layer_store store = get_layer_store(cfg.model_id);
+        const auto manifest = store.load_manifest();
+        worker_role bind_role = dist_role_to_worker_role(cfg.role);
+        if (!rt_role.empty()) {
+            const runtime_role rt = runtime_role_from_string(rt_role);
+            if (rt == runtime_role::pipeline_stage) {
+                bind_role = dist_role_to_worker_role(cfg.role);
+            } else if (rt != runtime_role::unassigned) {
+                bind_role = worker_role_from_runtime_role(rt);
+            }
+        }
+        bool tensors_ready = false;
+        bool cached_gguf   = false;
+        if (manifest.has_value()) {
+            const runtime_bind_result bind = runtime_bind_worker(
+                    store, *manifest, bind_role, cfg.layer_start, cfg.layer_end);
+            tensors_ready = bind.tensors_ready;
+            cached_gguf   = bind.cached_gguf_ready;
         }
 
         const double ms = std::chrono::duration<double, std::milli>(
@@ -852,6 +1126,8 @@ int main(int argc, char ** argv) {
             { "runtime_ready", true },
             { "worker_gguf", worker_gguf },
             { "tokenizer_ready", tokenizer_ready },
+            { "tensors_ready", tensors_ready },
+            { "cached_gguf", cached_gguf },
             { "materialization_time_ms", ms },
         }).dump(), "application/json");
     });
@@ -886,7 +1162,7 @@ int main(int argc, char ** argv) {
                 return;
             }
         } else if (!cfg.model_id.empty()) {
-            const std::string materialized = configure_materialize_worker_gguf(cfg, err);
+            const std::string materialized = configure_materialize_worker_gguf(cfg, body, err);
             if (materialized.empty()) {
                 res.status = 500;
                 res.set_content(json({ { "ok", false }, { "error", err } }).dump(), "application/json");
@@ -945,14 +1221,9 @@ int main(int argc, char ** argv) {
 
         const std::string prompt_text = body.value("prompt", "");
         if (prompt_tokens.empty() && !prompt_text.empty()) {
-            const llama_vocab * vocab = entry_node_vocab();
-            if (!vocab) {
-                res.status = 503;
-                res.set_content(R"({"ok":false,"error":"entry tokenizer not ready"})", "application/json");
-                return;
-            }
-            const std::vector<llama_token> toks = split_gen_tokenize(vocab, prompt_text);
-            prompt_tokens.assign(toks.begin(), toks.end());
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"prompt_tokens required; use tokenizer service"})", "application/json");
+            return;
         }
 
         if (prompt_tokens.empty()) {
@@ -978,12 +1249,8 @@ int main(int argc, char ** argv) {
 
         json tokens_json = json::array();
         std::string text;
-        const llama_vocab * vocab = entry_node_vocab();
         for (const int32_t t : out_tokens) {
             tokens_json.push_back(t);
-            if (vocab) {
-                text += split_gen_token_text(vocab, (llama_token) t);
-            }
         }
         g_runtime_stats.pipeline_generate_count++;
         res.set_content(json({
@@ -998,7 +1265,12 @@ int main(int argc, char ** argv) {
     svr.Post("/shutdown", [](const httplib::Request &, httplib::Response & res) {
         stop_all_workers();
         free_entry_tokenizer();
+        free_tokenizer_service();
         g_entry_worker_gguf.clear();
+        g_tokenizer_service_gguf.clear();
+        g_embedding_service_gguf.clear();
+        g_output_service_gguf.clear();
+        g_sampler_service_ready = false;
         res.set_content(R"({"ok":true})", "application/json");
     });
 

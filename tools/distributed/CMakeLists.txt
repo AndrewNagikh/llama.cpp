@@ -116,6 +116,16 @@ set(DIST_PLANNER_SOURCES
     memory_estimator.cpp
 )
 
+set(DIST_RUNTIME_SOURCES
+    runtime/runtime_role.cpp
+    runtime/runtime_role_descriptor.cpp
+    runtime/runtime_graph.cpp
+    runtime/runtime_cost_model.cpp
+    runtime/runtime_role_planner.cpp
+    runtime/layer_store_tensor_provider.cpp
+    runtime/runtime_worker_bind.cpp
+)
+
 set(DIST_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src
@@ -217,13 +227,16 @@ endfunction()
 
 dist_add_exe_light(node_agent node_agent.cpp)
 target_sources(node_agent PRIVATE ${DIST_TRANSPORT_SOURCES} ${DIST_RUNTIME_DEBUG_SOURCES}
+    ${DIST_RUNTIME_SOURCES}
     verification/worker_verify.cpp)
 dist_add_exe(orchestrator orchestrator.cpp)
 target_sources(orchestrator PRIVATE
     ${DIST_PLATFORM_SOURCES}
+    ${DIST_RUNTIME_SOURCES}
     dist_http_fetch.cpp
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
+    node_agent/layer_store/descriptor_materialize.cpp
     dist_rss_probe.cpp
     ${DIST_CONSISTENCY_SOURCES}
 )
@@ -341,6 +354,18 @@ if (LLAMA_BUILD_TESTS)
     add_executable(test-memory-estimator test-memory-estimator.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
     target_include_directories(test-memory-estimator PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-memory-estimator PRIVATE llama llama-common Threads::Threads)
+
+    add_executable(test-runtime-role-planner test-runtime-role-planner.cpp
+        runtime/runtime_role.cpp
+        runtime/runtime_role_descriptor.cpp
+        runtime/runtime_graph.cpp
+        runtime/runtime_cost_model.cpp
+        runtime/runtime_role_planner.cpp
+        architecture/worker_requirement.cpp
+        layer_planner.cpp
+        dist_common.cpp)
+    target_include_directories(test-runtime-role-planner PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-runtime-role-planner PRIVATE llama llama-common Threads::Threads)
 
     add_executable(test-capacity-check test-capacity-check.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
     target_include_directories(test-capacity-check PRIVATE ${DIST_INCLUDE_DIRS})

@@ -6,7 +6,14 @@
 #include <string>
 #include <vector>
 
+enum class runtime_role : uint32_t;
+
 enum class worker_role {
+    tokenizer,
+    embedding,
+    pipeline_stage,
+    output_head,
+    sampler,
     entry,
     middle,
     final,
@@ -14,6 +21,7 @@ enum class worker_role {
 };
 
 std::string worker_role_to_string(worker_role role);
+worker_role worker_role_from_runtime_role(runtime_role role);
 
 struct worker_requirement {
     worker_role              role         = worker_role::entry;

@@ -73,26 +73,43 @@ void populate_layer_blobs(architecture_descriptor & desc, const model_manifest &
     }
 }
 
-void set_dense_worker_requirements(architecture_descriptor & desc) {
+void set_layer_first_worker_requirements(architecture_descriptor & desc) {
     desc.worker_requirements.clear();
 
+    auto add = [&](worker_role role, std::vector<std::string> blobs) {
+        worker_requirement req;
+        req.role = role;
+        req.required_blobs = std::move(blobs);
+        desc.worker_requirements.push_back(std::move(req));
+    };
+
+    add(worker_role::tokenizer, {});
+    add(worker_role::embedding, { "embedding" });
+    add(worker_role::pipeline_stage, {});
+    add(worker_role::output_head, { "output_norm", "output_head" });
+    add(worker_role::sampler, {});
+
+    for (const auto & id : { "rope", "input_norm", "globals" }) {
+        if (find_blob(desc.blobs, id)) {
+            add(worker_role::embedding, { id });
+        }
+    }
+    if (find_blob(desc.blobs, "rope")) {
+        add(worker_role::pipeline_stage, { "rope" });
+    }
+
+    // Legacy worker roles (verification / compat materializer).
     worker_requirement entry;
     entry.role = worker_role::entry;
     entry.required_blobs = { "embedding" };
-    if (find_blob(desc.blobs, "rope")) {
-        entry.required_blobs.push_back("rope");
-    }
-    if (find_blob(desc.blobs, "input_norm")) {
-        entry.required_blobs.push_back("input_norm");
-    }
-    if (find_blob(desc.blobs, "globals")) {
-        entry.required_blobs.push_back("globals");
-    }
+    if (find_blob(desc.blobs, "rope"))       { entry.required_blobs.push_back("rope"); }
+    if (find_blob(desc.blobs, "input_norm")) { entry.required_blobs.push_back("input_norm"); }
+    if (find_blob(desc.blobs, "globals"))    { entry.required_blobs.push_back("globals"); }
     desc.worker_requirements.push_back(std::move(entry));
 
-    worker_requirement middle;
-    middle.role = worker_role::middle;
-    desc.worker_requirements.push_back(std::move(middle));
+    worker_requirement middle_req;
+    middle_req.role = worker_role::middle;
+    desc.worker_requirements.push_back(std::move(middle_req));
 
     worker_requirement final_req;
     final_req.role = worker_role::final;
@@ -102,8 +119,10 @@ void set_dense_worker_requirements(architecture_descriptor & desc) {
     worker_requirement full;
     full.role = worker_role::full;
     full.required_blobs = { "embedding", "output_norm", "output_head" };
-    if (find_blob(desc.blobs, "rope")) {
-        full.required_blobs.push_back("rope");
-    }
+    if (find_blob(desc.blobs, "rope")) { full.required_blobs.push_back("rope"); }
     desc.worker_requirements.push_back(std::move(full));
+}
+
+void set_dense_worker_requirements(architecture_descriptor & desc) {
+    set_layer_first_worker_requirements(desc);
 }

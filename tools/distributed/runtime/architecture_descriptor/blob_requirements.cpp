@@ -21,6 +21,18 @@ void mark_blob(
         case worker_role::final:
             req.required_for_final = true;
             break;
+        case worker_role::tokenizer:
+        case worker_role::embedding:
+        case worker_role::sampler:
+            break;
+        case worker_role::pipeline_stage:
+            req.required_for_entry  = true;
+            req.required_for_middle = true;
+            req.required_for_final  = true;
+            break;
+        case worker_role::output_head:
+            req.required_for_final = true;
+            break;
     }
 }
 
@@ -73,6 +85,13 @@ bool blob_required_for_role(
             return req.required_for_middle;
         case worker_role::final:
             return req.required_for_final;
+        case worker_role::tokenizer:
+        case worker_role::embedding:
+        case worker_role::sampler:
+            return false;
+        case worker_role::pipeline_stage:
+            return req.required_for_entry || req.required_for_middle || req.required_for_final;
+        case worker_role::output_head:
+            return req.required_for_final;
     }
-    return false;
 }

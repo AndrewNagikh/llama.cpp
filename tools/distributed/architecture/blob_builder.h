@@ -25,6 +25,7 @@ void add_tensor_to_blob(
 
 void populate_layer_blobs(architecture_descriptor & desc, const model_manifest & manifest);
 
+void set_layer_first_worker_requirements(architecture_descriptor & desc);
 void set_dense_worker_requirements(architecture_descriptor & desc);
 
 bool arch_prefix_matches(const std::string & architecture, const char * prefix);

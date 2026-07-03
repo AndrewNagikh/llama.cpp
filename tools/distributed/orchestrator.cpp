@@ -17,6 +17,9 @@
 #include "orchestrator/consistency/install_journal.h"
 #include "node_agent/layer_store/layer_store.h"
 #include "node_agent/layer_store/layer_gguf_assembler.h"
+#include "runtime/runtime_role_planner.h"
+#include "runtime/runtime_graph.h"
+#include "runtime/runtime_role.h"
 
 #include "httplib.h"
 #include "nlohmann/json.hpp"
@@ -49,6 +52,7 @@ static constexpr const char * DEFAULT_GENERATE_PROMPT = "Tell me a joke";
 struct dist_session {
     std::string session_id;
     std::string model;
+    runtime_graph runtime;
     std::vector<dist_pipeline_stage> pipeline;
     std::string entry_host;
     int entry_ctrl_port = 0;
@@ -853,7 +857,8 @@ static bool prepare_runtime_node(
             return false;
         }
         worker_gguf_out = j.value("worker_gguf", "");
-        if (worker_gguf_out.empty()) {
+        const std::string rt_role = body.value("runtime_role", "");
+        if (worker_gguf_out.empty() && rt_role != "sampler") {
             err = node.node_id + ": prepare returned empty worker_gguf";
             return false;
         }
@@ -1169,6 +1174,259 @@ static bool setup_pipeline(
         const std::vector<dist_layer_assignment> & assignments,
         const std::map<std::string, dist_node_info> & node_map,
         dist_session & session,
+        std::string & err);
+
+static bool setup_runtime_graph(
+        const std::string & session_id,
+        int n_layers,
+        const std::vector<dist_layer_assignment> & assignments,
+        const std::map<std::string, dist_node_info> & node_map,
+        const model_memory_requirements & mem,
+        dist_session & session,
+        std::string & err) {
+    runtime_role_planner_result plan = dist_plan_runtime_graph(
+            session.model, n_layers, mem, assignments, node_map);
+    if (!plan.success) {
+        err = "runtime graph: " + plan.error;
+        return false;
+    }
+    session.runtime = std::move(plan.graph);
+
+    std::set<std::string> touched_nodes;
+    for (const auto & a : session.runtime.assignments) {
+        touched_nodes.insert(a.node_id);
+    }
+    for (const auto & nid : touched_nodes) {
+        const dist_node_info * node = find_node(node_map, nid);
+        if (node) {
+            shutdown_node(*node);
+        }
+    }
+#if !defined(_WIN32)
+    usleep(300000);
+#endif
+
+    if (const dist_model_record * record = g_registry.find(session.model)) {
+        const std::string source_url = resolve_model_source_url(*record);
+
+        for (auto & a : session.runtime.assignments) {
+            if (!runtime_role_is_service(a.role)) {
+                continue;
+            }
+            const dist_node_info * node = find_node(node_map, a.node_id);
+            if (!node) {
+                err = "service node missing: " + a.node_id;
+                return false;
+            }
+
+            json prep = {
+                { "session_id", session_id },
+                { "model_id", session.model },
+                { "runtime_role", runtime_role_name(a.role) },
+                { "source_url", source_url },
+            };
+            std::string artifact;
+            if (!prepare_runtime_node(*node, prep, artifact, err, 600000)) {
+                return false;
+            }
+
+            httplib::Client cli(node->host.c_str(), node->http_port);
+            cli.set_connection_timeout(5, 0);
+            cli.set_read_timeout(120, 0);
+
+            if (a.role == runtime_role::tokenizer && !artifact.empty()) {
+                const json cfg = {
+                    { "session_id", session_id },
+                    { "model_id", session.model },
+                    { "worker_gguf", artifact },
+                };
+                const auto res = cli.Post("/runtime/tokenizer/configure", cfg.dump(), "application/json");
+                if (!res || res->status != 200) {
+                    err = a.node_id + " tokenizer configure failed";
+                    return false;
+                }
+            } else if (a.role == runtime_role::embedding && !artifact.empty()) {
+                const json cfg = {
+                    { "session_id", session_id },
+                    { "model_id", session.model },
+                    { "worker_gguf", artifact },
+                };
+                const auto res = cli.Post("/runtime/embedding/configure", cfg.dump(), "application/json");
+                if (!res || res->status != 200) {
+                    err = a.node_id + " embedding configure failed";
+                    return false;
+                }
+            } else if (a.role == runtime_role::output_head && !artifact.empty()) {
+                const json cfg = {
+                    { "session_id", session_id },
+                    { "model_id", session.model },
+                    { "worker_gguf", artifact },
+                };
+                const auto res = cli.Post("/runtime/output/configure", cfg.dump(), "application/json");
+                if (!res || res->status != 200) {
+                    err = a.node_id + " output configure failed";
+                    return false;
+                }
+            } else if (a.role == runtime_role::sampler) {
+                const json cfg = {
+                    { "session_id", session_id },
+                    { "model_id", session.model },
+                };
+                const auto res = cli.Post("/runtime/sampler/configure", cfg.dump(), "application/json");
+                if (!res || res->status != 200) {
+                    err = a.node_id + " sampler configure failed";
+                    return false;
+                }
+            }
+        }
+    }
+
+    const int pipe_base = 9100 + (int) (getpid() % 500) + 10;
+    const auto stage_ptrs = session.runtime.pipeline_stages();
+    if (stage_ptrs.empty()) {
+        err = "runtime graph has no pipeline stages";
+        return false;
+    }
+
+    std::vector<dist_pipeline_stage> stages;
+    stages.reserve(stage_ptrs.size());
+    for (size_t i = 0; i < stage_ptrs.size(); ++i) {
+        const runtime_role_assignment & ra = *stage_ptrs[i];
+        const dist_node_info * node = find_node(node_map, ra.node_id);
+        if (!node) {
+            err = "pipeline node missing: " + ra.node_id;
+            return false;
+        }
+
+        dist_pipeline_stage stage{};
+        stage.node_id     = ra.node_id;
+        stage.host        = node->host;
+        stage.http_port   = node->http_port;
+        stage.layer_start = ra.layer_start;
+        stage.layer_end   = ra.layer_end;
+        stage.score       = ra.score;
+
+        if (i == 0) {
+            stage.role      = DIST_ROLE_ENTRY;
+            stage.ctrl_port = pipe_base + 1;
+        } else if (i + 1 == stage_ptrs.size()) {
+            stage.role      = DIST_ROLE_FINAL;
+            stage.peer_port = pipe_base + (int) i + 1;
+        } else {
+            stage.role      = DIST_ROLE_MIDDLE;
+            stage.peer_port = pipe_base + (int) i + 1;
+        }
+        stages.push_back(stage);
+    }
+
+    const size_t n_stages = stages.size();
+    std::vector<std::string> worker_ggufs(n_stages);
+
+    for (size_t i = 0; i < n_stages; ++i) {
+        const auto & stage = stages[i];
+        const dist_node_info * node = find_node(node_map, stage.node_id);
+        if (!node) {
+            err = "node vanished: " + stage.node_id;
+            return false;
+        }
+
+        json prep = {
+            { "session_id", session_id },
+            { "model_id", session.model },
+            { "layer_start", stage.layer_start },
+            { "layer_end", stage.layer_end },
+            { "peer_bind", "0.0.0.0" },
+            { "runtime_role", "pipeline_stage" },
+        };
+        if (const dist_model_record * record = g_registry.find(session.model)) {
+            prep["source_url"] = resolve_model_source_url(*record);
+        }
+        if (stage.role == DIST_ROLE_FINAL) {
+            prep["role"] = "final";
+        } else if (stage.role == DIST_ROLE_MIDDLE) {
+            prep["role"] = "middle";
+        } else {
+            prep["role"] = "entry";
+        }
+
+        dist_rss_log_stage("prepare_runtime", stage.node_id.c_str());
+        if (!prepare_runtime_node(*node, prep, worker_ggufs[i], err, 600000)) {
+            return false;
+        }
+    }
+
+    for (int ri = (int) n_stages - 1; ri >= 0; --ri) {
+        const auto & stage = stages[(size_t) ri];
+        const dist_node_info * node = find_node(node_map, stage.node_id);
+        if (!node) {
+            err = "node vanished: " + stage.node_id;
+            return false;
+        }
+
+        json cfg = {
+            { "session_id", session_id },
+            { "model_id", session.model },
+            { "layer_start", stage.layer_start },
+            { "layer_end", stage.layer_end },
+            { "peer_bind", "0.0.0.0" },
+            { "skip_materialize", true },
+            { "worker_gguf", worker_ggufs[(size_t) ri] },
+            { "runtime_role", "pipeline_stage" },
+        };
+        if (const dist_model_record * record = g_registry.find(session.model)) {
+            cfg["source_url"] = resolve_model_source_url(*record);
+        }
+        if (stage.role == DIST_ROLE_FINAL) {
+            cfg["role"] = "final";
+            cfg["peer_port"] = stage.peer_port;
+        } else if (stage.role == DIST_ROLE_MIDDLE) {
+            const auto & next = stages[(size_t) ri + 1];
+            cfg["role"] = "middle";
+            cfg["peer_port"] = stage.peer_port;
+            cfg["next_host"] = next.host;
+            cfg["next_port"] = next.peer_port;
+        } else {
+            const auto & next = stages[(size_t) ri + 1];
+            cfg["role"] = "entry";
+            cfg["ctrl_port"] = stage.ctrl_port;
+            cfg["next_host"] = next.host;
+            cfg["next_port"] = next.peer_port;
+            cfg["next_is_final"] = (next.role == DIST_ROLE_FINAL);
+        }
+
+        if (!configure_node(*node, cfg, err)) {
+            return false;
+        }
+#if !defined(_WIN32)
+        usleep(ri == 0 ? 500000 : 200000);
+#endif
+    }
+
+    for (size_t i = 0; i < stage_ptrs.size(); ++i) {
+        for (auto & a : session.runtime.assignments) {
+            if (a.role == runtime_role::pipeline_stage && a.stage_index == (int) i) {
+                a.ctrl_port = stages[i].ctrl_port;
+                a.peer_port = stages[i].peer_port;
+                break;
+            }
+        }
+    }
+
+    session.pipeline        = stages;
+    session.entry_host      = stages[0].host;
+    session.entry_ctrl_port = stages[0].ctrl_port;
+    session.entry_layer_end = stages[0].layer_end;
+    session.active          = true;
+    session.configure_count = (int) session.runtime.assignments.size();
+    return true;
+}
+
+static bool setup_pipeline(
+        const std::string & session_id,
+        int n_layers,
+        const std::vector<dist_layer_assignment> & assignments,
+        const std::map<std::string, dist_node_info> & node_map,
+        dist_session & session,
         std::string & err) {
     if (assignments.empty()) {
         err = "empty layer plan";
@@ -1398,11 +1656,40 @@ static bool run_generation(
         return false;
     }
 
+    json prompt_tokens_json = json::array();
+    const runtime_role_assignment * tok_assign = session.runtime.find_role(runtime_role::tokenizer);
+    if (tok_assign != nullptr && tok_assign->http_port > 0) {
+        httplib::Client tcli(tok_assign->host.c_str(), tok_assign->http_port);
+        tcli.set_connection_timeout(10, 0);
+        tcli.set_read_timeout(60, 0);
+        const json tok_req = { { "prompt", prompt } };
+        const auto tok_res = tcli.Post("/runtime/tokenizer/tokenize", tok_req.dump(), "application/json");
+        if (!tok_res || tok_res->status != 200) {
+            err = "tokenizer service failed on " + tok_assign->node_id;
+            return false;
+        }
+        try {
+            const json tok_body = json::parse(tok_res->body);
+            if (!tok_body.value("ok", false)) {
+                err = tok_body.value("error", "tokenize failed");
+                return false;
+            }
+            prompt_tokens_json = tok_body.at("tokens");
+        } catch (...) {
+            err = "invalid tokenizer response";
+            return false;
+        }
+    }
+
     json body = {
-        { "prompt", prompt },
         { "max_tokens", max_new },
         { "layer_end", session.entry_layer_end },
     };
+    if (!prompt_tokens_json.empty()) {
+        body["prompt_tokens"] = prompt_tokens_json;
+    } else {
+        body["prompt"] = prompt;
+    }
 
     httplib::Client cli(entry.host.c_str(), entry.http_port);
     cli.set_connection_timeout(10, 0);
@@ -1432,6 +1719,22 @@ static bool run_generation(
         }
         out_tokens = j.value("tokens", json::array());
         text_out   = j.value("text", "");
+        if (text_out.empty() && tok_assign != nullptr && tok_assign->http_port > 0 && out_tokens.is_array()) {
+            httplib::Client tcli(tok_assign->host.c_str(), tok_assign->http_port);
+            tcli.set_connection_timeout(10, 0);
+            tcli.set_read_timeout(60, 0);
+            const json det_req = { { "tokens", out_tokens } };
+            if (const auto det_res = tcli.Post("/runtime/tokenizer/detokenize", det_req.dump(), "application/json")) {
+                if (det_res->status == 200) {
+                    try {
+                        const json det_body = json::parse(det_res->body);
+                        if (det_body.value("ok", false)) {
+                            text_out = det_body.value("text", "");
+                        }
+                    } catch (...) {}
+                }
+            }
+        }
         if (timing_out && j.contains("timing")) {
             *timing_out = j["timing"];
         }
@@ -1878,7 +2181,7 @@ int main(int argc, char ** argv) {
         session.model      = record->model_id;
 
         std::string err;
-        if (!setup_pipeline(session.session_id, n_layers, assignments, node_map, session, err)) {
+        if (!setup_runtime_graph(session.session_id, n_layers, assignments, node_map, mem, session, err)) {
             res.status = 500;
             res.set_content(json({
                 { "error", err },
@@ -1904,6 +2207,7 @@ int main(int argc, char ** argv) {
             { "session_id", session.session_id },
             { "layout", layout_json(session) },
             { "pipeline", pipeline_json(session) },
+            { "runtime_graph", session.runtime.to_json() },
             { "memory", {
                 { "required_gb", mem.total_gb() },
                 { "weights_gb", mem.weights_gb() },

@@ -12,6 +12,11 @@ std::string role_to_string(worker_role role) {
         case worker_role::middle: return "MIDDLE";
         case worker_role::final:  return "FINAL";
         case worker_role::full:   return "FULL";
+        case worker_role::tokenizer:    return "TOKENIZER";
+        case worker_role::embedding:    return "EMBEDDING";
+        case worker_role::pipeline_stage: return "PIPELINE_STAGE";
+        case worker_role::output_head: return "OUTPUT_HEAD";
+        case worker_role::sampler:    return "SAMPLER";
     }
     return "UNKNOWN";
 }
