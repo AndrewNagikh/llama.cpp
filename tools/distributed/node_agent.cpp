@@ -767,12 +767,23 @@ static std::string configure_materialize_worker_gguf(
             (store.model_root() / ("worker_" + role_name + ".gguf")).string();
 
     if (role == worker_role::tokenizer) {
-        if (!layer_store_materialize_tokenizer_shell(store, *manifest, out_path)) {
-            err = "failed to materialize tokenizer shell";
+        // Metadata-only shells list all model tensors in the GGUF header but contain no
+        // weight bytes, so llama cannot load them even with vocab_only. Materialize
+        // entry-equivalent blobs (embedding + globals) without transformer layers.
+        if (!materialize_worker_gguf(
+                    store,
+                    *manifest,
+                    rt,
+                    worker_role::entry,
+                    0,
+                    0,
+                    out_path,
+                    err)) {
+            err = "failed to materialize tokenizer weights: " + err;
             return {};
         }
         if (!tokenizer_shell_loadable(out_path)) {
-            err = "tokenizer shell not loadable after materialize";
+            err = "tokenizer gguf not loadable after materialize";
             return {};
         }
     } else if (!materialize_worker_gguf(
