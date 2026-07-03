@@ -641,6 +641,21 @@ static worker_role dist_role_to_worker_role(const dist_node_role role) {
     }
 }
 
+static bool tokenizer_shell_loadable(const std::string & path) {
+    if (path.empty()) {
+        return false;
+    }
+    ggml_backend_load_all();
+    llama_model_params params = llama_model_default_params();
+    params.vocab_only = true;
+    llama_model * model = llama_model_load_from_file(path.c_str(), params);
+    if (!model) {
+        return false;
+    }
+    llama_model_free(model);
+    return true;
+}
+
 static std::string configure_materialize_worker_gguf(
         const dist_configure_req & cfg,
         const json & body,
@@ -710,13 +725,21 @@ static std::string configure_materialize_worker_gguf(
     }
 
     if (!force_materialize && bind.cached_gguf_ready && !bind.worker_gguf_path.empty()) {
+        const bool cache_ok = role != worker_role::tokenizer ||
+                              tokenizer_shell_loadable(bind.worker_gguf_path);
+        if (cache_ok) {
+            fprintf(stderr,
+                    "node_agent: using cached %s role=%s layers=[%d,%d)\n",
+                    bind.worker_gguf_path.c_str(),
+                    role_name.c_str(),
+                    cfg.layer_start,
+                    cfg.layer_end);
+            return bind.worker_gguf_path;
+        }
         fprintf(stderr,
-                "node_agent: using cached %s role=%s layers=[%d,%d)\n",
+                "node_agent: stale cached %s for role=%s, rematerializing\n",
                 bind.worker_gguf_path.c_str(),
-                role_name.c_str(),
-                cfg.layer_start,
-                cfg.layer_end);
-        return bind.worker_gguf_path;
+                role_name.c_str());
     }
 
     if (bind_only) {
@@ -1087,6 +1110,16 @@ int main(int argc, char ** argv) {
             g_tokenizer_service_gguf = worker_gguf;
             free_tokenizer_service();
             tokenizer_ready = tokenizer_service_vocab() != nullptr;
+            if (!tokenizer_ready) {
+                res.status = 500;
+                res.set_content(json({
+                    { "status", "error" },
+                    { "runtime_ready", false },
+                    { "error", "tokenizer shell failed to load" },
+                    { "worker_gguf", worker_gguf },
+                }).dump(), "application/json");
+                return;
+            }
         } else if (rt_role == "embedding") {
             g_embedding_service_gguf = worker_gguf;
         } else if (rt_role == "output_head") {

@@ -862,6 +862,11 @@ static bool prepare_runtime_node(
             err = node.node_id + ": prepare returned empty worker_gguf";
             return false;
         }
+        if (rt_role == "tokenizer" && !j.value("tokenizer_ready", false)) {
+            err = node.node_id + ": prepare tokenizer not ready: " +
+                  j.value("error", "tokenizer shell failed");
+            return false;
+        }
         return true;
     } catch (...) {
         err = node.node_id + ": invalid prepare response";
@@ -1243,6 +1248,17 @@ static bool setup_runtime_graph(
                 const auto res = cli.Post("/runtime/tokenizer/configure", cfg.dump(), "application/json");
                 if (!res || res->status != 200) {
                     err = a.node_id + " tokenizer configure failed";
+                    return false;
+                }
+                try {
+                    const json j = json::parse(res->body);
+                    if (!j.value("ok", false) || !j.value("tokenizer_ready", false)) {
+                        err = a.node_id + " tokenizer configure: " +
+                              j.value("error", "tokenizer not ready");
+                        return false;
+                    }
+                } catch (...) {
+                    err = a.node_id + " tokenizer configure: invalid response";
                     return false;
                 }
             } else if (a.role == runtime_role::embedding && !artifact.empty()) {
