@@ -2,8 +2,8 @@
 #include "layer_special.h"
 
 #include "architecture/semantic_blob.h"
+#include "dist_http_fetch.h"
 #include "layer_checksum.h"
-#include "layer_gguf_assembler.h"
 
 #include <algorithm>
 #include <fstream>
@@ -522,4 +522,24 @@ bool layer_store::clear_model_storage(const bool keep_manifest) {
         return true;
     }
     return save_checksums(json::object());
+}
+
+bool layer_store_cache_metadata(
+        layer_store & store,
+        const model_manifest & manifest,
+        const std::string & source_url) {
+    if (source_url.empty() || manifest.tensor_data_offset == 0) {
+        return false;
+    }
+
+    const auto existing = store.metadata_bytes();
+    if (existing.has_value() && *existing == manifest.tensor_data_offset) {
+        return true;
+    }
+
+    std::vector<uint8_t> meta;
+    if (!dist_http_get_range(source_url, 0, manifest.tensor_data_offset, meta)) {
+        return false;
+    }
+    return store.save_metadata_blob(meta);
 }

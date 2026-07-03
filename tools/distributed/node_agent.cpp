@@ -18,6 +18,7 @@
 
 #include "ggml-backend.h"
 #include "transport/split_tcp_wire.h"
+#include "workers/split_gen_common.h"
 #include "runtime_debug/runtime_debug.h"
 #include "runtime_debug/trace_recorder.h"
 
@@ -58,9 +59,32 @@ struct node_runtime_stats {
     int context_create_count   = 0;
     int runtime_load_count     = 0;
     int materialization_generation = 0;
+    int tokenizer_init_count   = 0;
 };
 
 static node_runtime_stats g_runtime_stats;
+static std::string g_entry_worker_gguf;
+static llama_model * g_entry_tokenizer = nullptr;
+
+static void free_entry_tokenizer() {
+    if (g_entry_tokenizer) {
+        llama_model_free(g_entry_tokenizer);
+        g_entry_tokenizer = nullptr;
+    }
+}
+
+static const llama_vocab * entry_node_vocab() {
+    if (!g_entry_tokenizer && !g_entry_worker_gguf.empty()) {
+        ggml_backend_load_all();
+        llama_model_params params = llama_model_default_params();
+        params.vocab_only = true;
+        g_entry_tokenizer = llama_model_load_from_file(g_entry_worker_gguf.c_str(), params);
+        if (g_entry_tokenizer) {
+            g_runtime_stats.tokenizer_init_count = 1;
+        }
+    }
+    return g_entry_tokenizer ? llama_model_get_vocab(g_entry_tokenizer) : nullptr;
+}
 
 static json node_runtime_stats_json() {
     return {
@@ -72,6 +96,7 @@ static json node_runtime_stats_json() {
         { "context_create_count", g_runtime_stats.context_create_count },
         { "runtime_load_count", g_runtime_stats.runtime_load_count },
         { "materialization_generation", g_runtime_stats.materialization_generation },
+        { "tokenizer_init_count", g_runtime_stats.tokenizer_init_count },
         { "materialized", g_runtime_stats.materialization_count > 0 },
         { "runtime_loaded", g_runtime_stats.runtime_load_count > 0 },
     };
@@ -789,6 +814,48 @@ int main(int argc, char ** argv) {
         }).dump(), "application/json");
     });
 
+    svr.Post("/runtime/prepare", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        dist_configure_req cfg = parse_configure(body);
+        std::string err;
+        const std::string worker_gguf = configure_materialize_worker_gguf(cfg, err);
+        if (worker_gguf.empty()) {
+            res.status = 500;
+            res.set_content(json({
+                { "status", "error" },
+                { "runtime_ready", false },
+                { "error", err },
+            }).dump(), "application/json");
+            return;
+        }
+
+        bool tokenizer_ready = false;
+        if (cfg.role == DIST_ROLE_ENTRY) {
+            g_entry_worker_gguf = worker_gguf;
+            free_entry_tokenizer();
+            tokenizer_ready = entry_node_vocab() != nullptr;
+        }
+
+        const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        res.set_content(json({
+            { "status", "ok" },
+            { "runtime_ready", true },
+            { "worker_gguf", worker_gguf },
+            { "tokenizer_ready", tokenizer_ready },
+            { "materialization_time_ms", ms },
+        }).dump(), "application/json");
+    });
+
     svr.Post("/configure", [agent_bin](const httplib::Request & req, httplib::Response & res) {
         json body;
         try {
@@ -802,12 +869,23 @@ int main(int argc, char ** argv) {
         const dist_configure_req cfg = parse_configure(body);
         std::string worker_model = g_model_path;
         std::string err;
+        const bool skip_materialize = body.value("skip_materialize", false);
 
         if (dist_debug_enabled() && !cfg.session_id.empty()) {
             dist_debug_set_session(cfg.session_id);
         }
 
-        if (!cfg.model_id.empty()) {
+        if (skip_materialize) {
+            worker_model = body.value("worker_gguf", "");
+            if (worker_model.empty()) {
+                res.status = 400;
+                res.set_content(json({
+                    { "ok", false },
+                    { "error", "worker_gguf required when skip_materialize=true" },
+                }).dump(), "application/json");
+                return;
+            }
+        } else if (!cfg.model_id.empty()) {
             const std::string materialized = configure_materialize_worker_gguf(cfg, err);
             if (materialized.empty()) {
                 res.status = 500;
@@ -835,6 +913,7 @@ int main(int argc, char ** argv) {
         if (cfg.role == DIST_ROLE_ENTRY) {
             g_pipeline_ctrl_port = cfg.ctrl_port;
             g_pipeline_layer_end   = cfg.layer_end;
+            g_entry_worker_gguf    = worker_model;
         }
 
         res.set_content(json({
@@ -864,9 +943,21 @@ int main(int argc, char ** argv) {
             }
         }
 
+        const std::string prompt_text = body.value("prompt", "");
+        if (prompt_tokens.empty() && !prompt_text.empty()) {
+            const llama_vocab * vocab = entry_node_vocab();
+            if (!vocab) {
+                res.status = 503;
+                res.set_content(R"({"ok":false,"error":"entry tokenizer not ready"})", "application/json");
+                return;
+            }
+            const std::vector<llama_token> toks = split_gen_tokenize(vocab, prompt_text);
+            prompt_tokens.assign(toks.begin(), toks.end());
+        }
+
         if (prompt_tokens.empty()) {
             res.status = 400;
-            res.set_content(R"({"ok":false,"error":"prompt_tokens required"})", "application/json");
+            res.set_content(R"({"ok":false,"error":"prompt or prompt_tokens required"})", "application/json");
             return;
         }
         if (layer_end <= 0) {
@@ -886,14 +977,28 @@ int main(int argc, char ** argv) {
         }
 
         json tokens_json = json::array();
+        std::string text;
+        const llama_vocab * vocab = entry_node_vocab();
         for (const int32_t t : out_tokens) {
             tokens_json.push_back(t);
+            if (vocab) {
+                text += split_gen_token_text(vocab, (llama_token) t);
+            }
         }
-        res.set_content(json({ { "ok", true }, { "tokens", tokens_json }, { "timing", timing } }).dump(), "application/json");
+        g_runtime_stats.pipeline_generate_count++;
+        res.set_content(json({
+            { "ok", true },
+            { "tokens", tokens_json },
+            { "text", text },
+            { "count", out_tokens.size() },
+            { "timing", timing },
+        }).dump(), "application/json");
     });
 
     svr.Post("/shutdown", [](const httplib::Request &, httplib::Response & res) {
         stop_all_workers();
+        free_entry_tokenizer();
+        g_entry_worker_gguf.clear();
         res.set_content(R"({"ok":true})", "application/json");
     });
 

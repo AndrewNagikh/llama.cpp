@@ -17,16 +17,9 @@
 #include "orchestrator/consistency/install_journal.h"
 #include "node_agent/layer_store/layer_store.h"
 #include "node_agent/layer_store/layer_gguf_assembler.h"
-#include "verification/verification_pipeline.h"
-#include "verification/worker_verify.h"
-#include "split_gen_common.h"
-#include "split_tcp_wire.h"
 
 #include "httplib.h"
 #include "nlohmann/json.hpp"
-#include "llama.h"
-
-#include "ggml-backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -51,85 +44,20 @@
 
 using json = nlohmann::json;
 
-static std::string resolve_tokenizer_gguf_path(const dist_model_record & record);
+static constexpr const char * DEFAULT_GENERATE_PROMPT = "Tell me a joke";
 
 struct dist_session {
     std::string session_id;
     std::string model;
-    std::string model_path;
     std::vector<dist_pipeline_stage> pipeline;
     std::string entry_host;
     int entry_ctrl_port = 0;
     int entry_layer_end = 0;
     bool active         = false;
-    llama_model * tokenizer_model = nullptr;
-    int tokenizer_init_count = 0;
-    int generate_count       = 0;
-    int configure_count      = 0;
-    int64_t created_at_ms    = 0;
+    int generate_count  = 0;
+    int configure_count = 0;
+    int64_t created_at_ms = 0;
 };
-
-static void session_free_tokenizer(dist_session & session) {
-    if (session.tokenizer_model) {
-        llama_model_free(session.tokenizer_model);
-        session.tokenizer_model = nullptr;
-    }
-}
-
-static llama_model * session_get_tokenizer(
-        dist_session & session,
-        const dist_model_record * record,
-        std::string & tokenizer_path_out) {
-    if (session.tokenizer_model) {
-        tokenizer_path_out = session.model_path;
-        return session.tokenizer_model;
-    }
-    std::string tokenizer_path = session.model_path;
-    auto tokenizer_usable = [&](const std::string & path) -> bool {
-        if (path.empty()) {
-            return false;
-        }
-        std::error_code ec;
-        if (!std::filesystem::exists(path, ec)) {
-            return false;
-        }
-        if (record != nullptr && record->manifest.has_value()) {
-            const uint64_t meta_size = record->manifest->tensor_data_offset;
-            const auto fsize = std::filesystem::file_size(path, ec);
-            if (!ec && meta_size > 0 && fsize <= meta_size) {
-                return false;
-            }
-        }
-        return true;
-    };
-    if (!tokenizer_usable(tokenizer_path) && record != nullptr) {
-        tokenizer_path = resolve_tokenizer_gguf_path(*record);
-    }
-    if (!tokenizer_usable(tokenizer_path)) {
-        return nullptr;
-    }
-    dist_rss_log_stage("tokenizer_load_before", record ? record->model_id.c_str() : nullptr);
-    llama_model_params mparams = llama_model_default_params();
-    llama_model * model = llama_model_load_from_file(tokenizer_path.c_str(), mparams);
-    dist_rss_log_stage("tokenizer_load_after", record ? record->model_id.c_str() : nullptr);
-    if (!model && record != nullptr) {
-        std::error_code ec;
-        std::filesystem::remove(tokenizer_path, ec);
-        tokenizer_path = resolve_tokenizer_gguf_path(*record);
-        if (tokenizer_usable(tokenizer_path)) {
-            dist_rss_log_stage("tokenizer_load_retry_before", record->model_id.c_str());
-            model = llama_model_load_from_file(tokenizer_path.c_str(), llama_model_default_params());
-            dist_rss_log_stage("tokenizer_load_retry_after", record->model_id.c_str());
-        }
-    }
-    if (model) {
-        session.tokenizer_model = model;
-        session.model_path = tokenizer_path;
-        session.tokenizer_init_count++;
-    }
-    tokenizer_path_out = tokenizer_path;
-    return model;
-}
 
 static json session_debug_json(const dist_session & session) {
     json workers = json::array();
@@ -157,7 +85,6 @@ static json session_debug_json(const dist_session & session) {
         { "session_id", session.session_id },
         { "model", session.model },
         { "active", session.active },
-        { "tokenizer_init_count", session.tokenizer_init_count },
         { "generate_count", session.generate_count },
         { "configure_count", session.configure_count },
         { "workers", workers },
@@ -186,7 +113,6 @@ struct cluster_sync_job {
 };
 
 static std::map<std::string, cluster_sync_job> g_sync_jobs;
-static std::map<std::string, nlohmann::json> g_verify_reports;
 
 static void persist_registry();
 static void sync_model_state_from_cluster(const std::string & model_id, bool try_infer_layout);
@@ -894,18 +820,48 @@ static void trigger_cluster_optimization_async() {
     }).detach();
 }
 
-static bool gen3_send_recv(
-        int ctrl_fd,
-        split_gen_cmd cmd,
-        int32_t n_tokens,
-        int32_t pos_start,
-        int32_t layer_end,
-        const int32_t * tokens,
-        split_gen3_a_resp & resp) {
-    if (!split_gen_send_req(ctrl_fd, cmd, n_tokens, pos_start, layer_end, 0, tokens)) {
+static bool prepare_runtime_node(
+        const dist_node_info & node,
+        const json & body,
+        std::string & worker_gguf_out,
+        std::string & err,
+        int timeout_ms = 600000) {
+    httplib::Client cli(node.host.c_str(), node.http_port);
+    cli.set_connection_timeout(5, 0);
+    cli.set_read_timeout(timeout_ms / 1000, (timeout_ms % 1000) * 1000);
+
+    const auto res = cli.Post("/runtime/prepare", body.dump(), "application/json");
+    if (!res) {
+        err = "no response from " + node.node_id + " prepare at " + node.host + ":" +
+              std::to_string(node.http_port);
         return false;
     }
-    return split_gen3_recv_a_resp(ctrl_fd, resp, nullptr);
+    if (res->status != 200) {
+        try {
+            const json j = json::parse(res->body);
+            err = node.node_id + " prepare: " + j.value("error", res->body);
+        } catch (...) {
+            err = node.node_id + " prepare HTTP " + std::to_string(res->status);
+        }
+        return false;
+    }
+
+    try {
+        const json j = json::parse(res->body);
+        if (!j.value("runtime_ready", false)) {
+            err = node.node_id + ": " + j.value("error", "runtime prepare failed");
+            return false;
+        }
+        worker_gguf_out = j.value("worker_gguf", "");
+        if (worker_gguf_out.empty()) {
+            err = node.node_id + ": prepare returned empty worker_gguf";
+            return false;
+        }
+        return true;
+    } catch (...) {
+        err = node.node_id + ": invalid prepare response";
+        return false;
+    }
 }
 
 static bool configure_node(
@@ -1069,19 +1025,7 @@ static model_memory_requirements get_model_memory_for_record(
         }
     }
 
-    // Prefer a local GGUF matching the registry filename.
-    const std::string path = resolve_model_path(record);
-    if (!path.empty()) {
-        dist_rss_log_stage("estimate_model_memory_file_before", record.model_id.c_str());
-        model_memory_requirements mem = estimate_model_memory(path, n_ctx);
-        dist_rss_log_stage("estimate_model_memory_file_after", record.model_id.c_str());
-        if (mem.valid()) {
-            mem.model_id = record.model_id;
-            return mem;
-        }
-    }
-
-    // Otherwise fall back to the legacy catalog entry.
+    // Manifest-based estimate only; orchestrator never loads GGUF for memory sizing.
     {
         std::lock_guard<std::mutex> lock(g_mu);
         const auto * model = g_catalog.find_model(record.model_id);
@@ -1135,113 +1079,6 @@ static std::string layout_entry_node_id(const dist_model_record & record) {
         }
     }
     return node_id;
-}
-
-static std::string fetch_entry_worker_tokenizer(
-        const dist_model_record & record,
-        const std::string & dest_path) {
-    const std::string node_id = layout_entry_node_id(record);
-    if (node_id.empty()) {
-        return {};
-    }
-
-    dist_node_info node{};
-    {
-        std::lock_guard<std::mutex> lock(g_mu);
-        const auto it = g_nodes.find(node_id);
-        if (it == g_nodes.end() || !it->second.online) {
-            return {};
-        }
-        node = it->second;
-    }
-
-    httplib::Client client(node.host.c_str(), node.http_port);
-    client.set_connection_timeout(5, 0);
-    client.set_read_timeout(600, 0);
-    const std::string path = "/models/" + record.model_id + "/workers/entry";
-
-    std::ofstream out(dest_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        return {};
-    }
-
-    bool write_ok = true;
-    const auto result = client.Get(path.c_str(), [&](const char * data, size_t len) {
-        if (!write_ok || len == 0) {
-            return write_ok;
-        }
-        out.write(data, static_cast<std::streamsize>(len));
-        if (!out) {
-            write_ok = false;
-        }
-        return write_ok;
-    });
-    out.close();
-
-    if (!result || result->status != 200 || !write_ok) {
-        std::error_code ec;
-        std::filesystem::remove(dest_path, ec);
-        return {};
-    }
-
-    std::error_code ec;
-    if (!std::filesystem::exists(dest_path, ec) ||
-            std::filesystem::file_size(dest_path, ec) == 0) {
-        std::filesystem::remove(dest_path, ec);
-        return {};
-    }
-    return dest_path;
-}
-
-static std::string resolve_tokenizer_gguf_path(const dist_model_record & record) {
-    dist_rss_scope rss("resolve_tokenizer", record.model_id.c_str());
-    const std::string local = resolve_model_path(record);
-    if (!local.empty()) {
-        return local;
-    }
-    if (!record.manifest.has_value() || record.manifest->empty()) {
-        return {};
-    }
-
-    if (g_models_dir.empty()) {
-        return {};
-    }
-
-    layer_store store(g_models_dir, record.model_id);
-    if (!store.metadata_bytes().has_value()) {
-        cache_manifest_metadata(record.model_id, *record.manifest);
-    }
-
-    const std::string out =
-            (store.model_root() / "tokenizer.gguf").string();
-    std::error_code ec;
-    if (std::filesystem::exists(out, ec)) {
-        const uint64_t meta_size = record.manifest->tensor_data_offset;
-        const auto fsize = std::filesystem::file_size(out, ec);
-        if (!ec && fsize > meta_size) {
-            return out;
-        }
-        std::filesystem::remove(out, ec);
-    }
-
-    if (const std::string fetched = fetch_entry_worker_tokenizer(record, out); !fetched.empty()) {
-        dist_rss_log_stage("fetch_entry_worker_tokenizer", record.model_id.c_str());
-        return fetched;
-    }
-
-    dist_rss_log_stage("materialize_gguf_before", record.model_id.c_str());
-    if (layer_store_materialize_gguf(
-                store,
-                *record.manifest,
-                out,
-                0,
-                0,
-                false,
-                false)) {
-        dist_rss_log_stage("materialize_gguf_after", record.model_id.c_str());
-        return out;
-    }
-    return {};
 }
 
 static void dist_print_planner_report(
@@ -1404,6 +1241,7 @@ static bool setup_pipeline(
     }
 
     const size_t n_stages = stages.size();
+    std::vector<std::string> worker_ggufs(n_stages);
 
     for (const auto & stage : stages) {
         const dist_node_info * node = find_node(node_map, stage.node_id);
@@ -1415,6 +1253,41 @@ static bool setup_pipeline(
 #if !defined(_WIN32)
     usleep(300000);
 #endif
+
+    // Materialize worker GGUF on each node (data plane), then configure workers.
+    for (size_t i = 0; i < n_stages; ++i) {
+        const auto & stage = stages[i];
+        const dist_node_info * node = find_node(node_map, stage.node_id);
+        if (!node) {
+            err = "node vanished: " + stage.node_id;
+            return false;
+        }
+
+        json prep = {
+            { "session_id", session_id },
+            { "model_id", session.model },
+            { "layer_start", stage.layer_start },
+            { "layer_end", stage.layer_end },
+            { "peer_bind", "0.0.0.0" },
+        };
+
+        if (const dist_model_record * record = g_registry.find(session.model)) {
+            prep["source_url"] = resolve_model_source_url(*record);
+        }
+
+        if (stage.role == DIST_ROLE_FINAL) {
+            prep["role"] = "final";
+        } else if (stage.role == DIST_ROLE_MIDDLE) {
+            prep["role"] = "middle";
+        } else {
+            prep["role"] = "entry";
+        }
+
+        dist_rss_log_stage("prepare_runtime", stage.node_id.c_str());
+        if (!prepare_runtime_node(*node, prep, worker_ggufs[i], err, 600000)) {
+            return false;
+        }
+    }
 
     // Configure reverse: final -> ... -> entry
     for (int ri = (int) n_stages - 1; ri >= 0; --ri) {
@@ -1431,6 +1304,8 @@ static bool setup_pipeline(
             { "layer_start", stage.layer_start },
             { "layer_end", stage.layer_end },
             { "peer_bind", "0.0.0.0" },
+            { "skip_materialize", true },
+            { "worker_gguf", worker_ggufs[(size_t) ri] },
         };
 
         if (const dist_model_record * record = g_registry.find(session.model)) {
@@ -1506,9 +1381,10 @@ static json pipeline_json(const dist_session & session) {
 
 static bool run_generation(
         const dist_session & session,
-        const std::vector<llama_token> & prompt,
+        const std::string & prompt,
         int max_new,
-        std::vector<llama_token> & out_tokens,
+        json & out_tokens,
+        std::string & text_out,
         std::string & err,
         json * timing_out = nullptr) {
     if (session.pipeline.empty()) {
@@ -1523,13 +1399,10 @@ static bool run_generation(
     }
 
     json body = {
-        { "prompt_tokens", json::array() },
+        { "prompt", prompt },
         { "max_tokens", max_new },
         { "layer_end", session.entry_layer_end },
     };
-    for (const auto t : prompt) {
-        body["prompt_tokens"].push_back((int32_t) t);
-    }
 
     httplib::Client cli(entry.host.c_str(), entry.http_port);
     cli.set_connection_timeout(10, 0);
@@ -1557,9 +1430,8 @@ static bool run_generation(
             err = j.value("error", "generate failed");
             return false;
         }
-        for (const auto & t : j.at("tokens")) {
-            out_tokens.push_back((llama_token) t.get<int>());
-        }
+        out_tokens = j.value("tokens", json::array());
+        text_out   = j.value("text", "");
         if (timing_out && j.contains("timing")) {
             *timing_out = j["timing"];
         }
@@ -2004,7 +1876,6 @@ int main(int argc, char ** argv) {
         dist_session session{};
         session.session_id = make_id("sess");
         session.model      = record->model_id;
-        session.model_path = resolve_tokenizer_gguf_path(*record);
 
         std::string err;
         if (!setup_pipeline(session.session_id, n_layers, assignments, node_map, session, err)) {
@@ -2338,7 +2209,7 @@ int main(int argc, char ** argv) {
         }
 
         const std::string session_id = body.value("session_id", "");
-        const std::string prompt     = body.value("prompt", SPLIT_GEN_PROMPT);
+        const std::string prompt     = body.value("prompt", DEFAULT_GENERATE_PROMPT);
         const int max_tokens         = body.value("max_tokens", DIST_MAX_NEW_TOKENS);
 
         const auto t_request_start = std::chrono::steady_clock::now();
@@ -2363,47 +2234,23 @@ int main(int argc, char ** argv) {
 
         dist_rss_scope rss("generate", session.model.c_str());
 
-        ggml_backend_load_all();
-        const dist_model_record * record = g_registry.find(session.model);
-        std::string tokenizer_path;
-        llama_model * model = session_get_tokenizer(session, record, tokenizer_path);
-        if (!model) {
-            res.status = 503;
-            res.set_content(json({
-                { "error", "no tokenizer GGUF available; build manifest and cache metadata first" },
-            }).dump(), "application/json");
-            return;
-        }
-
-        const llama_vocab * vocab = llama_model_get_vocab(model);
-        const std::vector<llama_token> prompt_tokens = split_gen_tokenize(vocab, prompt);
-
-        std::vector<llama_token> tokens;
+        json out_tokens = json::array();
+        std::string text;
         std::string err;
         json pipeline_timing = json::object();
-        const bool ok = run_generation(session, prompt_tokens, max_tokens, tokens, err, &pipeline_timing);
+        const bool ok = run_generation(session, prompt, max_tokens, out_tokens, text, err, &pipeline_timing);
 
         {
             std::lock_guard<std::mutex> lock(g_mu);
             auto it = g_sessions.find(session_id);
             if (it != g_sessions.end()) {
-                it->second.tokenizer_model = session.tokenizer_model;
-                it->second.tokenizer_init_count = session.tokenizer_init_count;
                 it->second.generate_count++;
             }
         }
 
-        json out_tokens = json::array();
-        std::string text;
-        for (const auto t : tokens) {
-            out_tokens.push_back((int) t);
-            text += split_gen_token_text(vocab, t);
-        }
-
         const auto t_request_end = std::chrono::steady_clock::now();
         const double total_ms = std::chrono::duration<double, std::milli>(t_request_end - t_request_start).count();
-        const int prompt_tokens_n = (int) prompt_tokens.size();
-        const int generated_n = (int) tokens.size();
+        const int generated_n = out_tokens.is_array() ? (int) out_tokens.size() : 0;
 
         json timing = pipeline_timing;
         if (!timing.contains("total_ms")) {
@@ -2421,7 +2268,6 @@ int main(int argc, char ** argv) {
             const int decode_tokens = std::max(1, generated_n - 1);
             timing["decode_tokens_per_sec"] = decode_ms > 0 ? (decode_tokens * 1000.0 / decode_ms) : 0.0;
         }
-        timing["prompt_tokens"] = prompt_tokens_n;
         timing["generated_tokens"] = generated_n;
 
         if (!ok) {
@@ -2439,10 +2285,9 @@ int main(int argc, char ** argv) {
             { "session_id", session_id },
             { "tokens", out_tokens },
             { "text", text },
-            { "count", tokens.size() },
+            { "count", generated_n },
             { "timing", timing },
             { "session_stats", {
-                { "tokenizer_init_count", session.tokenizer_init_count },
                 { "generate_count", session.generate_count + 1 },
             }},
         }).dump(), "application/json");
@@ -2467,7 +2312,6 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lock(g_mu);
             const auto it = g_sessions.find(session_id);
             if (it != g_sessions.end()) {
-                session_free_tokenizer(it->second);
                 g_sessions.erase(it);
                 removed = true;
             }
@@ -2500,7 +2344,6 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lock(g_mu);
             const auto it = g_sessions.find(session_id);
             if (it != g_sessions.end()) {
-                session_free_tokenizer(it->second);
                 g_sessions.erase(it);
                 removed = true;
             }
@@ -3286,56 +3129,6 @@ int main(int argc, char ** argv) {
             { "status", "started" },
             { "operation_count", record->stored_install_plan->operation_count },
         }).dump(), "application/json");
-    });
-
-    // POST /models/{model_id}/verify - Run GGUF materialization verification pipeline.
-    svr.Post(R"(/models/([^/]+)/verify)", [](const httplib::Request & req, httplib::Response & res) {
-        const std::string model_id = req.matches[1];
-        const dist_model_record * record = g_registry.find(model_id);
-        if (!record || !record->manifest.has_value()) {
-            res.status = 404;
-            res.set_content(json({ { "error", "model not found or manifest missing" } }).dump(), "application/json");
-            return;
-        }
-
-        const std::string original = resolve_model_path(*record);
-        if (original.empty()) {
-            res.status = 503;
-            res.set_content(json({
-                { "error", "original GGUF not available locally; set --models-dir or register with local file" },
-            }).dump(), "application/json");
-            return;
-        }
-
-        layer_store store(g_models_dir.empty() ? std::filesystem::path(original).parent_path().string() : g_models_dir,
-                model_id);
-        const std::string work_dir = (store.model_root() / "verify").string();
-        const verification_report report = run_verification_pipeline(
-                model_id, original, store, *record->manifest, work_dir);
-
-        {
-            std::lock_guard<std::mutex> lock(g_mu);
-            g_verify_reports[model_id] = report.to_json();
-        }
-
-        res.set_content(report.summary_json().dump(), "application/json");
-        if (!report.passed) {
-            res.status = 422;
-        }
-    });
-
-    // GET /models/{model_id}/verify - Return last verification report.
-    svr.Get(R"(/models/([^/]+)/verify)", [](const httplib::Request & req, httplib::Response & res) {
-        const std::string model_id = req.matches[1];
-        std::lock_guard<std::mutex> lock(g_mu);
-        const auto it = g_verify_reports.find(model_id);
-        if (it == g_verify_reports.end()) {
-            res.status = 404;
-            res.set_content(json({ { "error", "no verification report; POST /verify first" } }).dump(),
-                    "application/json");
-            return;
-        }
-        res.set_content(it->second.dump(), "application/json");
     });
 
     // GET /jobs/{job_id} - Cluster synchronization job progress.

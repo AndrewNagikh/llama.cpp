@@ -224,12 +224,8 @@ target_sources(orchestrator PRIVATE
     dist_http_fetch.cpp
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
-    node_agent/layer_store/descriptor_materialize.cpp
-    node_agent/layer_store/layer_gguf_assembler.cpp
-    node_agent/layer_store/worker_builder.cpp
     dist_rss_probe.cpp
     ${DIST_CONSISTENCY_SOURCES}
-    ${VERIFICATION_SOURCES}
 )
 
 dist_add_verify_exe(gguf_inspect gguf_inspect.cpp)
@@ -237,6 +233,7 @@ dist_add_verify_exe(gguf_diff gguf_diff.cpp)
 dist_add_verify_exe(tensor_verify tensor_verify.cpp)
 dist_add_verify_exe(layer_verify layer_verify.cpp)
 dist_add_verify_exe(materialization_verify materialization_verify_tool.cpp)
+target_sources(materialization_verify PRIVATE memory_estimator_gguf.cpp)
 dist_add_verify_exe(logits_compare logits_compare_tool.cpp)
 dist_add_verify_exe(hidden_state_compare hidden_state_compare_tool.cpp)
 
@@ -341,27 +338,27 @@ if (LLAMA_BUILD_TESTS)
     dist_add_test_exe(test-registration-benchmark test-registration-benchmark.cpp)
 
     # Task 8 unit tests
-    add_executable(test-memory-estimator test-memory-estimator.cpp memory_estimator.cpp dist_common.cpp)
+    add_executable(test-memory-estimator test-memory-estimator.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
     target_include_directories(test-memory-estimator PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-memory-estimator PRIVATE llama llama-common Threads::Threads)
 
-    add_executable(test-capacity-check test-capacity-check.cpp memory_estimator.cpp dist_common.cpp)
+    add_executable(test-capacity-check test-capacity-check.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
     target_include_directories(test-capacity-check PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-capacity-check PRIVATE llama llama-common Threads::Threads)
 
-    add_executable(test-memory-aware-planner test-memory-aware-planner.cpp layer_planner.cpp memory_estimator.cpp dist_common.cpp)
+    add_executable(test-memory-aware-planner test-memory-aware-planner.cpp layer_planner.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
     target_include_directories(test-memory-aware-planner PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-memory-aware-planner PRIVATE llama llama-common Threads::Threads)
 
-    add_executable(test-planner-no-overlap test-planner-no-overlap.cpp layer_planner.cpp memory_estimator.cpp dist_common.cpp)
+    add_executable(test-planner-no-overlap test-planner-no-overlap.cpp layer_planner.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
     target_include_directories(test-planner-no-overlap PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-planner-no-overlap PRIVATE llama llama-common Threads::Threads)
 
-    add_executable(test-planner-low-memory test-planner-low-memory.cpp layer_planner.cpp memory_estimator.cpp dist_common.cpp)
+    add_executable(test-planner-low-memory test-planner-low-memory.cpp layer_planner.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
     target_include_directories(test-planner-low-memory PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-planner-low-memory PRIVATE llama llama-common Threads::Threads)
 
-    add_executable(test-capacity-api test-capacity-api.cpp memory_estimator.cpp dist_common.cpp)
+    add_executable(test-capacity-api test-capacity-api.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
     target_include_directories(test-capacity-api PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-capacity-api PRIVATE llama llama-common cpp-httplib Threads::Threads)
 
