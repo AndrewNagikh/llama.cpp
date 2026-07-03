@@ -88,14 +88,24 @@ static void free_entry_tokenizer() {
     }
 }
 
+static llama_model_params default_tokenizer_model_params() {
+    llama_model_params params = llama_model_default_params();
+    params.vocab_only   = true;
+    params.n_gpu_layers = 0;
+    return params;
+}
+
 static const llama_vocab * tokenizer_service_vocab() {
     if (!g_tokenizer_service_model && !g_tokenizer_service_gguf.empty()) {
         ggml_backend_load_all();
-        llama_model_params params = llama_model_default_params();
-        params.vocab_only = true;
-        g_tokenizer_service_model = llama_model_load_from_file(g_tokenizer_service_gguf.c_str(), params);
+        g_tokenizer_service_model = llama_model_load_from_file(
+                g_tokenizer_service_gguf.c_str(), default_tokenizer_model_params());
         if (g_tokenizer_service_model) {
             g_runtime_stats.tokenizer_init_count = 1;
+        } else {
+            fprintf(stderr,
+                    "node_agent: tokenizer load failed for %s\n",
+                    g_tokenizer_service_gguf.c_str());
         }
     }
     return g_tokenizer_service_model ? llama_model_get_vocab(g_tokenizer_service_model) : nullptr;
@@ -104,9 +114,8 @@ static const llama_vocab * tokenizer_service_vocab() {
 static const llama_vocab * entry_node_vocab() {
     if (!g_entry_tokenizer && !g_entry_worker_gguf.empty()) {
         ggml_backend_load_all();
-        llama_model_params params = llama_model_default_params();
-        params.vocab_only = true;
-        g_entry_tokenizer = llama_model_load_from_file(g_entry_worker_gguf.c_str(), params);
+        g_entry_tokenizer = llama_model_load_from_file(
+                g_entry_worker_gguf.c_str(), default_tokenizer_model_params());
         if (g_entry_tokenizer) {
             g_runtime_stats.tokenizer_init_count = 1;
         }
@@ -646,9 +655,7 @@ static bool tokenizer_shell_loadable(const std::string & path) {
         return false;
     }
     ggml_backend_load_all();
-    llama_model_params params = llama_model_default_params();
-    params.vocab_only = true;
-    llama_model * model = llama_model_load_from_file(path.c_str(), params);
+    llama_model * model = llama_model_load_from_file(path.c_str(), default_tokenizer_model_params());
     if (!model) {
         return false;
     }
@@ -736,6 +743,8 @@ static std::string configure_materialize_worker_gguf(
                     cfg.layer_end);
             return bind.worker_gguf_path;
         }
+        std::error_code ec;
+        std::filesystem::remove(bind.worker_gguf_path, ec);
         fprintf(stderr,
                 "node_agent: stale cached %s for role=%s, rematerializing\n",
                 bind.worker_gguf_path.c_str(),
@@ -760,6 +769,10 @@ static std::string configure_materialize_worker_gguf(
     if (role == worker_role::tokenizer) {
         if (!layer_store_materialize_tokenizer_shell(store, *manifest, out_path)) {
             err = "failed to materialize tokenizer shell";
+            return {};
+        }
+        if (!tokenizer_shell_loadable(out_path)) {
+            err = "tokenizer shell not loadable after materialize";
             return {};
         }
     } else if (!materialize_worker_gguf(
