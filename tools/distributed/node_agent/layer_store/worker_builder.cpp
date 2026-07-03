@@ -52,7 +52,21 @@ bool write_layer_blob_tensors(
     }
     architecture_descriptor arch;
     arch.blobs = rt.blobs;
-    return materialize_descriptor_tensors(store, arch, { blob_id }, file, err);
+        return materialize_descriptor_tensors(store, arch, { blob_id }, file, err);
+}
+
+bool all_nodes_blob_required_for_role(const semantic_blob & blob, const worker_role role) {
+    if (blob.deploy != blob_deploy_target::all_nodes) {
+        return false;
+    }
+    // Tied embeddings mark embedding as all_nodes for mono parity; distributed
+    // middle stages must not pull embedding weights onto every pipeline node.
+    if (blob.id == "embedding" || blob.role == tensor_semantic_role::embedding) {
+        return role == worker_role::entry ||
+               role == worker_role::embedding ||
+               role == worker_role::full;
+    }
+    return true;
 }
 
 } // namespace
@@ -119,7 +133,7 @@ bool materialize_worker_gguf(
     std::vector<std::string> required_blobs = plan.required_blobs;
 
     for (const semantic_blob & blob : rt.blobs) {
-        if (blob.deploy == blob_deploy_target::all_nodes) {
+        if (all_nodes_blob_required_for_role(blob, role)) {
             required_blobs.push_back(blob.id);
         }
     }
