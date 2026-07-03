@@ -2305,6 +2305,49 @@ int main(int argc, char ** argv) {
         }).dump(), "application/json");
     });
 
+    svr.Delete(R"(/session/([^/]+))", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string session_id = req.matches[1];
+        bool removed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            removed = g_sessions.erase(session_id) > 0;
+        }
+        if (!removed) {
+            res.status = 404;
+            res.set_content(json({ { "error", "session not found" } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(json({ { "session_id", session_id }, { "destroyed", true } }).dump(), "application/json");
+    });
+
+    svr.Post("/session/destroy", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        const std::string session_id = body.value("session_id", "");
+        if (session_id.empty()) {
+            res.status = 400;
+            res.set_content(json({ { "error", "session_id required" } }).dump(), "application/json");
+            return;
+        }
+        bool removed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            removed = g_sessions.erase(session_id) > 0;
+        }
+        if (!removed) {
+            res.status = 404;
+            res.set_content(json({ { "error", "session not found" } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(json({ { "session_id", session_id }, { "destroyed", true } }).dump(), "application/json");
+    });
+
     // Model management API
 
     // GET /catalog - List available models in catalog
