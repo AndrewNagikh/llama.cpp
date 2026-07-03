@@ -481,7 +481,6 @@ static bool run_local_pipeline_generate(
         debug_step++;
     }
 
-    pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_SHUTDOWN, 0, 0, layer_end, nullptr, resp);
     split_tcp_close(ctrl_fd);
 
     const auto t_total1 = std::chrono::steady_clock::now();

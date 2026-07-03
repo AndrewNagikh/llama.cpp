@@ -171,18 +171,19 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "gen3_a: ready ctrl_port=%d layer_end=%d\n", ctrl_port, layer_end);
 
-    const int ctrl_fd = split_tcp_accept(listen_fd);
-    split_tcp_close(listen_fd);
-    if (ctrl_fd < 0) {
-        fprintf(stderr, "gen3_a: ctrl accept failed\n");
-        return 1;
-    }
-
     while (true) {
+        const int ctrl_fd = split_tcp_accept(listen_fd);
+        if (ctrl_fd < 0) {
+            fprintf(stderr, "gen3_a: ctrl accept failed\n");
+            continue;
+        }
+
+        while (true) {
         split_gen_a_req req{};
         std::vector<int32_t> tokens_i32;
         if (!split_gen_recv_req(ctrl_fd, req, tokens_i32)) {
-            fprintf(stderr, "gen3_a: recv req failed\n");
+            fprintf(stderr, "gen3_a: client disconnected, waiting for next ctrl connection\n");
+            split_tcp_close(ctrl_fd);
             break;
         }
 
@@ -192,7 +193,13 @@ int main(int argc, char ** argv) {
             resp.magic   = SPLIT_GEN_MAGIC;
             resp.version = SPLIT_GEN3_VERSION;
             split_gen3_send_a_resp(ctrl_fd, resp, nullptr, 0);
-            break;
+            split_tcp_close(ctrl_fd);
+            split_tcp_close(b_fd);
+            split_tcp_close(listen_fd);
+
+            llama_free(ctx);
+            llama_model_free(model);
+            return 0;
         }
 
         if (req.cmd == SPLIT_GEN_CMD_RESET) {
@@ -231,6 +238,7 @@ int main(int argc, char ** argv) {
             decode_rc = split_gen_decode_one(ctx, (llama_token) tokens_i32[0], req.pos_start);
         } else {
             fprintf(stderr, "gen3_a: unknown cmd %u\n", req.cmd);
+            split_tcp_close(ctrl_fd);
             break;
         }
 
@@ -238,6 +246,7 @@ int main(int argc, char ** argv) {
 
         if (decode_rc != 0) {
             fprintf(stderr, "gen3_a: decode failed cmd=%u\n", req.cmd);
+            split_tcp_close(ctrl_fd);
             break;
         }
 
@@ -263,11 +272,13 @@ int main(int argc, char ** argv) {
         if (!forward_to_peer(b_fd, ctx, n_out, n_embd, le, req.pos_start,
                 req.include_logits != 0, n_vocab, ms_a, next_is_final,
                 debug_step, phase, dbg, resp, logits)) {
+            split_tcp_close(ctrl_fd);
             break;
         }
 
         if (!split_gen3_send_a_resp(ctrl_fd, resp, logits.empty() ? nullptr : logits.data(), n_vocab)) {
             fprintf(stderr, "gen3_a: send resp failed\n");
+            split_tcp_close(ctrl_fd);
             break;
         }
 
@@ -275,10 +286,11 @@ int main(int argc, char ** argv) {
             dbg->emit_token_selected(debug_step, phase, resp.token_id, req.pos_start, false);
         }
         debug_step++;
+        }
     }
 
-    split_tcp_close(ctrl_fd);
     split_tcp_close(b_fd);
+    split_tcp_close(listen_fd);
 
     llama_free(ctx);
     llama_model_free(model);
