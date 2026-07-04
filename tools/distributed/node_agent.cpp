@@ -73,6 +73,176 @@ static std::string g_output_service_gguf;
 static bool g_sampler_service_ready = false;
 static llama_model * g_entry_tokenizer = nullptr;
 static llama_model * g_tokenizer_service_model = nullptr;
+static llama_model * g_embedding_service_model = nullptr;
+static llama_context * g_embedding_service_ctx = nullptr;
+static int32_t g_embedding_service_n_embd = 0;
+static bool g_external_embedding = false;
+static std::string g_embedding_service_host;
+static int g_embedding_service_port = 0;
+static std::string g_register_host;
+
+static void free_embedding_service() {
+    if (g_embedding_service_ctx) {
+        llama_free(g_embedding_service_ctx);
+        g_embedding_service_ctx = nullptr;
+    }
+    if (g_embedding_service_model) {
+        llama_model_free(g_embedding_service_model);
+        g_embedding_service_model = nullptr;
+    }
+    g_embedding_service_n_embd = 0;
+}
+
+static bool ensure_embedding_service_loaded(std::string & err) {
+    if (g_embedding_service_ctx != nullptr) {
+        return true;
+    }
+    if (g_embedding_service_gguf.empty()) {
+        err = "embedding service not configured";
+        return false;
+    }
+    ggml_backend_load_all();
+    g_embedding_service_model = llama_model_load_from_file(
+            g_embedding_service_gguf.c_str(), llama_model_default_params());
+    if (!g_embedding_service_model) {
+        err = "failed to load embedding model";
+        return false;
+    }
+    g_embedding_service_n_embd = llama_model_n_embd(g_embedding_service_model);
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx   = 512;
+    cparams.n_batch = 512;
+    cparams.no_perf = true;
+    g_embedding_service_ctx = llama_init_from_model(g_embedding_service_model, cparams);
+    if (!g_embedding_service_ctx) {
+        err = "failed to create embedding context";
+        free_embedding_service();
+        return false;
+    }
+    llama_set_layer_range(g_embedding_service_ctx, 0, 1);
+    g_runtime_stats.runtime_load_count++;
+    return true;
+}
+
+static bool embedding_service_compute_local(
+        const std::vector<int32_t> & tokens,
+        int32_t pos_start,
+        std::vector<float> & hidden_out,
+        int32_t & n_embd_out,
+        std::string & err,
+        bool clear_memory = false) {
+    if (!ensure_embedding_service_loaded(err)) {
+        return false;
+    }
+    if (clear_memory) {
+        llama_memory_clear(llama_get_memory(g_embedding_service_ctx), true);
+    }
+    std::vector<llama_token> toks(tokens.begin(), tokens.end());
+    const bool all_outputs = tokens.size() > 1;
+    if (all_outputs) {
+        if (split_gen_decode_tokens(g_embedding_service_ctx, toks, pos_start, true) != 0) {
+            err = "embedding forward failed";
+            return false;
+        }
+    } else if (split_gen_decode_one(g_embedding_service_ctx, toks[0], pos_start) != 0) {
+        err = "embedding forward failed";
+        return false;
+    }
+    n_embd_out = g_embedding_service_n_embd;
+    hidden_out.resize((size_t) tokens.size() * (size_t) n_embd_out);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const float * h = all_outputs
+                ? llama_get_embeddings_ith(g_embedding_service_ctx, (int32_t) i)
+                : llama_get_embeddings(g_embedding_service_ctx);
+        if (h == nullptr) {
+            err = "embedding output missing";
+            return false;
+        }
+        std::memcpy(
+                hidden_out.data() + i * (size_t) n_embd_out,
+                h,
+                (size_t) n_embd_out * sizeof(float));
+    }
+    return true;
+}
+
+static void embedding_service_reset() {
+    if (g_embedding_service_ctx != nullptr) {
+        llama_memory_clear(llama_get_memory(g_embedding_service_ctx), true);
+    }
+}
+
+static bool embedding_service_compute_remote(
+        const std::vector<int32_t> & tokens,
+        int32_t pos_start,
+        std::vector<float> & hidden_out,
+        int32_t & n_embd_out,
+        std::string & err) {
+    if (g_embedding_service_host.empty() || g_embedding_service_port <= 0) {
+        err = "embedding service endpoint not configured";
+        return false;
+    }
+    httplib::Client cli(g_embedding_service_host.c_str(), g_embedding_service_port);
+    cli.set_connection_timeout(10, 0);
+    cli.set_read_timeout(120, 0);
+    json body = json::object();
+    json toks = json::array();
+    for (int32_t t : tokens) {
+        toks.push_back(t);
+    }
+    body["tokens"]    = toks;
+    body["pos_start"] = pos_start;
+    const auto res = cli.Post("/runtime/embedding/embed", body.dump(), "application/json");
+    if (!res || res->status != 200) {
+        err = "remote embedding service failed";
+        return false;
+    }
+    try {
+        const json j = json::parse(res->body);
+        if (!j.value("ok", false)) {
+            err = j.value("error", "embed failed");
+            return false;
+        }
+        n_embd_out = j.value("n_embd", 0);
+        hidden_out.clear();
+        for (const auto & v : j.at("hidden")) {
+            hidden_out.push_back(v.get<float>());
+        }
+        if (n_embd_out <= 0 || hidden_out.empty()) {
+            err = "invalid embedding response";
+            return false;
+        }
+        return true;
+    } catch (...) {
+        err = "invalid embedding response json";
+        return false;
+    }
+}
+
+static bool embedding_service_compute(
+        const std::vector<int32_t> & tokens,
+        int32_t pos_start,
+        std::vector<float> & hidden_out,
+        int32_t & n_embd_out,
+        std::string & err) {
+    const bool local = !g_embedding_service_gguf.empty() &&
+            (g_embedding_service_host.empty() ||
+             g_embedding_service_host == g_register_host ||
+             g_embedding_service_host == "127.0.0.1" ||
+             g_embedding_service_host == "localhost");
+    if (local) {
+        return embedding_service_compute_local(tokens, pos_start, hidden_out, n_embd_out, err);
+    }
+    return embedding_service_compute_remote(tokens, pos_start, hidden_out, n_embd_out, err);
+}
+
+static bool embedding_service_ready() {
+    std::string err;
+    if (!g_embedding_service_gguf.empty()) {
+        return ensure_embedding_service_loaded(err);
+    }
+    return !g_embedding_service_host.empty() && g_embedding_service_port > 0;
+}
 
 static void free_tokenizer_service() {
     if (g_tokenizer_service_model) {
@@ -453,6 +623,21 @@ static bool pipeline_gen3_send_recv(
     return split_gen3_recv_a_resp(ctrl_fd, resp, nullptr);
 }
 
+static bool pipeline_gen3_send_hidden_recv(
+        int ctrl_fd,
+        split_gen_cmd cmd,
+        int32_t n_tokens,
+        int32_t n_embd,
+        int32_t pos_start,
+        int32_t layer_end,
+        const float * hidden,
+        split_gen3_a_resp & resp) {
+    if (!split_gen_send_hidden_req(ctrl_fd, cmd, n_tokens, n_embd, pos_start, layer_end, hidden)) {
+        return false;
+    }
+    return split_gen3_recv_a_resp(ctrl_fd, resp, nullptr);
+}
+
 static bool run_local_pipeline_generate(
         const std::vector<int32_t> & prompt_tokens,
         int max_new,
@@ -491,8 +676,27 @@ static bool run_local_pipeline_generate(
     }
     g_runtime_stats.kv_cache_reset_count++;
 
+    if (g_external_embedding) {
+        embedding_service_reset();
+    }
+
     const auto t_prefill0 = std::chrono::steady_clock::now();
-    if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_PREFILL, (int32_t) prompt_tokens.size(), 0,
+    if (g_external_embedding) {
+        std::vector<float> hidden;
+        int32_t n_embd = 0;
+        if (!embedding_service_compute_local(
+                    prompt_tokens, 0, hidden, n_embd, err, false)) {
+            split_tcp_close(ctrl_fd);
+            return false;
+        }
+        if (!pipeline_gen3_send_hidden_recv(
+                    ctrl_fd, SPLIT_GEN_CMD_PREFILL_HIDDEN, (int32_t) prompt_tokens.size(), n_embd,
+                    0, layer_end, hidden.data(), resp)) {
+            err = "prefill hidden failed";
+            split_tcp_close(ctrl_fd);
+            return false;
+        }
+    } else if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_PREFILL, (int32_t) prompt_tokens.size(), 0,
             layer_end, prompt_tokens.data(), resp)) {
         err = "prefill failed";
         split_tcp_close(ctrl_fd);
@@ -525,7 +729,21 @@ static bool run_local_pipeline_generate(
         if (dbg) {
             dbg->emit_step_begin(debug_step, "decode", cur, pos, 0);
         }
-        if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur, resp)) {
+        if (g_external_embedding) {
+            std::vector<float> hidden;
+            int32_t n_embd = 0;
+            if (!embedding_service_compute_local({ cur }, pos, hidden, n_embd, err, false)) {
+                split_tcp_close(ctrl_fd);
+                return false;
+            }
+            if (!pipeline_gen3_send_hidden_recv(
+                        ctrl_fd, SPLIT_GEN_CMD_DECODE_HIDDEN, 1, n_embd, pos, layer_end,
+                        hidden.data(), resp)) {
+                err = "decode hidden failed at step " + std::to_string(step);
+                split_tcp_close(ctrl_fd);
+                return false;
+            }
+        } else if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur, resp)) {
             err = "decode failed at step " + std::to_string(step);
             split_tcp_close(ctrl_fd);
             return false;
@@ -585,6 +803,7 @@ static bool start_worker(
             "--ctrl-port", std::to_string(cfg.ctrl_port),
             "--b-host", cfg.next_host,
             "--b-port", std::to_string(cfg.next_port),
+            "--layer-start", std::to_string(cfg.layer_start),
             "--layer-end", std::to_string(cfg.layer_end),
             "--bind", cfg.peer_bind,
         };
@@ -663,6 +882,39 @@ static bool tokenizer_shell_loadable(const std::string & path) {
     return true;
 }
 
+static bool embedding_shell_loadable(const std::string & path) {
+    if (path.empty()) {
+        return false;
+    }
+    ggml_backend_load_all();
+    llama_model * model = llama_model_load_from_file(path.c_str(), llama_model_default_params());
+    if (!model) {
+        return false;
+    }
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx   = 8;
+    cparams.n_batch = 8;
+    cparams.no_perf = true;
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        llama_model_free(model);
+        return false;
+    }
+    llama_set_layer_range(ctx, 0, 1);
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    batch.token[0]     = 1;
+    batch.pos[0]       = 0;
+    batch.n_seq_id[0]  = 1;
+    batch.seq_id[0][0] = 0;
+    batch.logits[0]    = 1;
+    batch.n_tokens     = 1;
+    const bool ok = llama_decode(ctx, batch) == 0 && llama_get_embeddings(ctx) != nullptr;
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_model_free(model);
+    return ok;
+}
+
 static std::string configure_materialize_worker_gguf(
         const dist_configure_req & cfg,
         const json & body,
@@ -684,7 +936,14 @@ static std::string configure_materialize_worker_gguf(
     }
 
     worker_role role = dist_role_to_worker_role(cfg.role);
-    if (body.contains("runtime_role")) {
+    int32_t mat_layer_start = cfg.layer_start;
+    int32_t mat_layer_end   = cfg.layer_end;
+    if (body.value("external_embedding", false) && cfg.role == DIST_ROLE_ENTRY) {
+        role = worker_role::pipeline_stage;
+        if (mat_layer_start == 0 && mat_layer_end > 1) {
+            mat_layer_start = 1;
+        }
+    } else if (body.contains("runtime_role")) {
         const runtime_role rt = runtime_role_from_string(body.value("runtime_role", ""));
         if (rt == runtime_role::pipeline_stage && cfg.role != DIST_ROLE_UNCONFIGURED) {
             role = dist_role_to_worker_role(cfg.role);
@@ -712,8 +971,8 @@ static std::string configure_materialize_worker_gguf(
                     store,
                     *manifest,
                     role,
-                    cfg.layer_start,
-                    cfg.layer_end,
+                    mat_layer_start,
+                    mat_layer_end,
                     verr)) {
             err = "materialization verification failed: " + verr;
             return {};
@@ -725,7 +984,7 @@ static std::string configure_materialize_worker_gguf(
     const bool bind_only         = body.value("bind_only", false);
 
     const runtime_bind_result bind = runtime_bind_worker(
-            store, *manifest, role, cfg.layer_start, cfg.layer_end);
+            store, *manifest, role, mat_layer_start, mat_layer_end);
     if (!bind.success && !bind.tensors_ready) {
         err = bind.error.empty() ? "layer store bind failed" : bind.error;
         return {};
@@ -739,8 +998,8 @@ static std::string configure_materialize_worker_gguf(
                     "node_agent: using cached %s role=%s layers=[%d,%d)\n",
                     bind.worker_gguf_path.c_str(),
                     role_name.c_str(),
-                    cfg.layer_start,
-                    cfg.layer_end);
+                    mat_layer_start,
+                    mat_layer_end);
             return bind.worker_gguf_path;
         }
         std::error_code ec;
@@ -786,13 +1045,30 @@ static std::string configure_materialize_worker_gguf(
             err = "tokenizer gguf not loadable after materialize";
             return {};
         }
+    } else if (role == worker_role::embedding) {
+        if (!materialize_worker_gguf(
+                    store,
+                    *manifest,
+                    rt,
+                    worker_role::entry,
+                    0,
+                    1,
+                    out_path,
+                    err)) {
+            err = "failed to materialize embedding weights: " + err;
+            return {};
+        }
+        if (!embedding_shell_loadable(out_path)) {
+            err = "embedding gguf not loadable after materialize";
+            return {};
+        }
     } else if (!materialize_worker_gguf(
                        store,
                        *manifest,
                        rt,
                        role,
-                       cfg.layer_start,
-                       cfg.layer_end,
+                       mat_layer_start,
+                       mat_layer_end,
                        out_path,
                        err)) {
         err = "failed to assemble GGUF from layer store for role " + role_name + ": " + err;
@@ -803,8 +1079,8 @@ static std::string configure_materialize_worker_gguf(
             "node_agent: materialized %s role=%s layers=[%d,%d)\n",
             out_path.c_str(),
             role_name.c_str(),
-            cfg.layer_start,
-            cfg.layer_end);
+            mat_layer_start,
+            mat_layer_end);
     g_runtime_stats.materialization_count++;
     g_runtime_stats.materialization_generation++;
     return out_path;
@@ -866,6 +1142,7 @@ int main(int argc, char ** argv) {
     }
 
     std::string register_host = !advertise_host.empty() ? advertise_host : bind_host;
+    g_register_host = register_host;
     if (register_host == "0.0.0.0" || register_host == "*") {
         fprintf(stderr, "node_agent: set --advertise-host to a reachable IP (not 0.0.0.0)\n");
         return 1;
@@ -1066,9 +1343,63 @@ int main(int argc, char ** argv) {
         }
         const std::string path = body.value("worker_gguf", "");
         g_embedding_service_gguf = path;
+        free_embedding_service();
+        std::string err;
+        const bool ready = path.empty() ? false : ensure_embedding_service_loaded(err);
+        if (!ready) {
+            res.status = 500;
+            res.set_content(json({
+                { "ok", false },
+                { "embedding_ready", false },
+                { "error", err.empty() ? "embedding shell failed to load" : err },
+            }).dump(), "application/json");
+            return;
+        }
         res.set_content(json({
-            { "ok", !path.empty() },
-            { "embedding_ready", !path.empty() },
+            { "ok", true },
+            { "embedding_ready", true },
+            { "n_embd", g_embedding_service_n_embd },
+        }).dump(), "application/json");
+    });
+
+    svr.Post("/runtime/embedding/embed", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        std::vector<int32_t> tokens;
+        if (body.contains("tokens") && body["tokens"].is_array()) {
+            for (const auto & t : body["tokens"]) {
+                tokens.push_back(t.get<int32_t>());
+            }
+        }
+        if (tokens.empty()) {
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"tokens required"})", "application/json");
+            return;
+        }
+        const int32_t pos_start = body.value("pos_start", 0);
+        std::vector<float> hidden;
+        int32_t n_embd = 0;
+        std::string err;
+        if (!embedding_service_compute_local(tokens, pos_start, hidden, n_embd, err)) {
+            res.status = 503;
+            res.set_content(json({ { "ok", false }, { "error", err } }).dump(), "application/json");
+            return;
+        }
+        json hidden_json = json::array();
+        for (float v : hidden) {
+            hidden_json.push_back(v);
+        }
+        res.set_content(json({
+            { "ok", true },
+            { "hidden", hidden_json },
+            { "n_embd", n_embd },
+            { "n_tokens", (int) tokens.size() },
         }).dump(), "application/json");
     });
 
@@ -1146,6 +1477,18 @@ int main(int argc, char ** argv) {
             }
         } else if (rt_role == "embedding") {
             g_embedding_service_gguf = worker_gguf;
+            free_embedding_service();
+            std::string emb_err;
+            if (!ensure_embedding_service_loaded(emb_err)) {
+                res.status = 500;
+                res.set_content(json({
+                    { "status", "error" },
+                    { "runtime_ready", false },
+                    { "error", emb_err.empty() ? "embedding service failed to load" : emb_err },
+                    { "worker_gguf", worker_gguf },
+                }).dump(), "application/json");
+                return;
+            }
         } else if (rt_role == "output_head") {
             g_output_service_gguf = worker_gguf;
         } else if (is_sampler) {
@@ -1183,6 +1526,7 @@ int main(int argc, char ** argv) {
             { "runtime_ready", true },
             { "worker_gguf", worker_gguf },
             { "tokenizer_ready", tokenizer_ready },
+            { "embedding_ready", rt_role == "embedding" ? embedding_service_ready() : false },
             { "tensors_ready", tensors_ready },
             { "cached_gguf", cached_gguf },
             { "materialization_time_ms", ms },
@@ -1247,6 +1591,17 @@ int main(int argc, char ** argv) {
             g_pipeline_ctrl_port = cfg.ctrl_port;
             g_pipeline_layer_end   = cfg.layer_end;
             g_entry_worker_gguf    = worker_model;
+            g_external_embedding   = body.value("external_embedding", false) &&
+                    std::getenv("DIST_EXTERNAL_EMBEDDING") != nullptr &&
+                    std::getenv("DIST_EXTERNAL_EMBEDDING")[0] == '1';
+            if (body.contains("embedding_service") && body["embedding_service"].is_object()) {
+                const auto & es = body["embedding_service"];
+                g_embedding_service_host = es.value("host", "");
+                g_embedding_service_port = es.value("port", 0);
+            } else if (g_external_embedding && !g_embedding_service_gguf.empty()) {
+                g_embedding_service_host.clear();
+                g_embedding_service_port = 0;
+            }
         }
 
         res.set_content(json({
@@ -1323,11 +1678,15 @@ int main(int argc, char ** argv) {
         stop_all_workers();
         free_entry_tokenizer();
         free_tokenizer_service();
+        free_embedding_service();
         g_entry_worker_gguf.clear();
         g_tokenizer_service_gguf.clear();
         g_embedding_service_gguf.clear();
         g_output_service_gguf.clear();
         g_sampler_service_ready = false;
+        g_external_embedding = false;
+        g_embedding_service_host.clear();
+        g_embedding_service_port = 0;
         res.set_content(R"({"ok":true})", "application/json");
     });
 

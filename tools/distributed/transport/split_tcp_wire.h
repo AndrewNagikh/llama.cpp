@@ -88,10 +88,12 @@ constexpr uint32_t SPLIT_GEN_VERSION = 1;
 constexpr uint32_t SPLIT_AB_MAGIC = 0x42415350; // 'PSAB'
 
 enum split_gen_cmd : uint32_t {
-    SPLIT_GEN_CMD_RESET    = 1,
-    SPLIT_GEN_CMD_PREFILL  = 2,
-    SPLIT_GEN_CMD_DECODE   = 3,
-    SPLIT_GEN_CMD_SHUTDOWN = 4,
+    SPLIT_GEN_CMD_RESET         = 1,
+    SPLIT_GEN_CMD_PREFILL       = 2,
+    SPLIT_GEN_CMD_DECODE        = 3,
+    SPLIT_GEN_CMD_SHUTDOWN      = 4,
+    SPLIT_GEN_CMD_PREFILL_HIDDEN = 5,
+    SPLIT_GEN_CMD_DECODE_HIDDEN  = 6,
 };
 
 enum split_ab_cmd : uint32_t {
@@ -133,7 +135,10 @@ struct split_gen_b_resp {
 
 bool split_gen_send_req(int fd, split_gen_cmd cmd, int32_t n_tokens, int32_t pos_start,
         int32_t layer_end, int32_t include_logits, const int32_t * tokens);
-bool split_gen_recv_req(int fd, split_gen_a_req & req, std::vector<int32_t> & tokens);
+bool split_gen_send_hidden_req(int fd, split_gen_cmd cmd, int32_t n_tokens, int32_t n_embd,
+        int32_t pos_start, int32_t layer_end, const float * hidden);
+bool split_gen_recv_req(int fd, split_gen_a_req & req, std::vector<int32_t> & tokens,
+        std::vector<float> * hidden = nullptr, int32_t * n_embd_out = nullptr);
 
 bool split_gen_send_resp(int fd, const split_gen_a_resp & resp, const float * logits, int32_t n_vocab);
 bool split_gen_recv_resp(int fd, split_gen_a_resp & resp, std::vector<float> * logits);

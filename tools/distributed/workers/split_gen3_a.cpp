@@ -100,6 +100,7 @@ int main(int argc, char ** argv) {
     const char * model_path = argv[1];
     int ctrl_port = -1;
     int b_port    = -1;
+    int layer_start = 0;
     int layer_end = 5;
     bool next_is_final = false;
     const char * b_host = "127.0.0.1";
@@ -114,6 +115,8 @@ int main(int argc, char ** argv) {
             b_host = argv[++i];
         } else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
             bind_host = argv[++i];
+        } else if (strcmp(argv[i], "--layer-start") == 0 && i + 1 < argc) {
+            layer_start = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--layer-end") == 0 && i + 1 < argc) {
             layer_end = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--next-final") == 0) {
@@ -150,7 +153,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    llama_set_layer_range(ctx, 0, layer_end);
+    llama_set_layer_range(ctx, layer_start, layer_end);
 
     dist_debug_load_config();
     dist_debug_reset_recorder("entry");
@@ -169,7 +172,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    fprintf(stderr, "gen3_a: ready ctrl_port=%d layer_end=%d\n", ctrl_port, layer_end);
+    fprintf(stderr, "gen3_a: ready ctrl_port=%d layer_start=%d layer_end=%d\n",
+            ctrl_port, layer_start, layer_end);
 
     while (true) {
         const int ctrl_fd = split_tcp_accept(listen_fd);
@@ -181,7 +185,9 @@ int main(int argc, char ** argv) {
         while (true) {
         split_gen_a_req req{};
         std::vector<int32_t> tokens_i32;
-        if (!split_gen_recv_req(ctrl_fd, req, tokens_i32)) {
+        std::vector<float> hidden_in;
+        int32_t hidden_n_embd = 0;
+        if (!split_gen_recv_req(ctrl_fd, req, tokens_i32, &hidden_in, &hidden_n_embd)) {
             fprintf(stderr, "gen3_a: client disconnected, waiting for next ctrl connection\n");
             split_tcp_close(ctrl_fd);
             break;
@@ -219,23 +225,44 @@ int main(int argc, char ** argv) {
 
         const int64_t t0 = ggml_time_us();
         int decode_rc = 0;
-        const char * phase = (req.cmd == SPLIT_GEN_CMD_PREFILL) ? "prefill" : "decode";
+        const char * phase = (req.cmd == SPLIT_GEN_CMD_PREFILL ||
+                              req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) ? "prefill" : "decode";
         const int32_t in_tok = tokens_i32.empty() ? -1 : tokens_i32[0];
 
         if (dbg) {
             dbg->emit_step_begin(debug_step, phase, in_tok, req.pos_start, 0);
             dist_debug_log_position(dbg, debug_step, phase, ctx, req.pos_start,
-                    req.cmd == SPLIT_GEN_CMD_PREFILL ? req.n_tokens : 1, 1);
+                    req.cmd == SPLIT_GEN_CMD_PREFILL || req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN
+                            ? req.n_tokens : 1,
+                    1);
         }
 
         if (req.cmd == SPLIT_GEN_CMD_PREFILL) {
+            if (layer_start > 0) {
+                fprintf(stderr, "gen3_a: token prefill requires layer_start=0\n");
+                split_tcp_close(ctrl_fd);
+                break;
+            }
             std::vector<llama_token> tokens((size_t) req.n_tokens);
             for (int32_t i = 0; i < req.n_tokens; ++i) {
                 tokens[i] = (llama_token) tokens_i32[i];
             }
             decode_rc = split_gen_decode_tokens(ctx, tokens, req.pos_start, true);
         } else if (req.cmd == SPLIT_GEN_CMD_DECODE) {
+            if (layer_start > 0) {
+                fprintf(stderr, "gen3_a: token decode requires layer_start=0\n");
+                split_tcp_close(ctrl_fd);
+                break;
+            }
             decode_rc = split_gen_decode_one(ctx, (llama_token) tokens_i32[0], req.pos_start);
+        } else if (req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) {
+            const int32_t n_emb = hidden_n_embd > 0 ? hidden_n_embd : n_embd;
+            decode_rc = split_gen_decode_hidden(
+                    ctx, hidden_in.data(), req.n_tokens, n_emb, req.pos_start, true);
+        } else if (req.cmd == SPLIT_GEN_CMD_DECODE_HIDDEN) {
+            const int32_t n_emb = hidden_n_embd > 0 ? hidden_n_embd : n_embd;
+            decode_rc = split_gen_decode_hidden(
+                    ctx, hidden_in.data(), 1, n_emb, req.pos_start, true);
         } else {
             fprintf(stderr, "gen3_a: unknown cmd %u\n", req.cmd);
             split_tcp_close(ctrl_fd);
@@ -250,7 +277,8 @@ int main(int argc, char ** argv) {
             break;
         }
 
-        const int32_t n_out = (req.cmd == SPLIT_GEN_CMD_PREFILL) ? req.n_tokens : 1;
+        const int32_t n_out = (req.cmd == SPLIT_GEN_CMD_PREFILL ||
+                               req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) ? req.n_tokens : 1;
         const int32_t le    = req.layer_end > 0 ? req.layer_end : layer_end;
 
         if (dbg) {

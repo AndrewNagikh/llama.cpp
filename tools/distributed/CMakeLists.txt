@@ -367,6 +367,17 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-runtime-role-planner PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-runtime-role-planner PRIVATE llama llama-common Threads::Threads)
 
+    add_executable(test-embedding-service test-embedding-service.cpp
+        runtime/runtime_role.cpp
+        runtime/runtime_role_descriptor.cpp
+        runtime/runtime_graph.cpp
+        runtime/runtime_cost_model.cpp
+        runtime/runtime_role_planner.cpp
+        architecture/worker_requirement.cpp
+        dist_common.cpp)
+    target_include_directories(test-embedding-service PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-embedding-service PRIVATE llama llama-common Threads::Threads)
+
     add_executable(test-capacity-check test-capacity-check.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
     target_include_directories(test-capacity-check PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-capacity-check PRIVATE llama llama-common Threads::Threads)

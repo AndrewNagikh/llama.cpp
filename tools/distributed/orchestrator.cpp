@@ -867,6 +867,11 @@ static bool prepare_runtime_node(
                   j.value("error", "tokenizer shell failed");
             return false;
         }
+        if (rt_role == "embedding" && !j.value("embedding_ready", false)) {
+            err = node.node_id + ": prepare embedding not ready: " +
+                  j.value("error", "embedding shell failed");
+            return false;
+        }
         return true;
     } catch (...) {
         err = node.node_id + ": invalid prepare response";
@@ -1181,6 +1186,11 @@ static bool setup_pipeline(
         dist_session & session,
         std::string & err);
 
+static bool external_embedding_enabled() {
+    const char * v = std::getenv("DIST_EXTERNAL_EMBEDDING");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
 static bool setup_runtime_graph(
         const std::string & session_id,
         int n_layers,
@@ -1272,6 +1282,17 @@ static bool setup_runtime_graph(
                     err = a.node_id + " embedding configure failed";
                     return false;
                 }
+                try {
+                    const json j = json::parse(res->body);
+                    if (!j.value("ok", false) || !j.value("embedding_ready", false)) {
+                        err = a.node_id + " embedding configure: " +
+                              j.value("error", "embedding not ready");
+                        return false;
+                    }
+                } catch (...) {
+                    err = a.node_id + " embedding configure: invalid response";
+                    return false;
+                }
             } else if (a.role == runtime_role::output_head && !artifact.empty()) {
                 const json cfg = {
                     { "session_id", session_id },
@@ -1303,6 +1324,9 @@ static bool setup_runtime_graph(
         err = "runtime graph has no pipeline stages";
         return false;
     }
+
+    const runtime_role_assignment * emb_assign = session.runtime.find_role(runtime_role::embedding);
+    const bool external_embedding = external_embedding_enabled() && emb_assign != nullptr;
 
     std::vector<dist_pipeline_stage> stages;
     stages.reserve(stage_ptrs.size());
@@ -1354,6 +1378,10 @@ static bool setup_runtime_graph(
             { "peer_bind", "0.0.0.0" },
             { "runtime_role", "pipeline_stage" },
         };
+        if (external_embedding && stage.role == DIST_ROLE_ENTRY && stage.layer_start == 0) {
+            prep["layer_start"] = 1;
+            prep["external_embedding"] = true;
+        }
         if (const dist_model_record * record = g_registry.find(session.model)) {
             prep["source_url"] = resolve_model_source_url(*record);
         }
@@ -1363,6 +1391,9 @@ static bool setup_runtime_graph(
             prep["role"] = "middle";
         } else {
             prep["role"] = "entry";
+            if (external_embedding) {
+                prep["external_embedding"] = true;
+            }
         }
 
         dist_rss_log_stage("prepare_runtime", stage.node_id.c_str());
@@ -1389,6 +1420,10 @@ static bool setup_runtime_graph(
             { "worker_gguf", worker_ggufs[(size_t) ri] },
             { "runtime_role", "pipeline_stage" },
         };
+        if (external_embedding && stage.role == DIST_ROLE_ENTRY && stage.layer_start == 0) {
+            cfg["layer_start"] = 1;
+            cfg["external_embedding"] = true;
+        }
         if (const dist_model_record * record = g_registry.find(session.model)) {
             cfg["source_url"] = resolve_model_source_url(*record);
         }
@@ -1408,6 +1443,13 @@ static bool setup_runtime_graph(
             cfg["next_host"] = next.host;
             cfg["next_port"] = next.peer_port;
             cfg["next_is_final"] = (next.role == DIST_ROLE_FINAL);
+            if (external_embedding && emb_assign != nullptr) {
+                cfg["external_embedding"] = true;
+                cfg["embedding_service"] = {
+                    { "host", emb_assign->host },
+                    { "port", emb_assign->http_port },
+                };
+            }
         }
 
         if (!configure_node(*node, cfg, err)) {

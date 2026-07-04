@@ -309,7 +309,32 @@ bool split_gen_send_req(int fd, split_gen_cmd cmd, int32_t n_tokens, int32_t pos
     return true;
 }
 
-bool split_gen_recv_req(int fd, split_gen_a_req & req, std::vector<int32_t> & tokens) {
+bool split_gen_send_hidden_req(int fd, split_gen_cmd cmd, int32_t n_tokens, int32_t n_embd,
+        int32_t pos_start, int32_t layer_end, const float * hidden) {
+    split_gen_a_req req{};
+    req.magic          = SPLIT_GEN_MAGIC;
+    req.version        = SPLIT_GEN_VERSION;
+    req.cmd            = cmd;
+    req.n_tokens       = n_tokens;
+    req.pos_start      = pos_start;
+    req.layer_end      = layer_end;
+    req.include_logits = 0;
+
+    if (!split_tcp_send_all(fd, &req, sizeof(req))) {
+        return false;
+    }
+    if (!split_tcp_send_all(fd, &n_embd, sizeof(n_embd))) {
+        return false;
+    }
+    if (n_tokens > 0 && n_embd > 0 && hidden != nullptr) {
+        return split_tcp_send_all(
+                fd, hidden, (size_t) n_tokens * (size_t) n_embd * sizeof(float));
+    }
+    return true;
+}
+
+bool split_gen_recv_req(int fd, split_gen_a_req & req, std::vector<int32_t> & tokens,
+        std::vector<float> * hidden, int32_t * n_embd_out) {
     if (!split_tcp_recv_all(fd, &req, sizeof(req))) {
         return false;
     }
@@ -319,11 +344,35 @@ bool split_gen_recv_req(int fd, split_gen_a_req & req, std::vector<int32_t> & to
     }
 
     tokens.clear();
+    if (hidden != nullptr) {
+        hidden->clear();
+    }
+    if (n_embd_out != nullptr) {
+        *n_embd_out = 0;
+    }
+
     if (req.n_tokens > 0 &&
             (req.cmd == SPLIT_GEN_CMD_PREFILL || req.cmd == SPLIT_GEN_CMD_DECODE)) {
         tokens.resize((size_t) req.n_tokens);
         if (!split_tcp_recv_all(fd, tokens.data(), tokens.size() * sizeof(int32_t))) {
             return false;
+        }
+    }
+
+    if (req.n_tokens > 0 &&
+            (req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN || req.cmd == SPLIT_GEN_CMD_DECODE_HIDDEN)) {
+        int32_t n_embd = 0;
+        if (!split_tcp_recv_all(fd, &n_embd, sizeof(n_embd))) {
+            return false;
+        }
+        if (n_embd_out != nullptr) {
+            *n_embd_out = n_embd;
+        }
+        if (hidden != nullptr && n_embd > 0) {
+            hidden->resize((size_t) req.n_tokens * (size_t) n_embd);
+            if (!split_tcp_recv_all(fd, hidden->data(), hidden->size() * sizeof(float))) {
+                return false;
+            }
         }
     }
 
