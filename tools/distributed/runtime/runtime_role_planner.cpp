@@ -62,14 +62,15 @@ runtime_role_planner_result dist_plan_runtime_graph(
     const runtime_role_descriptor smp_desc = default_descriptor_for_role(runtime_role::sampler, weight_bytes);
     const runtime_role_descriptor stg_desc = default_descriptor_for_role(runtime_role::pipeline_stage, weight_bytes);
 
-    const std::string tok_node = dist_pick_node_for_runtime_role(runtime_role::tokenizer, tok_desc, candidates);
-
-    // Embedding/output remain colocated with first/last pipeline stage until hidden-state
-    // injection (11.3) and remote logits path (11.4) are wired end-to-end.
-    (void) emb_desc;
-    (void) out_desc;
     const std::string first_stage_node = layer_assignments.front().node_id;
     const std::string last_stage_node  = layer_assignments.back().node_id;
+
+    // Tokenizer/embedding/output colocate with first/last pipeline stage until
+    // dedicated blob sync and hidden/logits paths (11.3–11.4) are wired.
+    (void) tok_desc;
+    (void) emb_desc;
+    (void) out_desc;
+    const std::string tok_node         = first_stage_node;
     const std::string emb_node         = first_stage_node;
     const std::string out_node         = last_stage_node;
 

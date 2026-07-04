@@ -56,12 +56,9 @@ static int test_role_memory_fit() {
         fprintf(stderr, "missing tokenizer role\n");
         return 1;
     }
-    if (tok->node_id == "mac") {
-        fprintf(stderr, "tokenizer should not land on 18GB mac for 60GB model\n");
-        return 1;
-    }
-    if (tok->node_id != "win") {
-        fprintf(stderr, "expected tokenizer on win, got %s\n", tok->node_id.c_str());
+    if (tok->node_id != "mac") {
+        fprintf(stderr, "tokenizer should colocate with first pipeline stage (mac), got %s\n",
+                tok->node_id.c_str());
         return 1;
     }
     return 0;
