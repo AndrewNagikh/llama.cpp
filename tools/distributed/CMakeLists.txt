@@ -188,6 +188,13 @@ set(VERIFICATION_SOURCES
     verification/verification_suite.cpp
 )
 
+set(DIST_VERIFY_RUNTIME_SOURCES
+    runtime/runtime_role.cpp
+    runtime/runtime_descriptor.cpp
+    runtime/runtime_graph.cpp
+    runtime/runtime_install_planning.cpp
+)
+
 function(dist_link_platform_libs target)
     if (WIN32)
         target_link_libraries(${target} PRIVATE ws2_32)
@@ -195,7 +202,7 @@ function(dist_link_platform_libs target)
 endfunction()
 
 function(dist_add_verify_exe name main_source)
-    add_executable(${name} ${main_source} ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES} dist_common.cpp memory_estimator.cpp)
+    add_executable(${name} ${main_source} ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES} ${DIST_VERIFY_RUNTIME_SOURCES} dist_common.cpp memory_estimator.cpp)
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(${name} PRIVATE cxx_std_17)
     target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
