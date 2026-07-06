@@ -313,6 +313,29 @@ bool cluster_model_registry::apply_layout(
     model_layout ml;
     ml.desired = layout;
     r.layout = ml;
+    r.stored_runtime_graph.reset();
+    r.stored_runtime_install_nodes.reset();
+
+    if (out) {
+        *out = r;
+    }
+    return true;
+}
+
+bool cluster_model_registry::apply_runtime_plan(
+        const std::string & model_id,
+        runtime_graph graph,
+        runtime_install_node_map install_nodes,
+        dist_model_record * out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(model_id);
+    if (it == records_.end()) {
+        return false;
+    }
+
+    dist_model_record & r = it->second;
+    r.stored_runtime_graph         = std::move(graph);
+    r.stored_runtime_install_nodes = std::move(install_nodes);
 
     if (out) {
         *out = r;
@@ -361,7 +384,8 @@ bool cluster_model_registry::apply_coverage(
 bool cluster_model_registry::refresh_coverage(
         const std::string & model_id,
         const std::set<std::string> & online_nodes,
-        dist_model_record * out) {
+        dist_model_record * out,
+        const runtime_install_node_map * runtime_nodes) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = records_.find(model_id);
     if (it == records_.end()) {
@@ -387,7 +411,7 @@ bool cluster_model_registry::refresh_coverage(
         const semantic_runtime_descriptor rt =
                 build_semantic_runtime_descriptor(*r.manifest);
         const runtime_coverage_report rt_report = compute_runtime_coverage(
-                rt, r.layout->desired, actual, online_nodes);
+                rt, r.layout->desired, actual, online_nodes, runtime_nodes);
         report = rt_report.layer_coverage;
         if (!rt_report.fully_ready() && report.state == coverage_state::ready) {
             report.state = coverage_state::partial;
@@ -535,6 +559,8 @@ bool cluster_model_registry::clear_install_cluster_state(
     r.actual.reset();
     r.coverage.reset();
     r.stored_install_plan.reset();
+    r.stored_runtime_graph.reset();
+    r.stored_runtime_install_nodes.reset();
 
     if (out) {
         *out = r;

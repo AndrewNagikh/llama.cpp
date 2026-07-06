@@ -182,6 +182,20 @@ void add_semantic_blob_downloads(
         const std::string & source_url,
         const actual_model_layout & actual,
         const std::set<std::string> & ready_blobs) {
+    const runtime_install_node_map runtime_nodes = runtime_install_node_map_legacy(
+            entry_node, final_node, all_nodes);
+    add_semantic_blob_downloads(
+            operations, seen, rt, runtime_nodes, source_url, actual, ready_blobs);
+}
+
+void add_semantic_blob_downloads(
+        std::vector<install_operation> & operations,
+        std::set<std::string> & seen,
+        const semantic_runtime_descriptor & rt,
+        const runtime_install_node_map & runtime_nodes,
+        const std::string & source_url,
+        const actual_model_layout & actual,
+        const std::set<std::string> & ready_blobs) {
     for (const semantic_blob & blob : rt.blobs) {
         if (blob.storage_alias || blob.deploy == blob_deploy_target::none || blob.tensors.empty()) {
             continue;
@@ -190,8 +204,8 @@ void add_semantic_blob_downloads(
             continue;
         }
 
-        const std::vector<std::string> desired_nodes = nodes_for_blob_deploy(
-                blob.deploy, entry_node, final_node, all_nodes);
+        const std::vector<std::string> desired_nodes = nodes_for_runtime_blob_deploy(
+                blob.deploy, blob.role, runtime_nodes);
         const std::string storage_id = blob.storage_alias && !blob.storage_blob_id.empty()
                 ? blob.storage_blob_id
                 : blob.id;

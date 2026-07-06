@@ -117,6 +117,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_layer_range(int32_t start, int32_t end);
+    void set_skip_output_head(bool skip);
     void set_hidden_state(const float * data, int32_t n_tokens);
     void clear_hidden_state();
     int32_t get_hidden_state_n_tokens() const;

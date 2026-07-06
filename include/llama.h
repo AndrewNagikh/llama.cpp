@@ -342,6 +342,8 @@ extern "C" {
         uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
+        int32_t  layer_start;       // execute layers in [layer_start, layer_end)
+        int32_t  layer_end;         // layer_end < 0 means all layers
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
@@ -382,6 +384,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool skip_output_head; // skip output norm/head for hidden-state pipeline stages
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -468,6 +471,7 @@ extern "C" {
     LLAMA_API void llama_detach_threadpool(struct llama_context * ctx);
 
     typedef void (*llama_model_set_tensor_data_t)(struct ggml_tensor * tensor, void * userdata);
+    typedef bool (*llama_model_tensor_filter_t)(const char * tensor_name, void * userdata);
 
     // Create a new model from GGUF metadata as well as a function to set the tensor data
     //   - tensors are created as GGML_TYPE_F32 by default,
@@ -476,6 +480,14 @@ extern "C" {
                     struct gguf_context * metadata,
           llama_model_set_tensor_data_t   set_tensor_data,    // function to initialize tensor data with
                                    void * set_tensor_data_ud, // userdata for function
+              struct llama_model_params   params);
+
+    LLAMA_API struct llama_model * llama_model_init_from_user_filtered(
+                    struct gguf_context * metadata,
+          llama_model_set_tensor_data_t   set_tensor_data,
+                                   void * set_tensor_data_ud,
+          llama_model_tensor_filter_t     tensor_filter,
+                                   void * tensor_filter_ud,
               struct llama_model_params   params);
 
     DEPRECATED(LLAMA_API struct llama_model * llama_load_model_from_file(

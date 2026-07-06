@@ -8,6 +8,17 @@
 #include <string>
 #include <vector>
 
+// Advertised service endpoint. This is what other nodes must use; it is
+// intentionally separate from local bind addresses.
+struct runtime_service_endpoint {
+    std::string scheme = "http";
+    std::string host;
+    int         port = 0;
+
+    nlohmann::json to_json() const;
+    static runtime_service_endpoint from_json(const nlohmann::json & j);
+};
+
 // One role binding on a cluster node.
 
 struct runtime_role_assignment {
@@ -15,6 +26,7 @@ struct runtime_role_assignment {
     std::string  node_id;
     std::string  host;
     int          http_port    = 0;
+    runtime_service_endpoint endpoint;
     int32_t      layer_start  = 0;
     int32_t      layer_end    = 0;
     int          stage_index  = 0;

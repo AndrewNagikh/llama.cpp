@@ -18,6 +18,9 @@ struct runtime_planner_node {
     uint64_t    gpu_budget_bytes = 0;
     double      cpu_score       = 1.0;
     double      memory_bw_score = 1.0;
+    int32_t     pipeline_layers = 0;
+    bool        is_first_pipeline_stage = false;
+    bool        is_last_pipeline_stage  = false;
 };
 
 runtime_planner_node runtime_planner_node_from_dist(const dist_node_info & node);
@@ -38,3 +41,7 @@ double runtime_cost_for_role(
         int32_t layer_count = 0);
 
 uint64_t runtime_node_budget_bytes(const runtime_planner_node & node, bool prefers_gpu);
+
+double runtime_pipeline_service_penalty(
+        const runtime_planner_node & node,
+        runtime_role role);

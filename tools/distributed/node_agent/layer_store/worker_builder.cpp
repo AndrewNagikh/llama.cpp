@@ -62,8 +62,7 @@ bool all_nodes_blob_required_for_role(const semantic_blob & blob, const worker_r
     // Tied embeddings mark embedding as all_nodes for mono parity; distributed
     // middle stages must not pull embedding weights onto every pipeline node.
     if (blob.id == "embedding" || blob.role == tensor_semantic_role::embedding) {
-        return role == worker_role::entry ||
-               role == worker_role::embedding ||
+        return role == worker_role::embedding ||
                role == worker_role::full;
     }
     return true;

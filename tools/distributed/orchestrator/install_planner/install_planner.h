@@ -3,6 +3,7 @@
 #include "coverage/coverage.h"
 #include "layout_planner/layout_planner.h"
 #include "manifest_builder/manifest_builder.h"
+#include "runtime/runtime_install_planning.h"
 
 #include "nlohmann/json.hpp"
 
@@ -104,7 +105,8 @@ install_plan_build_result build_install_plan(
         const desired_model_layout & desired,
         const actual_model_layout & actual,
         const coverage_report & coverage,
-        const std::string & source_url = "");
+        const std::string & source_url = "",
+        const runtime_install_node_map * runtime_nodes = nullptr);
 
 // Group consecutive same-node operations (sorted by node, layer).
 std::vector<install_plan_group> group_install_operations(

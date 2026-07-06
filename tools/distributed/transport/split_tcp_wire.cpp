@@ -15,8 +15,10 @@ typedef int socklen_t;
 static bool g_wsa_started = false;
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -178,11 +180,46 @@ int split_tcp_connect(const char * host, int port) {
             continue;
         }
 
+#if !defined(_WIN32)
+        const int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
+#endif
+
         if (connect(fd, ai->ai_addr, (socklen_t) ai->ai_addrlen) == 0) {
+#if !defined(_WIN32)
+            if (flags >= 0) {
+                fcntl(fd, F_SETFL, flags);
+            }
+#endif
             split_tcp_set_timeouts(fd, 30000);
             freeaddrinfo(res);
             return fd;
         }
+
+#if !defined(_WIN32)
+        if (errno == EINPROGRESS) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(fd, &wfds);
+            timeval tv{};
+            tv.tv_sec = 1;
+            const int sel = select(fd + 1, nullptr, &wfds, nullptr, &tv);
+            if (sel > 0 && FD_ISSET(fd, &wfds)) {
+                int so_error = 0;
+                socklen_t so_len = sizeof(so_error);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) == 0 && so_error == 0) {
+                    if (flags >= 0) {
+                        fcntl(fd, F_SETFL, flags);
+                    }
+                    split_tcp_set_timeouts(fd, 30000);
+                    freeaddrinfo(res);
+                    return fd;
+                }
+            }
+        }
+#endif
 
         split_tcp_close(fd);
         fd = -1;

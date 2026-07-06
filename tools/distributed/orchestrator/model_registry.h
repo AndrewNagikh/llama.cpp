@@ -15,6 +15,8 @@
 #include "install_planner/install_planner.h"
 #include "optimizer/cluster_optimizer.h"
 #include "model_provider/model_provider.h"
+#include "runtime/runtime_graph.h"
+#include "runtime/runtime_install_planning.h"
 
 // ---------------------------------------------------------------------------
 // Cluster Model Registry - Task 9.1 / 9.2 / 9.3
@@ -54,6 +56,9 @@ struct dist_model_record {
     std::optional<install_plan>      stored_install_plan;
     std::optional<model_layout>      pending_layout;   // Task 9.8 two-phase rebalance
     std::optional<optimization_result> optimization; // Task 9.8 last optimizer run
+    // Task 11 — cached runtime graph + install map (stable across install/session).
+    std::optional<runtime_graph>           stored_runtime_graph;
+    std::optional<runtime_install_node_map> stored_runtime_install_nodes;
 
     // Task 9.2: remote discovery metadata
     std::vector<remote_model_file> files;
@@ -105,6 +110,12 @@ public:
             const desired_model_layout & layout,
             dist_model_record * out = nullptr);
 
+    bool apply_runtime_plan(
+            const std::string & model_id,
+            runtime_graph graph,
+            runtime_install_node_map install_nodes,
+            dist_model_record * out = nullptr);
+
     // Store actual installed layers reported by nodes.
     bool apply_actual(
             const std::string & model_id,
@@ -121,7 +132,8 @@ public:
     bool refresh_coverage(
             const std::string & model_id,
             const std::set<std::string> & online_nodes = {},
-            dist_model_record * out = nullptr);
+            dist_model_record * out = nullptr,
+            const runtime_install_node_map * runtime_nodes = nullptr);
 
     bool apply_install_plan(
             const std::string & model_id,

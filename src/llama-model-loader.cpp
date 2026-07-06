@@ -513,6 +513,8 @@ llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
+        llama_model_tensor_filter_t tensor_filter,
+        void * tensor_filter_ud,
         const std::string & fname,
         std::vector<std::string> & splits,
         FILE * file,
@@ -522,7 +524,11 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+        : metadata(meta),
+          set_tensor_data(set_tensor_data),
+          set_tensor_data_ud(set_tensor_data_ud),
+          tensor_filter(tensor_filter),
+          tensor_filter_ud(tensor_filter_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -1241,6 +1247,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             GGML_ASSERT(t_meta.nb[dim] >= 1);
         }
         ggml_set_name(&t_meta, tn.str().c_str());
+        if (tensor_filter != nullptr && !tensor_filter(t_meta.name, tensor_filter_ud)) {
+            return nullptr;
+        }
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);

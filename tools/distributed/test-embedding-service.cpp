@@ -13,10 +13,11 @@ static dist_node_info make_node(const std::string & id, double score) {
     n.score     = score;
     n.online    = true;
     n.memory.free_ram_bytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;
+    n.cpu.logical_cores = 8;
     return n;
 }
 
-static int test_embedding_colocated_with_entry() {
+static int test_services_colocated_with_entry_boundary() {
     std::vector<dist_layer_assignment> layers;
     dist_layer_assignment a{};
     a.node_id     = "node-a";
@@ -52,14 +53,15 @@ static int test_embedding_colocated_with_entry() {
         return 1;
     }
     if (emb->node_id != "node-a" || tok->node_id != "node-a") {
-        fprintf(stderr, "embedding/tokenizer should colocate with entry stage node-a\n");
+        fprintf(stderr, "expected tokenizer/embedding on entry boundary node-a, got tok=%s emb=%s\n",
+                tok->node_id.c_str(), emb->node_id.c_str());
         return 1;
     }
     return 0;
 }
 
 int main() {
-    if (test_embedding_colocated_with_entry() != 0) {
+    if (test_services_colocated_with_entry_boundary() != 0) {
         fprintf(stderr, "test-embedding-service: FAILED\n");
         return 1;
     }

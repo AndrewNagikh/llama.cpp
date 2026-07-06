@@ -147,7 +147,8 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
     }
     cur = inpL;
 
-    const bool partial = layer_end < n_layer;
+    const bool partial = layer_end < n_layer ||
+            (cparams.skip_output_head && layer_start > 0);
 
     if (!partial) {
         cur = build_norm(cur,

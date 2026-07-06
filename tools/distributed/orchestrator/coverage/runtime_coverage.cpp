@@ -1,7 +1,9 @@
 #include "runtime_coverage.h"
 
+#include "architecture/architecture_descriptor.h"
 #include "architecture/semantic_blob.h"
 #include "architecture/semantic_runtime_descriptor.h"
+#include "runtime/runtime_install_planning.h"
 
 #include <algorithm>
 #include <climits>
@@ -130,7 +132,8 @@ runtime_coverage_report compute_runtime_coverage(
         const semantic_runtime_descriptor & rt,
         const desired_model_layout & desired,
         const actual_model_layout & actual,
-        const std::set<std::string> & online_nodes) {
+        const std::set<std::string> & online_nodes,
+        const runtime_install_node_map * runtime_nodes) {
     runtime_coverage_report report;
     const layer_tensor_expectations expectations = expectations_from_rt(rt);
     const layer_tensor_expectations * exp_ptr =
@@ -151,6 +154,11 @@ runtime_coverage_report compute_runtime_coverage(
     }
     std::vector<std::string> node_list(layout_nodes.begin(), layout_nodes.end());
 
+    const runtime_install_node_map deploy_nodes =
+            runtime_nodes != nullptr && runtime_nodes->valid()
+                    ? *runtime_nodes
+                    : runtime_install_node_map_legacy(entry_node, final_node, node_list);
+
     int storage_missing = 0;
     int storage_ready   = 0;
     int storage_total   = 0;
@@ -161,8 +169,8 @@ runtime_coverage_report compute_runtime_coverage(
             continue;
         }
 
-        const std::vector<std::string> targets = nodes_for_blob_deploy(
-                blob.deploy, entry_node, final_node, node_list);
+        const std::vector<std::string> targets = nodes_for_runtime_blob_deploy(
+                blob.deploy, blob.role, deploy_nodes);
         const std::string storage_id = blob.storage_alias && !blob.storage_blob_id.empty()
                 ? blob.storage_blob_id
                 : blob.id;

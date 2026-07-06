@@ -23,6 +23,9 @@ struct llama_cparams {
     // partial forward: execute layers in [layer_start, layer_end); layer_end < 0 means n_layer()
     int32_t  layer_start = 0;
     int32_t  layer_end   = -1;
+    // When true with layer_start > 0 and layer_end == n_layer, skip output norm / LM head
+    // and emit pre-norm hidden state (distributed external output service).
+    bool skip_output_head = false;
 
     float rope_freq_base;
     float rope_freq_scale;

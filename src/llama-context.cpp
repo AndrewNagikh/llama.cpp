@@ -13,15 +13,74 @@
 #include "llama-distributed.h"
 #include "llama.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 //
 // llama_context
 //
+
+static bool dist_graph_trace_enabled() {
+    const char * v = std::getenv("DIST_GRAPH_TRACE");
+    return v != nullptr && std::strcmp(v, "0") != 0;
+}
+
+static void dist_graph_trace_context_event(
+        const char * step,
+        const char * phase,
+        const llama_model & model,
+        const llama_cparams & cparams,
+        uint32_t n_tokens,
+        uint32_t n_seqs,
+        uint32_t n_outputs,
+        double elapsed_ms = -1.0,
+        bool success = true) {
+    if (!dist_graph_trace_enabled()) {
+        return;
+    }
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+    const size_t tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    if (elapsed_ms >= 0.0) {
+        std::fprintf(stderr,
+                "graph_trace timestamp_ms=%lld thread=%zu scope=context step=%s phase=%s elapsed_ms=%.3f success=%d arch=%s layer_start=%d layer_end=%d n_tokens=%u n_seqs=%u n_outputs=%u\n",
+                (long long) ts_ms,
+                tid,
+                step,
+                phase,
+                elapsed_ms,
+                success ? 1 : 0,
+                llm_arch_name(model.arch),
+                cparams.layer_start,
+                cparams.layer_end,
+                n_tokens,
+                n_seqs,
+                n_outputs);
+    } else {
+        std::fprintf(stderr,
+                "graph_trace timestamp_ms=%lld thread=%zu scope=context step=%s phase=%s success=%d arch=%s layer_start=%d layer_end=%d n_tokens=%u n_seqs=%u n_outputs=%u\n",
+                (long long) ts_ms,
+                tid,
+                step,
+                phase,
+                success ? 1 : 0,
+                llm_arch_name(model.arch),
+                cparams.layer_start,
+                cparams.layer_end,
+                n_tokens,
+                n_seqs,
+                n_outputs);
+    }
+    std::fflush(stderr);
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -61,6 +120,9 @@ llama_context::llama_context(
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
+    cparams.layer_start             = params.layer_start;
+    cparams.layer_end               = params.layer_end;
+    cparams.skip_output_head        = params.skip_output_head;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -1177,6 +1239,14 @@ void llama_context::set_layer_range(int32_t start, int32_t end) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_skip_output_head(bool skip) {
+    if (cparams.skip_output_head == skip) {
+        return;
+    }
+    cparams.skip_output_head = skip;
+    sched_need_reserve       = true;
+}
+
 void llama_context::set_hidden_state(const float * data, int32_t n_tokens) {
     LLAMA_LOG_DEBUG("%s: n_tokens = %d\n", __func__, n_tokens);
 
@@ -1213,8 +1283,9 @@ int32_t llama_context::get_hidden_state(float * out, const int32_t out_nfloats) 
 }
 
 bool llama_context::is_layer_partial_out() const {
-    const int32_t end = cparams.layer_end < 0 ? (int32_t) model.hparams.n_layer() : cparams.layer_end;
-    return end < (int32_t) model.hparams.n_layer();
+    const int32_t n_layer = (int32_t) model.hparams.n_layer();
+    const int32_t end     = cparams.layer_end < 0 ? n_layer : cparams.layer_end;
+    return end < n_layer || (cparams.skip_output_head && cparams.layer_start > 0);
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -2432,6 +2503,8 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    const auto trace_start = std::chrono::steady_clock::now();
+    dist_graph_trace_context_event("graph_reserve", "enter", model, cparams, n_tokens, n_seqs, n_outputs);
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -2483,9 +2556,15 @@ ggml_cgraph * llama_context::graph_reserve(
     } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+        const auto elapsed = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - trace_start).count();
+        dist_graph_trace_context_event("graph_reserve", "exit", model, cparams, n_tokens, n_seqs, n_outputs, elapsed, false);
         return nullptr;
     }
 
+    const auto elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - trace_start).count();
+    dist_graph_trace_context_event("graph_reserve", "exit", model, cparams, n_tokens, n_seqs, n_outputs, elapsed, true);
     return gf;
 }
 
@@ -3549,6 +3628,8 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.layer_start                 =*/ 0,
+        /*.layer_end                   =*/ -1,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
@@ -3574,6 +3655,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.skip_output_head            =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -3812,6 +3894,13 @@ void llama_set_hidden_state(llama_context * ctx, const float * data, int32_t n_t
 
 void llama_clear_hidden_state(llama_context * ctx) {
     ctx->clear_hidden_state();
+}
+
+void llama_set_skip_output_head(llama_context * ctx, bool skip) {
+    if (!ctx) {
+        return;
+    }
+    ctx->set_skip_output_head(skip);
 }
 
 int32_t llama_get_hidden_state_n_tokens(llama_context * ctx) {

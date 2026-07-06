@@ -13,13 +13,26 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <numeric>
 #include <sstream>
+#include <thread>
 #include <unordered_set>
 
 // dedup helpers
+
+static int graph_trace_enabled_cached() {
+    static const int enabled = [] {
+        const char * v = std::getenv("DIST_GRAPH_TRACE");
+        return v != nullptr && std::strcmp(v, "0") != 0 ? 1 : 0;
+    }();
+    return enabled;
+}
 
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
@@ -1089,6 +1102,53 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     }
 }
 
+bool llm_graph_context::trace_enabled() const {
+    return graph_trace_enabled_cached() != 0;
+}
+
+void llm_graph_context::trace_event(
+        const char * scope,
+        const char * step,
+        const char * phase,
+        double elapsed_ms,
+        bool success) const {
+    if (!trace_enabled()) {
+        return;
+    }
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+    const size_t tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    if (elapsed_ms >= 0.0) {
+        std::fprintf(stderr,
+                "graph_trace timestamp_ms=%lld thread=%zu scope=%s step=%s phase=%s elapsed_ms=%.3f success=%d arch=%s layer_start=%d layer_end=%d n_tokens=%lld\n",
+                (long long) ts_ms,
+                tid,
+                scope,
+                step,
+                phase,
+                elapsed_ms,
+                success ? 1 : 0,
+                llm_arch_name(arch),
+                cparams.layer_start,
+                cparams.layer_end,
+                (long long) n_tokens);
+    } else {
+        std::fprintf(stderr,
+                "graph_trace timestamp_ms=%lld thread=%zu scope=%s step=%s phase=%s success=%d arch=%s layer_start=%d layer_end=%d n_tokens=%lld\n",
+                (long long) ts_ms,
+                tid,
+                scope,
+                step,
+                phase,
+                success ? 1 : 0,
+                llm_arch_name(arch),
+                cparams.layer_start,
+                cparams.layer_end,
+                (long long) n_tokens);
+    }
+    std::fflush(stderr);
+}
+
 ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
@@ -1844,6 +1904,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+    llm_graph_trace_scope trace(*this, "common", "build_inp_embd");
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
 
@@ -1868,28 +1929,37 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     {
         auto & cur = inps[0];
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
-
-        // apply lora for embedding tokens if needed
-        for (const auto & lora : *loras) {
-            llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
-            if (lw == nullptr) {
-                continue;
-            }
-
-            const float adapter_scale = lora.second;
-            const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
-
-            ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
-                        ctx0, lw->b, // non-transposed lora_b
-                        ggml_get_rows(ctx0, lw->a, inp->tokens)
-                        ), scale);
-
-            cur = ggml_add(ctx0, cur, inpL_delta);
+        {
+            llm_graph_trace_scope subtrace(*this, "common.build_inp_embd", "ggml_get_rows");
+            cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
         }
 
-        if (n_embd_inp != n_embd) {
-            cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+        // apply lora for embedding tokens if needed
+        {
+            llm_graph_trace_scope subtrace(*this, "common.build_inp_embd", "LoRA");
+            for (const auto & lora : *loras) {
+                llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
+                if (lw == nullptr) {
+                    continue;
+                }
+
+                const float adapter_scale = lora.second;
+                const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+
+                ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
+                            ctx0, lw->b, // non-transposed lora_b
+                            ggml_get_rows(ctx0, lw->a, inp->tokens)
+                            ), scale);
+
+                cur = ggml_add(ctx0, cur, inpL_delta);
+            }
+        }
+
+        {
+            llm_graph_trace_scope subtrace(*this, "common.build_inp_embd", "pad");
+            if (n_embd_inp != n_embd) {
+                cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+            }
         }
     }
 
@@ -1903,10 +1973,17 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     assert(ggml_are_same_shape (inps[0], inps[1]));
     assert(ggml_are_same_stride(inps[0], inps[1]));
 
-    ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
+    ggml_tensor * cur;
+    {
+        llm_graph_trace_scope subtrace(*this, "common.build_inp_embd", "build_forward_select");
+        cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
+    }
 
-    if (n_embd_inp != n_embd) {
-        cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
+    {
+        llm_graph_trace_scope subtrace(*this, "common.build_inp_embd", "view");
+        if (n_embd_inp != n_embd) {
+            cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
+        }
     }
 
     res->t_inp_embd = cur;
@@ -1927,7 +2004,70 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     // make sure the produced embeddings are immediately materialized in the ggml graph
     // ref: https://github.com/ggml-org/llama.cpp/pull/18599
-    ggml_build_forward_expand(gf, cur);
+    {
+        llm_graph_trace_scope subtrace(*this, "common.build_inp_embd", "build_forward_expand");
+        ggml_build_forward_expand(gf, cur);
+    }
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_embd_token_only(ggml_tensor * tok_embd) const {
+    llm_graph_trace_scope trace(*this, "common", "build_inp_embd_token_only");
+    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp());
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    cb(inp->tokens, "inp_tokens", -1);
+    ggml_set_input(inp->tokens);
+    res->t_inp_tokens = inp->tokens;
+
+    ggml_tensor * cur;
+    {
+        llm_graph_trace_scope subtrace(*this, "common.build_inp_embd_token_only", "ggml_get_rows");
+        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    }
+
+    {
+        llm_graph_trace_scope subtrace(*this, "common.build_inp_embd_token_only", "LoRA");
+        for (const auto & lora : *loras) {
+            llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
+            if (lw == nullptr) {
+                continue;
+            }
+
+            const float adapter_scale = lora.second;
+            const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+            ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
+                        ctx0, lw->b,
+                        ggml_get_rows(ctx0, lw->a, inp->tokens)
+                        ), scale);
+            cur = ggml_add(ctx0, cur, inpL_delta);
+        }
+    }
+
+    const int64_t n_embd = hparams.n_embd;
+    {
+        llm_graph_trace_scope subtrace(*this, "common.build_inp_embd_token_only", "pad_view");
+        if (hparams.n_embd_inp() != n_embd) {
+            cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+            cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
+        }
+    }
+
+    res->t_inp_embd = cur;
+    if (hparams.f_embedding_scale != 0.0f) {
+        if (!ggml_is_contiguous(cur)) {
+            cur = ggml_cont(ctx0, cur);
+        }
+        cur = ggml_scale(ctx0, cur, hparams.f_embedding_scale);
+    }
+
+    cb(cur, "embd", -1);
+    res->add_input(std::move(inp));
+    {
+        llm_graph_trace_scope subtrace(*this, "common.build_inp_embd_token_only", "build_forward_expand");
+        ggml_build_forward_expand(gf, cur);
+    }
 
     return cur;
 }
@@ -1951,6 +2091,7 @@ ggml_tensor * llm_graph_context::build_inp_hidden() const {
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {
+    llm_graph_trace_scope trace(*this, "common", "build_position");
     auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
 
     auto & cur = inp->pos;
@@ -1979,6 +2120,7 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
 }
 
 ggml_tensor * llm_graph_context::build_inp_out_ids() const {
+    llm_graph_trace_scope trace(*this, "common", "build_out_ids");
     // note: when all tokens are output, we could skip this optimization to spare the ggml_get_rows() calls,
     //       but this would make the graph topology depend on the number of output tokens, which can interfere with
     //       features that require constant topology such as pipeline parallelism
@@ -2332,6 +2474,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 }
 
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+    llm_graph_trace_scope trace(*this, "common", "build_kv_inputs");
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
@@ -2755,6 +2898,7 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
 //       like with the non-sliding window equivalent
 //       once sliding-window hybrid caches are a thing.
 llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const {
+    llm_graph_trace_scope trace(*this, "common", "build_kv_inputs_iswa");
     const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, mctx_cur);

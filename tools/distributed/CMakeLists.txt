@@ -118,12 +118,17 @@ set(DIST_PLANNER_SOURCES
 
 set(DIST_RUNTIME_SOURCES
     runtime/runtime_role.cpp
+    runtime/runtime_descriptor.cpp
     runtime/runtime_role_descriptor.cpp
     runtime/runtime_graph.cpp
     runtime/runtime_cost_model.cpp
     runtime/runtime_role_planner.cpp
     runtime/layer_store_tensor_provider.cpp
     runtime/runtime_worker_bind.cpp
+    runtime/runtime_config.cpp
+    runtime/runtime_scheduler.cpp
+    runtime/llama_layer_store_model_load.cpp
+    runtime/runtime_install_planning.cpp
 )
 
 set(DIST_INCLUDE_DIRS
@@ -218,8 +223,30 @@ function(dist_add_test_exe name main_source)
     dist_link_platform_libs(${name})
 endfunction()
 
+set(RUNTIME_WORKER_LOAD_SOURCES
+    ${DIST_PLATFORM_SOURCES}
+    dist_common.cpp
+    dist_http_fetch.cpp
+    node_agent/layer_store/layer_store.cpp
+    node_agent/layer_store/layer_checksum.cpp
+    node_agent/layer_store/descriptor_materialize.cpp
+    orchestrator/manifest_builder/manifest_builder.cpp
+    ${DIST_ARCHITECTURE_SOURCES}
+    runtime/layer_store_tensor_provider.cpp
+    runtime/runtime_config.cpp
+    runtime/runtime_descriptor.cpp
+    runtime/llama_layer_store_model_load.cpp
+    runtime/runtime_install_planning.cpp
+    runtime/runtime_graph.cpp
+    runtime/runtime_role.cpp
+    workers/split_gen_model_load.cpp
+)
+
 function(dist_add_worker name main_source)
-    add_executable(${name} ${main_source} ${DIST_TRANSPORT_SOURCES} ${DIST_RUNTIME_DEBUG_SOURCES})
+    add_executable(${name} ${main_source}
+        ${DIST_TRANSPORT_SOURCES}
+        ${DIST_RUNTIME_DEBUG_SOURCES}
+        ${RUNTIME_WORKER_LOAD_SOURCES})
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common Threads::Threads)
     dist_link_platform_libs(${name})
@@ -228,6 +255,8 @@ endfunction()
 dist_add_exe_light(node_agent node_agent.cpp)
 target_sources(node_agent PRIVATE ${DIST_TRANSPORT_SOURCES} ${DIST_RUNTIME_DEBUG_SOURCES}
     ${DIST_RUNTIME_SOURCES}
+    runtime/runtime_compat_materialize.cpp
+    runtime/runtime_worker_gguf_resolver.cpp
     verification/worker_verify.cpp)
 dist_add_exe(orchestrator orchestrator.cpp)
 target_sources(orchestrator PRIVATE
@@ -284,6 +313,11 @@ target_include_directories(verify_layer_equivalence PRIVATE ${DIST_INCLUDE_DIRS}
 target_compile_features(verify_layer_equivalence PRIVATE cxx_std_17)
 target_link_libraries(verify_layer_equivalence PRIVATE llama llama-common Threads::Threads)
 
+add_executable(diagnose_hidden_boundary diagnose_hidden_boundary.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
+target_include_directories(diagnose_hidden_boundary PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(diagnose_hidden_boundary PRIVATE cxx_std_17)
+target_link_libraries(diagnose_hidden_boundary PRIVATE llama llama-common Threads::Threads)
+
 add_executable(verify_hidden_transport verify_hidden_transport_tool.cpp ${DIST_RUNTIME_VERIFY_SOURCES} ${DIST_TRANSPORT_VERIFY_SOURCES})
 target_include_directories(verify_hidden_transport PRIVATE ${DIST_INCLUDE_DIRS})
 target_compile_features(verify_hidden_transport PRIVATE cxx_std_17)
@@ -317,6 +351,7 @@ target_link_libraries(verify_context_params PRIVATE llama llama-common Threads::
 dist_add_worker(split_gen3_a ${DIST_WORKERS_DIR}/split_gen3_a.cpp)
 dist_add_worker(split_gen3_b ${DIST_WORKERS_DIR}/split_gen3_b.cpp)
 dist_add_worker(split_gen3_c ${DIST_WORKERS_DIR}/split_gen3_c.cpp)
+target_link_libraries(split_gen3_c PRIVATE cpp-httplib)
 
 # End-to-end cluster validation suite (Task 7.5). Defined unconditionally so a
 # single `build.sh e2e` builds them even when LLAMA_BUILD_TESTS is OFF.
@@ -329,34 +364,13 @@ dist_add_test_exe(test-cluster-e2e-optimizer-join test-cluster-e2e-optimizer-joi
 dist_add_test_exe(test-cluster-e2e-verification test-cluster-e2e-verification.cpp)
 
 if (LLAMA_BUILD_TESTS)
-    add_executable(test-layer-planner test-layer-planner.cpp ${DIST_PLANNER_SOURCES} dist_common.cpp)
-    target_include_directories(test-layer-planner PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-layer-planner PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-model-catalog test-model-catalog.cpp model_catalog.cpp)
-    target_include_directories(test-model-catalog PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-model-catalog PRIVATE Threads::Threads)
-
-    dist_add_test_exe(test-model-install test-model-install.cpp)
-
-    dist_add_test_exe(test-orchestrator-3node test-orchestrator-3node.cpp)
-    dist_add_test_exe(test-orchestrator-dynamic-layout test-orchestrator-dynamic-layout.cpp)
-    dist_add_test_exe(test-split-materialized-2stage test-split-materialized-2stage.cpp)
-    target_sources(test-split-materialized-2stage PRIVATE ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES})
-
-    add_executable(test-node-benchmark test-node-benchmark.cpp ${DIST_PLATFORM_SOURCES} ${DIST_BENCHMARK_SOURCES})
-    target_include_directories(test-node-benchmark PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-node-benchmark PRIVATE llama llama-common Threads::Threads)
-
-    dist_add_test_exe(test-registration-benchmark test-registration-benchmark.cpp)
-
-    # Task 8 unit tests
-    add_executable(test-memory-estimator test-memory-estimator.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
-    target_include_directories(test-memory-estimator PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-memory-estimator PRIVATE llama llama-common Threads::Threads)
-
+    # v0.2 release-critical distributed runtime gates. Legacy Task 8/9
+    # planner, registry, optimizer, sync, and verification experiments remain as
+    # source files, but are intentionally excluded from the active release test
+    # surface unless promoted back into this curated gate list.
     add_executable(test-runtime-role-planner test-runtime-role-planner.cpp
         runtime/runtime_role.cpp
+        runtime/runtime_descriptor.cpp
         runtime/runtime_role_descriptor.cpp
         runtime/runtime_graph.cpp
         runtime/runtime_cost_model.cpp
@@ -369,6 +383,7 @@ if (LLAMA_BUILD_TESTS)
 
     add_executable(test-embedding-service test-embedding-service.cpp
         runtime/runtime_role.cpp
+        runtime/runtime_descriptor.cpp
         runtime/runtime_role_descriptor.cpp
         runtime/runtime_graph.cpp
         runtime/runtime_cost_model.cpp
@@ -378,604 +393,107 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-embedding-service PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-embedding-service PRIVATE llama llama-common Threads::Threads)
 
-    add_executable(test-capacity-check test-capacity-check.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
-    target_include_directories(test-capacity-check PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-capacity-check PRIVATE llama llama-common Threads::Threads)
+    add_executable(test-runtime-cost test-runtime-cost.cpp
+        runtime/runtime_role.cpp
+        runtime/runtime_role_descriptor.cpp
+        runtime/runtime_cost_model.cpp
+        architecture/worker_requirement.cpp
+        dist_common.cpp)
+    target_include_directories(test-runtime-cost PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-runtime-cost PRIVATE llama llama-common Threads::Threads)
 
-    add_executable(test-memory-aware-planner test-memory-aware-planner.cpp layer_planner.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
-    target_include_directories(test-memory-aware-planner PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-memory-aware-planner PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-planner-no-overlap test-planner-no-overlap.cpp layer_planner.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
-    target_include_directories(test-planner-no-overlap PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-planner-no-overlap PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-planner-low-memory test-planner-low-memory.cpp layer_planner.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
-    target_include_directories(test-planner-low-memory PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-planner-low-memory PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-capacity-api test-capacity-api.cpp memory_estimator.cpp memory_estimator_gguf.cpp dist_common.cpp)
-    target_include_directories(test-capacity-api PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-capacity-api PRIVATE llama llama-common cpp-httplib Threads::Threads)
-
-    add_executable(test-probe-memory test-probe-memory.cpp dist_common.cpp)
-    target_include_directories(test-probe-memory PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-probe-memory PRIVATE llama Threads::Threads)
-
-    set(MODEL_REGISTRY_SOURCES
-        orchestrator/model_registry.cpp
-        orchestrator/model_provider/model_provider.cpp
-        orchestrator/model_provider/huggingface_provider.cpp
-        orchestrator/manifest_builder/manifest_builder.cpp
-        ${DIST_ARCHITECTURE_SOURCES}
-        orchestrator/layout_planner/layout_planner.cpp
-        orchestrator/layout_estimator/layout_estimator.cpp
-        orchestrator/optimizer/cluster_optimizer.cpp
-        orchestrator/coverage/coverage.cpp
-        orchestrator/coverage/runtime_coverage.cpp
-        orchestrator/install_planner/install_planner.cpp
-        ${DIST_CONSISTENCY_SOURCES}
-        memory_estimator.cpp
-        dist_common.cpp
-    )
-    set(MODEL_REGISTRY_LINK_LIBS cpp-httplib llama Threads::Threads)
-
-    # Task 9.1 model registry tests
-    add_executable(test-model-registry test-model-registry.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-model-registry PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-model-registry PRIVATE cxx_std_17)
-    target_link_libraries(test-model-registry PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-model-status test-model-status.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-model-status PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-model-status PRIVATE cxx_std_17)
-    target_link_libraries(test-model-status PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-model-api test-model-api.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-model-api PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-model-api PRIVATE cxx_std_17)
-    target_link_libraries(test-model-api PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    # Task 9.2 remote model discovery tests
-    add_executable(test-provider-interface test-provider-interface.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-provider-interface PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-provider-interface PRIVATE cxx_std_17)
-    target_link_libraries(test-provider-interface PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-discovery-result test-discovery-result.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-discovery-result PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-discovery-result PRIVATE cxx_std_17)
-    target_link_libraries(test-discovery-result PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-registry-discovery test-registry-discovery.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-registry-discovery PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-registry-discovery PRIVATE cxx_std_17)
-    target_link_libraries(test-registry-discovery PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-huggingface-provider test-huggingface-provider.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-huggingface-provider PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-huggingface-provider PRIVATE cxx_std_17)
-    target_link_libraries(test-huggingface-provider PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-model-discovery test-model-discovery.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-model-discovery PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-model-discovery PRIVATE cxx_std_17)
-    target_link_libraries(test-model-discovery PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-discovery-errors test-discovery-errors.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-discovery-errors PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-discovery-errors PRIVATE cxx_std_17)
-    target_link_libraries(test-discovery-errors PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-discovery-update test-discovery-update.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-discovery-update PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-discovery-update PRIVATE cxx_std_17)
-    target_link_libraries(test-discovery-update PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    # Task 9.3 GGUF manifest builder tests
-    add_executable(test-gguf-header test-gguf-header.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-gguf-header PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-gguf-header PRIVATE cxx_std_17)
-    target_link_libraries(test-gguf-header PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-gguf-metadata test-gguf-metadata.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-gguf-metadata PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-gguf-metadata PRIVATE cxx_std_17)
-    target_link_libraries(test-gguf-metadata PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-tensor-directory test-tensor-directory.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-tensor-directory PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-tensor-directory PRIVATE cxx_std_17)
-    target_link_libraries(test-tensor-directory PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-layer-descriptor test-layer-descriptor.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-layer-descriptor PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-layer-descriptor PRIVATE cxx_std_17)
-    target_link_libraries(test-layer-descriptor PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-manifest-builder test-manifest-builder.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-manifest-builder PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-manifest-builder PRIVATE cxx_std_17)
-    target_link_libraries(test-manifest-builder PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-build-manifest test-build-manifest.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-build-manifest PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-build-manifest PRIVATE cxx_std_17)
-    target_link_libraries(test-build-manifest PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-manifest-refresh test-manifest-refresh.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-manifest-refresh PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-manifest-refresh PRIVATE cxx_std_17)
-    target_link_libraries(test-manifest-refresh PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-corrupted-header test-corrupted-header.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-corrupted-header PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-corrupted-header PRIVATE cxx_std_17)
-    target_link_libraries(test-corrupted-header PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    # Task 9.4 desired cluster layout planner tests
-    add_executable(test-layout-planner test-layout-planner.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-layout-planner PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-layout-planner PRIVATE cxx_std_17)
-    target_link_libraries(test-layout-planner PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-layer-placement test-layer-placement.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-layer-placement PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-layer-placement PRIVATE cxx_std_17)
-    target_link_libraries(test-layer-placement PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-memory-fit test-memory-fit.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-memory-fit PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-memory-fit PRIVATE cxx_std_17)
-    target_link_libraries(test-memory-fit PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-no-overlap test-no-overlap.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-no-overlap PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-no-overlap PRIVATE cxx_std_17)
-    target_link_libraries(test-no-overlap PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-full-coverage test-full-coverage.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-full-coverage PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-full-coverage PRIVATE cxx_std_17)
-    target_link_libraries(test-full-coverage PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-gpu-priority test-gpu-priority.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-gpu-priority PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-gpu-priority PRIVATE cxx_std_17)
-    target_link_libraries(test-gpu-priority PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-build-layout test-build-layout.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-build-layout PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-build-layout PRIVATE cxx_std_17)
-    target_link_libraries(test-build-layout PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-layout-update test-layout-update.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-layout-update PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-layout-update PRIVATE cxx_std_17)
-    target_link_libraries(test-layout-update PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-layout-node-loss test-layout-node-loss.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-layout-node-loss PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-layout-node-loss PRIVATE cxx_std_17)
-    target_link_libraries(test-layout-node-loss PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    # Task 9.5 cluster coverage tests
-    add_executable(test-coverage test-coverage.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-coverage PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-coverage PRIVATE cxx_std_17)
-    target_link_libraries(test-coverage PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-reconcile test-reconcile.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-reconcile PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-reconcile PRIVATE cxx_std_17)
-    target_link_libraries(test-reconcile PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-checksum test-checksum.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-checksum PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-checksum PRIVATE cxx_std_17)
-    target_link_libraries(test-checksum PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-empty-cluster test-empty-cluster.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-empty-cluster PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-empty-cluster PRIVATE cxx_std_17)
-    target_link_libraries(test-empty-cluster PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-partial-coverage test-partial-coverage.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-partial-coverage PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-partial-coverage PRIVATE cxx_std_17)
-    target_link_libraries(test-partial-coverage PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-ready-coverage test-ready-coverage.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-ready-coverage PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-ready-coverage PRIVATE cxx_std_17)
-    target_link_libraries(test-ready-coverage PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-degraded-coverage test-degraded-coverage.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-degraded-coverage PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-degraded-coverage PRIVATE cxx_std_17)
-    target_link_libraries(test-degraded-coverage PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-node-report test-node-report.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-node-report PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-node-report PRIVATE cxx_std_17)
-    target_link_libraries(test-node-report PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-coverage-refresh test-coverage-refresh.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-coverage-refresh PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-coverage-refresh PRIVATE cxx_std_17)
-    target_link_libraries(test-coverage-refresh PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-reconcile-after-node-loss test-reconcile-after-node-loss.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-reconcile-after-node-loss PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-reconcile-after-node-loss PRIVATE cxx_std_17)
-    target_link_libraries(test-reconcile-after-node-loss PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    # Task 9.6 install planner tests
-    add_executable(test-install-plan test-install-plan.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-install-plan PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-install-plan PRIVATE cxx_std_17)
-    target_link_libraries(test-install-plan PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-download-operation test-download-operation.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-download-operation PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-download-operation PRIVATE cxx_std_17)
-    target_link_libraries(test-download-operation PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-repair-operation test-repair-operation.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-repair-operation PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-repair-operation PRIVATE cxx_std_17)
-    target_link_libraries(test-repair-operation PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-delete-operation test-delete-operation.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-delete-operation PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-delete-operation PRIVATE cxx_std_17)
-    target_link_libraries(test-delete-operation PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-operation-grouping test-operation-grouping.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-operation-grouping PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-operation-grouping PRIVATE cxx_std_17)
-    target_link_libraries(test-operation-grouping PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-install-validation test-install-validation.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-install-validation PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-install-validation PRIVATE cxx_std_17)
-    target_link_libraries(test-install-validation PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-build-install-plan test-build-install-plan.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-build-install-plan PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-build-install-plan PRIVATE cxx_std_17)
-    target_link_libraries(test-build-install-plan PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-install-plan-after-node-loss test-install-plan-after-node-loss.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-install-plan-after-node-loss PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-install-plan-after-node-loss PRIVATE cxx_std_17)
-    target_link_libraries(test-install-plan-after-node-loss PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    add_executable(test-install-plan-update test-install-plan-update.cpp ${MODEL_REGISTRY_SOURCES})
-    target_include_directories(test-install-plan-update PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-install-plan-update PRIVATE cxx_std_17)
-    target_link_libraries(test-install-plan-update PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    set(SYNC_AGENT_SOURCES
+    set(RUNTIME_UNIT_TEST_SOURCES
         ${DIST_PLATFORM_SOURCES}
+        dist_common.cpp
         dist_http_fetch.cpp
         node_agent/layer_store/layer_store.cpp
         node_agent/layer_store/layer_checksum.cpp
         node_agent/layer_store/descriptor_materialize.cpp
-        node_agent/layer_store/layer_gguf_assembler.cpp
-        node_agent/synchronization/sync_types.cpp
-        node_agent/synchronization/synchronization_engine.cpp
-        node_agent/synchronization/executors/http_range/http_range_executor.cpp
-        orchestrator/install_planner/install_planner.cpp
+        node_agent/layer_store/worker_builder.cpp
         orchestrator/manifest_builder/manifest_builder.cpp
         ${DIST_ARCHITECTURE_SOURCES}
-        ${DIST_CONSISTENCY_SOURCES}
-        dist_common.cpp
+        ${DIST_RUNTIME_SOURCES}
     )
-    set(SYNC_AGENT_LINK_LIBS cpp-httplib llama Threads::Threads)
 
-    # Task 9.7 synchronization engine tests
-    add_executable(test-layer-store test-layer-store.cpp ${SYNC_AGENT_SOURCES})
-    target_include_directories(test-layer-store PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-layer-store PRIVATE cxx_std_17)
-    target_link_libraries(test-layer-store PRIVATE ${SYNC_AGENT_LINK_LIBS})
+    add_executable(test-runtime-worker-bind test-runtime-worker-bind.cpp ${RUNTIME_UNIT_TEST_SOURCES})
+    target_include_directories(test-runtime-worker-bind PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-worker-bind PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-worker-bind PRIVATE llama cpp-httplib Threads::Threads)
 
-    add_executable(test-layer-verify test-layer-verify.cpp ${SYNC_AGENT_SOURCES})
-    target_include_directories(test-layer-verify PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-layer-verify PRIVATE cxx_std_17)
-    target_link_libraries(test-layer-verify PRIVATE ${SYNC_AGENT_LINK_LIBS})
+    add_executable(test-layer-store-tensor-provider test-layer-store-tensor-provider.cpp ${RUNTIME_UNIT_TEST_SOURCES})
+    target_include_directories(test-layer-store-tensor-provider PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-layer-store-tensor-provider PRIVATE cxx_std_17)
+    target_link_libraries(test-layer-store-tensor-provider PRIVATE llama cpp-httplib Threads::Threads)
 
-    add_executable(test-http-range-executor test-http-range-executor.cpp ${SYNC_AGENT_SOURCES})
-    target_include_directories(test-http-range-executor PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-http-range-executor PRIVATE cxx_std_17)
-    target_link_libraries(test-http-range-executor PRIVATE ${SYNC_AGENT_LINK_LIBS})
+    add_executable(test-runtime-config test-runtime-config.cpp runtime/runtime_config.cpp)
+    target_include_directories(test-runtime-config PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-config PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-config PRIVATE Threads::Threads)
 
-    add_executable(test-install-job test-install-job.cpp ${SYNC_AGENT_SOURCES})
-    target_include_directories(test-install-job PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-install-job PRIVATE cxx_std_17)
-    target_link_libraries(test-install-job PRIVATE ${SYNC_AGENT_LINK_LIBS})
-
-    add_executable(test-job-progress test-job-progress.cpp ${SYNC_AGENT_SOURCES})
-    target_include_directories(test-job-progress PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-job-progress PRIVATE cxx_std_17)
-    target_link_libraries(test-job-progress PRIVATE ${SYNC_AGENT_LINK_LIBS})
-
-    add_executable(test-layer-delete test-layer-delete.cpp ${SYNC_AGENT_SOURCES})
-    target_include_directories(test-layer-delete PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-layer-delete PRIVATE cxx_std_17)
-    target_link_libraries(test-layer-delete PRIVATE ${SYNC_AGENT_LINK_LIBS})
-
-    add_executable(test-sync-engine test-sync-engine.cpp ${SYNC_AGENT_SOURCES})
-    target_include_directories(test-sync-engine PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-sync-engine PRIVATE cxx_std_17)
-    target_link_libraries(test-sync-engine PRIVATE ${SYNC_AGENT_LINK_LIBS})
-
-    add_executable(test-partial-install test-partial-install.cpp ${SYNC_AGENT_SOURCES})
-    target_include_directories(test-partial-install PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-partial-install PRIVATE cxx_std_17)
-    target_link_libraries(test-partial-install PRIVATE ${SYNC_AGENT_LINK_LIBS})
-
-    add_executable(test-corrupted-layer test-corrupted-layer.cpp ${SYNC_AGENT_SOURCES})
-    target_include_directories(test-corrupted-layer PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-corrupted-layer PRIVATE cxx_std_17)
-    target_link_libraries(test-corrupted-layer PRIVATE ${SYNC_AGENT_LINK_LIBS})
-
-    add_executable(test-coverage-after-sync test-coverage-after-sync.cpp
-        ${MODEL_REGISTRY_SOURCES}
-        node_agent/layer_store/layer_store.cpp
-        node_agent/layer_store/layer_checksum.cpp
-        node_agent/layer_store/descriptor_materialize.cpp
-        node_agent/layer_store/layer_gguf_assembler.cpp
-        node_agent/synchronization/sync_types.cpp
-        node_agent/synchronization/synchronization_engine.cpp
-        node_agent/synchronization/executors/http_range/http_range_executor.cpp)
-    target_include_directories(test-coverage-after-sync PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-coverage-after-sync PRIVATE cxx_std_17)
-    target_link_libraries(test-coverage-after-sync PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    # Task 9.8 cluster optimizer tests
-    macro(dist_add_optimizer_test name)
-        add_executable(${name} ${name}.cpp ${MODEL_REGISTRY_SOURCES})
-        target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
-        target_compile_features(${name} PRIVATE cxx_std_17)
-        target_link_libraries(${name} PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-    endmacro()
-
-    dist_add_optimizer_test(test-layout-estimator)
-    dist_add_optimizer_test(test-storage-only-node)
-    dist_add_optimizer_test(test-performance-simulation)
-    dist_add_optimizer_test(test-optimizer-policy)
-    dist_add_optimizer_test(test-no-benefit)
-    dist_add_optimizer_test(test-improvement-threshold)
-    dist_add_optimizer_test(test-node-join)
-    dist_add_optimizer_test(test-slow-node)
-    dist_add_optimizer_test(test-node-loss)
-    dist_add_optimizer_test(test-memory-change)
-
-    # Task 9.9 — cluster state consistency & install idempotency
-    macro(dist_add_consistency_test name)
-        add_executable(${name} ${name}.cpp
-            ${MODEL_REGISTRY_SOURCES}
-            node_agent/layer_store/layer_store.cpp
-            node_agent/layer_store/layer_checksum.cpp
-            node_agent/layer_store/descriptor_materialize.cpp
-            node_agent/layer_store/layer_gguf_assembler.cpp
-            node_agent/layer_store/worker_builder.cpp)
-        target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
-        target_compile_features(${name} PRIVATE cxx_std_17)
-        target_link_libraries(${name} PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-    endmacro()
-
-    dist_add_consistency_test(test-install-idempotency)
-    dist_add_consistency_test(test-store-consistency)
-    dist_add_consistency_test(test-coverage-consistency)
-    dist_add_consistency_test(test-registry-consistency)
-
-    add_executable(test-sync-state-machine test-sync-state-machine.cpp
-        orchestrator/consistency/install_journal.cpp
-        orchestrator/coverage/coverage.cpp
-        dist_common.cpp)
-    target_include_directories(test-sync-state-machine PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-sync-state-machine PRIVATE cxx_std_17)
-    target_link_libraries(test-sync-state-machine PRIVATE ${MODEL_REGISTRY_LINK_LIBS})
-
-    macro(dist_add_verify_test name)
-        add_executable(${name} ${name}.cpp ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES} dist_common.cpp memory_estimator.cpp)
-        target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
-        target_compile_features(${name} PRIVATE cxx_std_17)
-        target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
-    endmacro()
-
-    dist_add_verify_test(test-gguf-inspector)
-    dist_add_verify_test(test-gguf-diff)
-    dist_add_verify_test(test-tensor-checksum)
-    dist_add_verify_test(test-layer-checksum)
-    dist_add_verify_test(test-alignment)
-    dist_add_verify_test(test-materialization-repeatability)
-    dist_add_verify_test(test-materialized-load)
-    dist_add_verify_test(test-logit-parity)
-    dist_add_verify_test(test-sampling-parity)
-    dist_add_verify_test(test-materialization-verification)
-    dist_add_verify_test(test-layer-store-verification)
-    dist_add_verify_test(test-verification-multi-model)
-
-    set(ARCHITECTURE_TEST_SOURCES
-        ${DIST_ARCHITECTURE_SOURCES}
-        orchestrator/manifest_builder/manifest_builder.cpp
-        dist_common.cpp
+    set(RUNTIME_DESCRIPTOR_TEST_SOURCES
+        runtime/runtime_descriptor.cpp
+        runtime/runtime_role.cpp
     )
-    macro(dist_add_architecture_test name)
-        add_executable(${name} ${name}.cpp ${ARCHITECTURE_TEST_SOURCES})
-        target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
-        target_compile_features(${name} PRIVATE cxx_std_17)
-        target_link_libraries(${name} PRIVATE llama llama-common Threads::Threads)
-    endmacro()
 
-    dist_add_architecture_test(test-architecture-descriptor)
-    dist_add_architecture_test(test-architecture-detector)
-    dist_add_architecture_test(test-semantic-roles)
-    dist_add_architecture_test(test-semantic-blobs)
-    dist_add_architecture_test(test-worker-requirements)
-    dist_add_architecture_test(test-blob-builder)
-    dist_add_architecture_test(test-tied-embeddings)
-    dist_add_architecture_test(test-output-head)
-    dist_add_architecture_test(test-llama-plugin)
-    dist_add_architecture_test(test-qwen-plugin)
-    dist_add_architecture_test(test-gemma-plugin)
-    dist_add_architecture_test(test-phi-plugin)
-    dist_add_architecture_test(test-smol-plugin)
-    dist_add_architecture_test(test-deepseek-plugin)
-    dist_add_architecture_test(test-qwen-descriptor)
-    dist_add_architecture_test(test-gemma-descriptor)
-    dist_add_architecture_test(test-deepseek-descriptor)
+    add_executable(test-runtime-descriptor test-runtime-descriptor.cpp ${RUNTIME_DESCRIPTOR_TEST_SOURCES})
+    target_include_directories(test-runtime-descriptor PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-descriptor PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-descriptor PRIVATE Threads::Threads)
 
-    dist_add_architecture_test(test-runtime-descriptor)
-    dist_add_architecture_test(test-tensor-graph)
+    add_executable(test-runtime-service test-runtime-service.cpp ${RUNTIME_DESCRIPTOR_TEST_SOURCES})
+    target_include_directories(test-runtime-service PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-service PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-service PRIVATE Threads::Threads)
 
-    add_executable(test-worker-builder test-worker-builder.cpp
-        ${ARCHITECTURE_TEST_SOURCES}
-        node_agent/layer_store/layer_store.cpp
-        node_agent/layer_store/layer_checksum.cpp
-        node_agent/layer_store/descriptor_materialize.cpp
-        node_agent/layer_store/layer_gguf_assembler.cpp
-        node_agent/layer_store/worker_builder.cpp)
-    target_include_directories(test-worker-builder PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-worker-builder PRIVATE cxx_std_17)
-    target_link_libraries(test-worker-builder PRIVATE llama llama-common Threads::Threads)
+    add_executable(test-runtime-schema test-runtime-schema.cpp ${RUNTIME_DESCRIPTOR_TEST_SOURCES})
+    target_include_directories(test-runtime-schema PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-schema PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-schema PRIVATE Threads::Threads)
 
-    add_executable(test-qwen-materialization test-qwen-materialization.cpp
-        ${ARCHITECTURE_TEST_SOURCES}
-        node_agent/layer_store/layer_store.cpp
-        node_agent/layer_store/layer_checksum.cpp
-        node_agent/layer_store/descriptor_materialize.cpp
-        node_agent/layer_store/layer_gguf_assembler.cpp
-        verification/layer_store_populate.cpp
-        verification/verification_common.cpp
-        verification/gguf_inspector.cpp
-        verification/deps/sha256/sha256.c
-        orchestrator/install_planner/install_planner.cpp)
-    target_include_directories(test-qwen-materialization PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-qwen-materialization PRIVATE cxx_std_17)
-    target_link_libraries(test-qwen-materialization PRIVATE llama llama-common Threads::Threads)
+    add_executable(test-runtime-install-planning test-runtime-install-planning.cpp
+        runtime/runtime_install_planning.cpp
+        runtime/runtime_descriptor.cpp
+        runtime/runtime_graph.cpp
+        runtime/runtime_role.cpp)
+    target_include_directories(test-runtime-install-planning PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-install-planning PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-install-planning PRIVATE Threads::Threads)
 
-    # Task 9.8.3 — runtime debug framework tests
-    add_executable(test-runtime-trace test-runtime-trace.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-runtime-trace PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-runtime-trace PRIVATE cxx_std_17)
-    target_link_libraries(test-runtime-trace PRIVATE llama llama-common Threads::Threads)
+    add_executable(test-runtime-acceptance test-runtime-acceptance.cpp
+        runtime/runtime_install_planning.cpp
+        runtime/runtime_scheduler.cpp
+        runtime/runtime_descriptor.cpp
+        runtime/runtime_graph.cpp
+        runtime/runtime_role.cpp)
+    target_include_directories(test-runtime-acceptance PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-acceptance PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-acceptance PRIVATE Threads::Threads)
 
-    add_executable(test-decode-loop-parity test-decode-loop-parity.cpp
-        verification/decode_loop_parity.cpp
-        runtime_debug/tensor_stats.cpp
-        verification/verification_common.cpp
-        verification/deps/sha256/sha256.c)
-    target_include_directories(test-decode-loop-parity PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-decode-loop-parity PRIVATE cxx_std_17)
-    target_link_libraries(test-decode-loop-parity PRIVATE Threads::Threads)
+    add_executable(test-runtime-presmoke test-runtime-presmoke.cpp
+        ${RUNTIME_UNIT_TEST_SOURCES}
+        runtime/runtime_compat_materialize.cpp)
+    target_include_directories(test-runtime-presmoke PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-presmoke PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-presmoke PRIVATE llama cpp-httplib Threads::Threads)
 
-    add_executable(test-hidden-parity test-hidden-parity.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-hidden-parity PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-hidden-parity PRIVATE cxx_std_17)
-    target_link_libraries(test-hidden-parity PRIVATE llama llama-common Threads::Threads)
+    add_executable(test-runtime-layer-store-model-load test-runtime-layer-store-model-load.cpp
+        ${VERIFICATION_SOURCES}
+        ${NODE_AGENT_SOURCES}
+        ${DIST_RUNTIME_SOURCES}
+        dist_common.cpp
+        memory_estimator.cpp)
+    target_include_directories(test-runtime-layer-store-model-load PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-layer-store-model-load PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-layer-store-model-load PRIVATE llama llama-common cpp-httplib Threads::Threads)
 
-    # Task 9.8.4 — layer boundary verification
-    add_executable(test-layer-boundary test-layer-boundary.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-layer-boundary PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-layer-boundary PRIVATE cxx_std_17)
-    target_link_libraries(test-layer-boundary PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-layer-equivalence test-layer-equivalence.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-layer-equivalence PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-layer-equivalence PRIVATE cxx_std_17)
-    target_link_libraries(test-layer-equivalence PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-graph-equivalence test-graph-equivalence.cpp
-        verification/graph_equivalence.cpp
-        verification/layer_runner.cpp
-        runtime_debug/tensor_stats.cpp
-        runtime_debug/layer_trace.cpp
-        verification/verification_common.cpp
-        verification/deps/sha256/sha256.c)
-    target_include_directories(test-graph-equivalence PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-graph-equivalence PRIVATE cxx_std_17)
-    target_link_libraries(test-graph-equivalence PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-attention-equivalence test-attention-equivalence.cpp
-        verification/graph_equivalence.cpp
-        verification/layer_runner.cpp
-        runtime_debug/tensor_stats.cpp
-        runtime_debug/layer_trace.cpp
-        verification/verification_common.cpp
-        verification/deps/sha256/sha256.c)
-    target_include_directories(test-attention-equivalence PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-attention-equivalence PRIVATE cxx_std_17)
-    target_link_libraries(test-attention-equivalence PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-rope-equivalence test-rope-equivalence.cpp
-        verification/graph_equivalence.cpp
-        verification/layer_runner.cpp
-        runtime_debug/tensor_stats.cpp
-        runtime_debug/layer_trace.cpp
-        verification/verification_common.cpp
-        verification/deps/sha256/sha256.c)
-    target_include_directories(test-rope-equivalence PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-rope-equivalence PRIVATE cxx_std_17)
-    target_link_libraries(test-rope-equivalence PRIVATE llama llama-common Threads::Threads)
-
-    # Task 9.8.5 — runtime state parity
-    add_executable(test-runtime-state test-runtime-state.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-runtime-state PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-runtime-state PRIVATE cxx_std_17)
-    target_link_libraries(test-runtime-state PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-hidden-transport test-hidden-transport.cpp ${DIST_RUNTIME_VERIFY_SOURCES} ${DIST_TRANSPORT_VERIFY_SOURCES})
-    target_include_directories(test-hidden-transport PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-hidden-transport PRIVATE cxx_std_17)
-    target_link_libraries(test-hidden-transport PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-runtime-api-verify test-runtime-api-verify.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-runtime-api-verify PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-runtime-api-verify PRIVATE cxx_std_17)
-    target_link_libraries(test-runtime-api-verify PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-decode-state-parity test-decode-state-parity.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-decode-state-parity PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-decode-state-parity PRIVATE cxx_std_17)
-    target_link_libraries(test-decode-state-parity PRIVATE llama llama-common Threads::Threads)
-
-    # Task 9.8.6 — final runtime isolation
-    add_executable(test-final-runtime test-final-runtime.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-final-runtime PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-final-runtime PRIVATE cxx_std_17)
-    target_link_libraries(test-final-runtime PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-hidden-injection test-hidden-injection.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-hidden-injection PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-hidden-injection PRIVATE cxx_std_17)
-    target_link_libraries(test-hidden-injection PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-final-logits test-final-logits.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-final-logits PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-final-logits PRIVATE cxx_std_17)
-    target_link_libraries(test-final-logits PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-decode-graph test-decode-graph.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-decode-graph PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-decode-graph PRIVATE cxx_std_17)
-    target_link_libraries(test-decode-graph PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-context-params test-context-params.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-context-params PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-context-params PRIVATE cxx_std_17)
-    target_link_libraries(test-context-params PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-runtime-api test-runtime-api.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-runtime-api PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-runtime-api PRIVATE cxx_std_17)
-    target_link_libraries(test-runtime-api PRIVATE llama llama-common Threads::Threads)
-
-    add_executable(test-runtime-cache test-runtime-cache.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
-    target_include_directories(test-runtime-cache PRIVATE ${DIST_INCLUDE_DIRS})
-    target_compile_features(test-runtime-cache PRIVATE cxx_std_17)
-    target_link_libraries(test-runtime-cache PRIVATE llama llama-common Threads::Threads)
+    add_custom_target(runtime-presmoke-gates
+        DEPENDS
+            test-runtime-presmoke
+            test-runtime-acceptance
+            verify_hidden_pipeline
+            verify_logits_pipeline
+            verify_final_runtime
+            verify_final_logits
+            verify_decode_graph
+            verify_decode_loop_parity)
 endif()

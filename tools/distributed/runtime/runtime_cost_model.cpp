@@ -24,6 +24,21 @@ uint64_t runtime_node_budget_bytes(const runtime_planner_node & node, const bool
     return node.cpu_budget_bytes;
 }
 
+double runtime_pipeline_service_penalty(
+        const runtime_planner_node & node,
+        const runtime_role role) {
+    double penalty = 1.0 + 0.15 * static_cast<double>(std::max(node.pipeline_layers, 0));
+    if (role == runtime_role::tokenizer || role == runtime_role::embedding) {
+        if (node.is_first_pipeline_stage) {
+            penalty *= 4.0;
+        }
+    }
+    if (role == runtime_role::output_head && node.is_last_pipeline_stage) {
+        penalty *= 3.0;
+    }
+    return penalty;
+}
+
 static double cost_from_budget(const runtime_planner_node & node, const runtime_role_descriptor & desc) {
     const uint64_t budget = runtime_node_budget_bytes(node, desc.prefers_gpu);
     if (budget < desc.required_memory_bytes) {
@@ -34,13 +49,14 @@ static double cost_from_budget(const runtime_planner_node & node, const runtime_
 
 double runtime_cost_tokenizer(const runtime_planner_node & node, const runtime_role_descriptor & desc) {
     const double mem_penalty = cost_from_budget(node, desc);
-    return mem_penalty / node.cpu_score;
+    return mem_penalty * runtime_pipeline_service_penalty(node, runtime_role::tokenizer) / node.cpu_score;
 }
 
 double runtime_cost_embedding(const runtime_planner_node & node, const runtime_role_descriptor & desc) {
     const double mem_penalty = cost_from_budget(node, desc);
     const double gpu_bonus   = node.has_gpu ? (1.0 / std::max(node.score, 1.0)) : 1.0;
-    return mem_penalty * gpu_bonus / node.memory_bw_score;
+    return mem_penalty * gpu_bonus * runtime_pipeline_service_penalty(node, runtime_role::embedding) /
+            node.memory_bw_score;
 }
 
 double runtime_cost_pipeline_stage(
@@ -59,7 +75,7 @@ double runtime_cost_pipeline_stage(
 double runtime_cost_output_head(const runtime_planner_node & node, const runtime_role_descriptor & desc) {
     const double mem_penalty = cost_from_budget(node, desc);
     const double gpu_bonus   = node.has_gpu ? (1.0 / std::max(node.score, 1.0)) : 3.0;
-    return mem_penalty * gpu_bonus;
+    return mem_penalty * gpu_bonus * runtime_pipeline_service_penalty(node, runtime_role::output_head);
 }
 
 double runtime_cost_sampler(const runtime_planner_node & node, const runtime_role_descriptor & desc) {

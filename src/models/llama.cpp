@@ -107,11 +107,16 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
     const int32_t layer_start = cparams.layer_start;
     const int32_t layer_end   = cparams.layer_end < 0 ? (int32_t) n_layer : cparams.layer_end;
+    const char * graph_scope = layer_start == 0 && layer_end < n_layer ? "llama.entry" : "llama.graph";
+    llm_graph_trace_scope graph_trace(*this, graph_scope, "graph_constructor");
 
-    if (layer_start > 0) {
-        inpL = build_inp_hidden();
-    } else {
-        inpL = build_inp_embd(model.tok_embd);
+    {
+        llm_graph_trace_scope trace(*this, graph_scope, "build_input");
+        if (layer_start > 0) {
+            inpL = build_inp_hidden();
+        } else {
+            inpL = build_inp_embd(model.tok_embd);
+        }
     }
 
     // inp_pos - contains the positions
@@ -147,7 +152,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         }
     }
 
-    for (int il = layer_start; il < layer_end; ++il) {
+    {
+        llm_graph_trace_scope trace(*this, graph_scope, "layer_loop");
+        for (int il = layer_start; il < layer_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -248,11 +255,13 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         cb(cur, "l_out", il);
 
         // input for next layer
-        inpL = cur;
+            inpL = cur;
+        }
     }
     cur = inpL;
 
-    const bool partial = layer_end < n_layer;
+    const bool partial = layer_end < n_layer ||
+            (cparams.skip_output_head && layer_start > 0);
 
     if (!partial) {
         cur = build_norm(cur,
@@ -275,7 +284,10 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         res->t_logits = nullptr;
     }
 
-    ggml_build_forward_expand(gf, cur);
+    {
+        llm_graph_trace_scope trace(*this, graph_scope, "graph_finalize");
+        ggml_build_forward_expand(gf, cur);
+    }
 }
 
 template struct llama_model_llama::graph<false>;

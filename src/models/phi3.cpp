@@ -73,7 +73,19 @@ llama_model_phi3::graph<iswa>::graph(const llama_model & model, const llm_graph_
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    const int32_t layer_start = cparams.layer_start;
+    const int32_t layer_end   = cparams.layer_end < 0 ? (int32_t) n_layer : cparams.layer_end;
+    const char * graph_scope = layer_start == 0 && layer_end < n_layer ? "phi.entry" : "phi.graph";
+    llm_graph_trace_scope graph_trace(*this, graph_scope, "graph_constructor");
+
+    {
+        llm_graph_trace_scope trace(*this, graph_scope, "build_input");
+        if (layer_start > 0) {
+            inpL = build_inp_hidden();
+        } else {
+            inpL = build_inp_embd(model.tok_embd);
+        }
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -88,107 +100,173 @@ llama_model_phi3::graph<iswa>::graph(const llama_model & model, const llm_graph_
     }
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
-        auto * residual = inpL;
+    GGML_ASSERT(layer_start >= 0);
+    GGML_ASSERT(layer_start <= layer_end);
+    GGML_ASSERT(layer_end <= n_layer);
 
-        // self-attention
-        {
-            // rope freq factors for 128k context
-            ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
+    if (layer_start > 0 || layer_end < n_layer) {
+        LLAMA_LOG_INFO("%s: layer_start=%d layer_end=%d (effective_end=%d n_layer=%d)\n",
+                __func__, layer_start, cparams.layer_end, layer_end, (int) n_layer);
+    }
 
-            ggml_tensor* attn_norm_output = build_norm(inpL,
-                    model.layers[il].attn_norm,
-                    model.layers[il].attn_norm_b,
-                    LLM_NORM_RMS, il);
-            cb(attn_norm_output, "attn_norm", il);
+    {
+        llm_graph_trace_scope trace(*this, graph_scope, "layer_loop");
+        for (int il = layer_start; il < layer_end; ++il) {
+            llm_graph_trace_scope layer_trace(*this, graph_scope, "layer_body");
+            res->t_layer_inp[il] = inpL;
+            auto * residual = inpL;
 
-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], attn_norm_output,
-                    n_embd_head, n_head, n_head_kv, il);
-            Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, rope_factors,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+            // self-attention
+            {
+                // rope freq factors for 128k context
+                ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
-            Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, rope_factors,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+                ggml_tensor* attn_norm_output;
+                {
+                    llm_graph_trace_scope subtrace(*this, graph_scope, "layer_attn_norm");
+                    attn_norm_output = build_norm(inpL,
+                            model.layers[il].attn_norm,
+                            model.layers[il].attn_norm_b,
+                            LLM_NORM_RMS, il);
+                    cb(attn_norm_output, "attn_norm", il);
+                }
 
-            cb(Qcur, "Qcur", il);
-            cb(Kcur, "Kcur", il);
-            cb(Vcur, "Vcur", il);
+                auto qkv = [&]() {
+                    llm_graph_trace_scope subtrace(*this, graph_scope, "layer_qkv");
+                    return build_qkv(model.layers[il], attn_norm_output,
+                            n_embd_head, n_head, n_head_kv, il);
+                }();
+                auto Qcur = qkv.q;
+                auto Kcur = qkv.k;
+                auto Vcur = qkv.v;
 
-            Qcur = ggml_scale(ctx0, Qcur, 1.0f / sqrtf(float(n_embd_head)));
-            cb(Qcur, "Qcur", il);
+                {
+                    llm_graph_trace_scope subtrace(*this, graph_scope, "layer_rope");
+                    Qcur = ggml_rope_ext(
+                            ctx0, Qcur, inp_pos, rope_factors,
+                            n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                            ext_factor, attn_factor, beta_fast, beta_slow
+                            );
 
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
+                    Kcur = ggml_rope_ext(
+                            ctx0, Kcur, inp_pos, rope_factors,
+                            n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                            ext_factor, attn_factor, beta_fast, beta_slow
+                            );
+                }
+
+                cb(Qcur, "Qcur", il);
+                cb(Kcur, "Kcur", il);
+                cb(Vcur, "Vcur", il);
+
+                {
+                    llm_graph_trace_scope subtrace(*this, graph_scope, "layer_q_scale");
+                    Qcur = ggml_scale(ctx0, Qcur, 1.0f / sqrtf(float(n_embd_head)));
+                    cb(Qcur, "Qcur", il);
+                }
+
+                {
+                    llm_graph_trace_scope subtrace(*this, graph_scope, "layer_attn");
+                    cur = build_attn(inp_attn,
+                            model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
+                }
+            }
+            {
+                llm_graph_trace_scope subtrace(*this, graph_scope, "layer_output_rows");
+                if (il == layer_end - 1 && inp_out_ids) {
+                    cur      = ggml_get_rows(ctx0, cur,      inp_out_ids);
+                    residual = ggml_get_rows(ctx0, residual, inp_out_ids);
+                }
+            }
+            {
+                llm_graph_trace_scope subtrace(*this, graph_scope, "layer_residual_attn");
+                cur = ggml_add(ctx0, cur, residual);
+                residual = cur;
+            }
+
+            {
+                llm_graph_trace_scope subtrace(*this, graph_scope, "layer_ffn_norm");
+                cur = build_norm(cur,
+                        model.layers[il].ffn_norm, model.layers[il].ffn_norm_b,
+                        LLM_NORM_RMS, il);
+                cb(cur, "ffn_norm", il);
+            }
+
+            // feed-forward network
+            {
+                llm_graph_trace_scope subtrace(*this, graph_scope, "layer_ffn");
+                if (model.layers[il].ffn_gate_inp == nullptr) {
+                    cur = build_ffn(cur,
+                            model.layers[il].ffn_up,   NULL, NULL,
+                            NULL,                      NULL, NULL,
+                            model.layers[il].ffn_down, NULL, NULL,
+                            NULL,
+                            LLM_FFN_SWIGLU, LLM_FFN_SEQ, il);
+                    cb(cur, "ffn_out", il);
+                } else {
+                    // MoE branch
+                    cur = build_moe_ffn(cur,
+                            model.layers[il].ffn_gate_inp,
+                            model.layers[il].ffn_up_exps,
+                            model.layers[il].ffn_gate_exps,
+                            model.layers[il].ffn_down_exps,
+                            nullptr,
+                            n_expert, n_expert_used,
+                            LLM_FFN_SILU, true,
+                            hparams.expert_weights_scale,
+                            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                            il);
+                    cb(cur, "ffn_moe_out", il);
+                }
+            }
+            {
+                llm_graph_trace_scope subtrace(*this, graph_scope, "layer_residual_ffn");
+                cur = ggml_add(ctx0, residual, cur);
+            }
+
+            {
+                llm_graph_trace_scope subtrace(*this, graph_scope, "layer_cvec");
+                cur = build_cvec(cur, il);
+                cb(cur, "l_out", il);
+            }
+
+            // input for next layer
+            inpL = cur;
         }
-        if (il == n_layer - 1 && inp_out_ids) {
-            cur      = ggml_get_rows(ctx0, cur,      inp_out_ids);
-            residual = ggml_get_rows(ctx0, residual, inp_out_ids);
-        }
-        cur = ggml_add(ctx0, cur, residual);
-        residual = cur;
+    }
+    cur = inpL;
 
+    const bool partial = layer_end < n_layer ||
+            (cparams.skip_output_head && layer_start > 0);
+
+    if (!partial) {
         cur = build_norm(cur,
-                model.layers[il].ffn_norm, model.layers[il].ffn_norm_b,
-                LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
+                model.output_norm,
+                model.output_norm_b,
+                LLM_NORM_RMS, -1);
 
-        // feed-forward network
-        if (model.layers[il].ffn_gate_inp == nullptr) {
-            cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   NULL, NULL,
-                    NULL,                      NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
-                    NULL,
-                    LLM_FFN_SWIGLU, LLM_FFN_SEQ, il);
-            cb(cur, "ffn_out", il);
-        } else {
-            // MoE branch
-            cur = build_moe_ffn(cur,
-                    model.layers[il].ffn_gate_inp,
-                    model.layers[il].ffn_up_exps,
-                    model.layers[il].ffn_gate_exps,
-                    model.layers[il].ffn_down_exps,
-                    nullptr,
-                    n_expert, n_expert_used,
-                    LLM_FFN_SILU, true,
-                    hparams.expert_weights_scale,
-                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                    il);
-            cb(cur, "ffn_moe_out", il);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        cur = build_lora_mm(model.output, cur, model.output_s);
+
+        if (model.output_b != nullptr) {
+            cb(cur, "result_output_no_bias", -1);
+            cur = ggml_add(ctx0, cur, model.output_b);
         }
-        cur = ggml_add(ctx0, residual, cur);
-
-        cur = build_cvec(cur, il);
-        cb(cur, "l_out", il);
-
-        // input for next layer
-        inpL = cur;
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    } else {
+        cb(cur, "partial_out", -1);
+        res->t_embd   = cur;
+        res->t_logits = nullptr;
     }
-    cur = build_norm(inpL,
-            model.output_norm,
-            model.output_norm_b,
-            LLM_NORM_RMS, -1);
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
-
-    cur = build_lora_mm(model.output, cur, model.output_s);
-
-    if (model.output_b != nullptr) {
-        cb(cur, "result_output_no_bias", -1);
-        cur = ggml_add(ctx0, cur, model.output_b);
+    {
+        llm_graph_trace_scope trace(*this, graph_scope, "graph_finalize");
+        ggml_build_forward_expand(gf, cur);
     }
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 // Explicit template instantiations

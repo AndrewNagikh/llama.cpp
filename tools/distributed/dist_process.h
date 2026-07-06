@@ -28,6 +28,7 @@ bool dist_process_spawn(
 
 bool dist_process_kill(dist_child_process & proc);
 bool dist_process_reap(dist_child_process & proc);
+bool dist_process_is_running(dist_child_process & proc);
 
 // Run command, capture stdout. Returns exit code (-1 on spawn error).
 int dist_process_run_capture_stdout(

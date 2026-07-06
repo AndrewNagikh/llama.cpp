@@ -4,6 +4,8 @@
 
 #include "llama-distributed.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -13,6 +15,51 @@ static constexpr int    SPLIT_GEN_SEED          = 1234;
 static constexpr int    SPLIT_GEN_MAX_NEW       = 16;
 static constexpr int    SPLIT_GEN_LAYER_END     = 8;
 static const char *     SPLIT_GEN_PROMPT        = "Tell me a joke";
+
+static bool split_gen_pipe_trace_enabled() {
+    const char * v = std::getenv("DIST_PIPE_TRACE");
+    return v != nullptr && std::strcmp(v, "0") != 0;
+}
+
+static void split_gen_pipe_trace(
+        const char * worker,
+        const char * phase,
+        const char * step,
+        int32_t n_tokens,
+        int32_t n_embd,
+        int32_t pos_start,
+        int32_t layer_start,
+        int32_t layer_end) {
+    if (!split_gen_pipe_trace_enabled()) {
+        return;
+    }
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+    std::fprintf(stderr,
+            "pipe_trace timestamp_ms=%lld worker=%s phase=%s step=%s n_tokens=%d n_embd=%d pos_start=%d layer_start=%d layer_end=%d\n",
+            (long long) ts_ms,
+            worker,
+            phase,
+            step,
+            n_tokens,
+            n_embd,
+            pos_start,
+            layer_start,
+            layer_end);
+    std::fflush(stderr);
+}
+
+static void split_gen_write_ready_state(const std::string & ready_file, const char * state) {
+    if (ready_file.empty()) {
+        return;
+    }
+    FILE * f = std::fopen(ready_file.c_str(), "w");
+    if (f == nullptr) {
+        return;
+    }
+    std::fprintf(f, "%s\n", state);
+    std::fclose(f);
+}
 
 static llama_sampler * split_gen_make_sampler() {
     auto sparams = llama_sampler_chain_default_params();
@@ -73,13 +120,17 @@ static int split_gen_decode_hidden(
         int32_t n_tokens,
         int32_t n_embd,
         llama_pos pos_start,
-        bool last_output) {
+        bool all_outputs,
+        bool use_hidden_state_api = true) {
+    if (use_hidden_state_api) {
+        llama_set_hidden_state(ctx, hidden, n_tokens);
+    }
     llama_batch batch = llama_batch_init(n_tokens, n_embd, 1);
     for (int32_t i = 0; i < n_tokens; ++i) {
         batch.pos[i]       = pos_start + i;
         batch.n_seq_id[i]  = 1;
         batch.seq_id[i][0] = 0;
-        batch.logits[i]    = last_output && (i == n_tokens - 1);
+        batch.logits[i]    = all_outputs ? 1 : (i == n_tokens - 1);
         std::memcpy(
                 batch.embd + (size_t) i * n_embd,
                 hidden + (size_t) i * n_embd,
@@ -89,6 +140,23 @@ static int split_gen_decode_hidden(
     const int ret = llama_decode(ctx, batch);
     llama_batch_free(batch);
     return ret;
+}
+
+// layer_start > 0: hidden injection must run one token at a time so KV is
+// updated per position (matches split_gen3_b middle-stage prefill).
+static int split_gen_decode_hidden_seq(
+        llama_context * ctx,
+        const float * hidden,
+        int32_t n_tokens,
+        int32_t n_embd,
+        llama_pos pos_start) {
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const float * in = hidden + (size_t) i * (size_t) n_embd;
+        if (split_gen_decode_hidden(ctx, in, 1, n_embd, pos_start + i, true) != 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static std::vector<llama_token> split_gen_tokenize(const llama_vocab * vocab, const std::string & prompt) {

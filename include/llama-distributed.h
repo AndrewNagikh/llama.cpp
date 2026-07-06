@@ -27,6 +27,9 @@ LLAMA_API int32_t llama_get_hidden_state(struct llama_context * ctx, float * out
 // Clear hidden state set by llama_set_hidden_state().
 LLAMA_API void llama_clear_hidden_state(struct llama_context * ctx);
 
+// Skip output norm + LM head on [layer_start, n_layer) partial forwards (external output service).
+LLAMA_API void llama_set_skip_output_head(struct llama_context * ctx, bool skip);
+
 #ifdef __cplusplus
 }
 #endif

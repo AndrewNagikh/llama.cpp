@@ -94,6 +94,8 @@ struct llama_model_loader {
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;
     void * set_tensor_data_ud;
+    llama_model_tensor_filter_t tensor_filter = nullptr;
+    void * tensor_filter_ud = nullptr;
     std::vector<ggml_context_ptr> contexts;
 
     std::string arch_name;
@@ -123,6 +125,8 @@ struct llama_model_loader {
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
+        llama_model_tensor_filter_t tensor_filter,
+        void * tensor_filter_ud,
         const std::string & fname,
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         FILE * file,

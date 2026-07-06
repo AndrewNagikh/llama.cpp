@@ -7,6 +7,10 @@
 struct hidden_pipeline_parity_result {
     bool ok = false;
     parity_metrics metrics{};
+    tensor_stats reference_stats{};
+    tensor_stats producer_stats{};
+    bool exact_sha_match = false;
+    bool aggregate_match = false;
     std::string message;
 };
 

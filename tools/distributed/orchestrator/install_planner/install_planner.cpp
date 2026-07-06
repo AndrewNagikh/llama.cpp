@@ -394,7 +394,8 @@ install_plan_build_result build_install_plan(
         const desired_model_layout & desired,
         const actual_model_layout & actual,
         const coverage_report & coverage,
-        const std::string & source_url) {
+        const std::string & source_url,
+        const runtime_install_node_map * runtime_nodes) {
     install_plan_build_result result{};
     result.plan.model_id = desired.model_id.empty() ? coverage.model_id : desired.model_id;
 
@@ -411,7 +412,7 @@ install_plan_build_result build_install_plan(
     // Task 9.9 — idempotent fast path: fully ready layout needs zero operations.
     {
         const runtime_coverage_report rt_cov = compute_runtime_coverage(
-                rt, desired, actual, {});
+                rt, desired, actual, {}, runtime_nodes);
         if (rt_cov.fully_ready()) {
             result.success = true;
             finalize_plan(result.plan);
@@ -475,13 +476,14 @@ install_plan_build_result build_install_plan(
             source_url);
 
     if (!entry_node.empty() || !final_node.empty()) {
+        const runtime_install_node_map nodes = runtime_nodes != nullptr && runtime_nodes->valid()
+                ? *runtime_nodes
+                : runtime_install_node_map_legacy(entry_node, final_node, node_list);
         add_semantic_blob_downloads(
                 operations,
                 blob_seen,
                 rt,
-                entry_node,
-                final_node,
-                node_list,
+                nodes,
                 source_url,
                 actual,
                 ready_blobs);

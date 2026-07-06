@@ -2,7 +2,7 @@
 
 #include "ggml-backend.h"
 #include "ggml.h"
-#include "llama.h"
+#include "split_gen_model_load.h"
 #include "split_gen_common.h"
 #include "../transport/split_tcp_wire.h"
 #include "../runtime_debug/debug_hooks.h"
@@ -12,10 +12,14 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static void usage(const char * prog) {
-    fprintf(stderr, "usage: %s MODEL --ab-port PORT --bc-port PORT [--layer-start N] [--layer-end N]\n", prog);
+    fprintf(stderr,
+            "usage: %s MODEL --ab-port PORT --bc-port PORT [--layer-start N] "
+            "[--layer-end N] [--ready-file PATH]\n",
+            prog);
 }
 
 static bool forward_to_c(
@@ -136,6 +140,7 @@ int main(int argc, char ** argv) {
     int layer_end   = 10;
     const char * bc_host = "127.0.0.1";
     const char * bind_host = "0.0.0.0";
+    std::string ready_file;
 
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--ab-port") == 0 && i + 1 < argc) {
@@ -150,6 +155,8 @@ int main(int argc, char ** argv) {
             layer_start = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--layer-end") == 0 && i + 1 < argc) {
             layer_end = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--ready-file") == 0 && i + 1 < argc) {
+            ready_file = argv[++i];
         } else {
             usage(argv[0]);
             return 1;
@@ -161,17 +168,23 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    split_gen_write_ready_state(ready_file, "MODEL_LOADING");
+
     const int listen_fd = split_tcp_listen_host(bind_host, ab_port);
     if (listen_fd < 0) {
+        split_gen_write_ready_state(ready_file, "FAILED");
         fprintf(stderr, "gen3_b: listen failed %s:%d\n", bind_host, ab_port);
         return 1;
     }
+    split_gen_write_ready_state(ready_file, "LISTENER_READY");
 
     ggml_backend_load_all();
 
-    llama_model * model = llama_model_load_from_file(model_path, llama_model_default_params());
+    std::string load_err;
+    llama_model * model = split_gen_load_model(model_path, load_err);
     if (!model) {
-        fprintf(stderr, "gen3_b: load model failed\n");
+        split_gen_write_ready_state(ready_file, "FAILED");
+        fprintf(stderr, "gen3_b: load model failed: %s\n", load_err.c_str());
         return 1;
     }
 
@@ -180,9 +193,14 @@ int main(int argc, char ** argv) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx   = 512;
     cparams.n_batch = 512;
+    cparams.n_ubatch = 1;
     cparams.no_perf = true;
+    cparams.layer_start = layer_start;
+    cparams.layer_end   = layer_end;
+    fprintf(stderr, "gen3_b: create context layer_start=%d layer_end=%d\n", layer_start, layer_end);
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
+        split_gen_write_ready_state(ready_file, "FAILED");
         fprintf(stderr, "gen3_b: create context failed\n");
         return 1;
     }
@@ -194,21 +212,26 @@ int main(int argc, char ** argv) {
     trace_recorder * dbg = dist_debug_recorder();
     int32_t debug_step   = 0;
 
-    const int bc_fd = split_tcp_connect_retry(bc_host, bc_port, 300, 100);
+    const int bc_fd = split_tcp_connect_retry(bc_host, bc_port, 3000, 100);
     if (bc_fd < 0) {
+        split_gen_write_ready_state(ready_file, "FAILED");
         fprintf(stderr, "gen3_b: connect to C failed %s:%d\n", bc_host, bc_port);
         return 1;
     }
+    split_gen_write_ready_state(ready_file, "PIPE_READY");
 
     fprintf(stderr, "gen3_b: ready ab_port=%d layer=[%d,%d)\n", ab_port, layer_start, layer_end);
+    split_gen_write_ready_state(ready_file, "READY");
 
     const int ab_fd = split_tcp_accept(listen_fd);
     split_tcp_close(listen_fd);
     if (ab_fd < 0) {
         fprintf(stderr, "gen3_b: accept failed\n");
+        split_gen_write_ready_state(ready_file, "FAILED");
         return 1;
     }
 
+    bool normal_shutdown = false;
     while (true) {
         split_ab_cmd cmd;
         if (!split_ab_recv_cmd(ab_fd, cmd)) {
@@ -218,6 +241,7 @@ int main(int argc, char ** argv) {
 
         if (cmd == SPLIT_AB_CMD_SHUTDOWN) {
             split_ab_send_shutdown(bc_fd);
+            normal_shutdown = true;
             break;
         }
 
@@ -262,10 +286,14 @@ int main(int argc, char ** argv) {
 
         double ms_b = 0.0;
         std::vector<float> out_hidden;
+        split_gen_pipe_trace("middle", phase, "decode_enter",
+                msg.header.n_tokens, n_embd, msg.meta.pos_start, layer_start, layer_end);
         if (!run_b_layers(ctx, msg, n_embd, layer_start, layer_end, ms_b, out_hidden)) {
             fprintf(stderr, "gen3_b: decode failed\n");
             break;
         }
+        split_gen_pipe_trace("middle", phase, "decode_exit",
+                msg.header.n_tokens, n_embd, msg.meta.pos_start, layer_start, layer_end);
 
         if (dbg) {
             dist_debug_log_kv(dbg, debug_step, phase, ctx, 0);
@@ -276,11 +304,15 @@ int main(int argc, char ** argv) {
         }
 
         split_gen3_mid_resp resp{};
+        split_gen_pipe_trace("middle", phase, "forward_to_final_enter",
+                msg.header.n_tokens, n_embd, msg.meta.pos_start, layer_start, layer_end);
         if (!forward_to_c(bc_fd, msg.header.n_tokens, n_embd, layer_end,
                 msg.meta.pos_start, ms_b, out_hidden.data(),
                 debug_step, phase, dbg, resp)) {
             break;
         }
+        split_gen_pipe_trace("middle", phase, "forward_to_final_exit",
+                msg.header.n_tokens, n_embd, msg.meta.pos_start, layer_start, layer_end);
 
         if (dbg) {
             dist_debug_log_runtime_state(
@@ -298,6 +330,7 @@ int main(int argc, char ** argv) {
         debug_step++;
     }
 
+    split_gen_write_ready_state(ready_file, normal_shutdown ? "STOPPED" : "FAILED");
     split_tcp_close(ab_fd);
     split_tcp_close(bc_fd);
 

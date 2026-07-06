@@ -4,12 +4,36 @@
 
 using json = nlohmann::json;
 
+nlohmann::json runtime_service_endpoint::to_json() const {
+    return {
+        { "scheme", scheme.empty() ? "http" : scheme },
+        { "host", host },
+        { "port", port },
+    };
+}
+
+runtime_service_endpoint runtime_service_endpoint::from_json(const nlohmann::json & j) {
+    runtime_service_endpoint e{};
+    e.scheme = j.value("scheme", "http");
+    e.host   = j.value("host", "");
+    e.port   = j.value("port", 0);
+    return e;
+}
+
 nlohmann::json runtime_role_assignment::to_json() const {
+    runtime_service_endpoint effective_endpoint = endpoint;
+    if (effective_endpoint.host.empty()) {
+        effective_endpoint.host = host;
+    }
+    if (effective_endpoint.port <= 0) {
+        effective_endpoint.port = http_port;
+    }
     json j = {
         { "role", runtime_role_name(role) },
         { "node_id", node_id },
         { "host", host },
         { "http_port", http_port },
+        { "endpoint", effective_endpoint.to_json() },
         { "layer_start", layer_start },
         { "layer_end", layer_end },
         { "stage_index", stage_index },
@@ -30,6 +54,12 @@ runtime_role_assignment runtime_role_assignment::from_json(const nlohmann::json 
     a.node_id     = j.value("node_id", "");
     a.host        = j.value("host", "");
     a.http_port   = j.value("http_port", 0);
+    if (j.contains("endpoint") && j["endpoint"].is_object()) {
+        a.endpoint = runtime_service_endpoint::from_json(j["endpoint"]);
+    } else {
+        a.endpoint.host = a.host;
+        a.endpoint.port = a.http_port;
+    }
     a.layer_start = j.value("layer_start", 0);
     a.layer_end   = j.value("layer_end", 0);
     a.stage_index = j.value("stage_index", 0);

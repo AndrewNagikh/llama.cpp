@@ -20,6 +20,7 @@
 #include "runtime/runtime_role_planner.h"
 #include "runtime/runtime_graph.h"
 #include "runtime/runtime_role.h"
+#include "runtime/runtime_install_planning.h"
 
 #include "httplib.h"
 #include "nlohmann/json.hpp"
@@ -34,6 +35,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -131,6 +133,45 @@ static bool build_and_store_install_plan(
         const std::string & model_id,
         dist_model_record * record,
         const desired_model_layout * layout_override = nullptr);
+static std::vector<dist_layer_assignment> assignments_from_desired_layout(
+        const desired_model_layout & desired,
+        const std::map<std::string, dist_node_info> & node_map,
+        int n_layers);
+static model_memory_requirements get_model_memory_for_record(
+        const dist_model_record & record,
+        int32_t n_ctx);
+static std::optional<runtime_install_node_map> runtime_install_nodes_for_layout(
+        const dist_model_record & record,
+        const desired_model_layout & desired,
+        const std::map<std::string, dist_node_info> & node_map);
+static bool store_runtime_plan_for_layout(
+        const std::string & model_id,
+        const desired_model_layout & desired,
+        const std::map<std::string, dist_node_info> & node_map);
+
+static bool refresh_model_coverage(
+        const std::string & model_id,
+        const std::set<std::string> & online_nodes,
+        dist_model_record * out = nullptr) {
+    std::map<std::string, dist_node_info> node_map;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        for (const std::string & nid : online_nodes) {
+            const auto it = g_nodes.find(nid);
+            if (it != g_nodes.end()) {
+                node_map[nid] = it->second;
+            }
+        }
+    }
+    const dist_model_record * rec = g_registry.find(model_id);
+    std::optional<runtime_install_node_map> runtime_nodes;
+    if (rec != nullptr && rec->layout.has_value()) {
+        runtime_nodes = runtime_install_nodes_for_layout(*rec, rec->layout->desired, node_map);
+    }
+    const runtime_install_node_map * runtime_ptr =
+            runtime_nodes.has_value() ? &*runtime_nodes : nullptr;
+    return g_registry.refresh_coverage(model_id, online_nodes, out, runtime_ptr);
+}
 
 static std::string make_id(const char * prefix) {
     static std::mt19937_64 rng{ std::random_device{}() };
@@ -459,7 +500,7 @@ static void coordinate_install_plan_execute(
                 dist_model_record * record = g_registry.find(model_id);
                 if (record) {
                     g_registry.apply_actual(model_id, actual, record);
-                    g_registry.refresh_coverage(model_id, online_nodes, record);
+                    refresh_model_coverage(model_id, online_nodes, record);
                     record = g_registry.find(model_id);
                     if (record) {
                         build_and_store_install_plan(model_id, record);
@@ -589,7 +630,7 @@ static bool build_and_store_install_plan(
     std::set<std::string> online_nodes;
     poll_installed_layers_from_nodes(model_id, actual, online_nodes);
     g_registry.apply_actual(model_id, actual, record);
-    g_registry.refresh_coverage(model_id, online_nodes, record);
+    refresh_model_coverage(model_id, online_nodes, record);
 
     record = g_registry.find(model_id);
     if (!record || !record->coverage.has_value()) {
@@ -600,12 +641,27 @@ static bool build_and_store_install_plan(
             ? compute_coverage(*layout_override, actual, online_nodes)
             : *record->coverage;
 
+    std::map<std::string, dist_node_info> node_map;
+    for (const std::string & node_id : online_nodes) {
+        std::lock_guard<std::mutex> lock(g_mu);
+        const auto it = g_nodes.find(node_id);
+        if (it != g_nodes.end() && it->second.online) {
+            node_map[node_id] = it->second;
+        }
+    }
+
+    const std::optional<runtime_install_node_map> runtime_nodes =
+            runtime_install_nodes_for_layout(*record, *target, node_map);
+    const runtime_install_node_map * runtime_nodes_ptr =
+            runtime_nodes.has_value() ? &*runtime_nodes : nullptr;
+
     const auto built = build_install_plan(
             *record->manifest,
             *target,
             actual,
             coverage_for_plan,
-            resolve_model_source_url(*record));
+            resolve_model_source_url(*record),
+            runtime_nodes_ptr);
     if (!built.success) {
         return false;
     }
@@ -771,7 +827,7 @@ static void sync_model_state_from_cluster(
     }
 
     if (record && record->layout.has_value() && !record->layout->desired.placements.empty()) {
-        g_registry.refresh_coverage(model_id, online_nodes, record);
+        refresh_model_coverage(model_id, online_nodes, record);
         record = g_registry.find(model_id);
 
         // Saved layout may be stale after restart; adopt on-disk placement when fully installed.
@@ -786,13 +842,13 @@ static void sync_model_state_from_cluster(
                             model_id.c_str(),
                             static_cast<int>(inferred->placements.size()));
                     if (record) {
-                        g_registry.refresh_coverage(model_id, online_nodes, record);
+                        refresh_model_coverage(model_id, online_nodes, record);
                     }
                 }
             }
         }
     } else if (record && record->layout.has_value()) {
-        g_registry.refresh_coverage(model_id, online_nodes, record);
+        refresh_model_coverage(model_id, online_nodes, record);
     }
 }
 
@@ -822,6 +878,10 @@ static void trigger_cluster_optimization_async() {
             }
         }
     }).detach();
+}
+
+static std::string configure_worker_artifact(const std::string & artifact) {
+    return artifact.empty() ? "layer-store" : artifact;
 }
 
 static bool prepare_runtime_node(
@@ -858,7 +918,10 @@ static bool prepare_runtime_node(
         }
         worker_gguf_out = j.value("worker_gguf", "");
         const std::string rt_role = body.value("runtime_role", "");
-        if (worker_gguf_out.empty() && rt_role != "sampler") {
+        const bool bind_ready = j.value("tensors_ready", false) &&
+                worker_gguf_out.empty() &&
+                j.value("bind_source", "") == "layer_store";
+        if (worker_gguf_out.empty() && rt_role != "sampler" && !bind_ready) {
             err = node.node_id + ": prepare returned empty worker_gguf";
             return false;
         }
@@ -870,6 +933,11 @@ static bool prepare_runtime_node(
         if (rt_role == "embedding" && !j.value("embedding_ready", false)) {
             err = node.node_id + ": prepare embedding not ready: " +
                   j.value("error", "embedding shell failed");
+            return false;
+        }
+        if (rt_role == "output_head" && !j.value("output_ready", false)) {
+            err = node.node_id + ": prepare output not ready: " +
+                  j.value("error", "output shell failed");
             return false;
         }
         return true;
@@ -908,6 +976,50 @@ static bool configure_node(
     } catch (...) {
         err = node.node_id + ": invalid configure response";
         return false;
+    }
+}
+
+static bool wait_node_worker_ready(
+        const dist_node_info & node,
+        const dist_node_role role,
+        std::string & err,
+        int timeout_ms = 300000) {
+    httplib::Client cli(node.host.c_str(), node.http_port);
+    cli.set_connection_timeout(5, 0);
+    cli.set_read_timeout(5, 0);
+
+    const auto start = std::chrono::steady_clock::now();
+    while (true) {
+        const auto res = cli.Get("/status");
+        if (res && res->status == 200) {
+            try {
+                const json j = json::parse(res->body);
+                const std::string role_name = dist_role_name(role);
+                const std::string state =
+                        j.value("worker_states", json::object()).value(role_name, "STARTING");
+                if (state == "READY") {
+                    return true;
+                }
+                if (state == "FAILED") {
+                    err = node.node_id + " " + role_name + " worker failed during readiness";
+                    return false;
+                }
+            } catch (...) {
+                // Status can race with process restarts; keep polling until timeout.
+            }
+        }
+
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeout_ms) {
+            err = node.node_id + " " + std::string(dist_role_name(role)) + " worker READY timeout";
+            return false;
+        }
+#if defined(_WIN32)
+        Sleep(100);
+#else
+        usleep(100000);
+#endif
     }
 }
 
@@ -1052,6 +1164,139 @@ static model_memory_requirements get_model_memory_for_record(
     return {};
 }
 
+static std::optional<runtime_descriptor> runtime_descriptor_for_record(
+        const dist_model_record & record,
+        std::string & err) {
+    if (!record.manifest.has_value() || record.manifest->n_layer == 0) {
+        err = "manifest not ready";
+        return std::nullopt;
+    }
+
+    const std::string arch_id = record.manifest->architecture.empty()
+            ? "unknown.arch"
+            : record.manifest->architecture + ".arch";
+    runtime_descriptor desc = make_basic_text_generation_runtime_descriptor(
+            record.model_id,
+            arch_id,
+            static_cast<int32_t>(record.manifest->n_layer));
+
+    const runtime_descriptor_validation validation =
+            validate_runtime_descriptor(desc);
+    if (!validation.ok()) {
+        err = validation.errors.empty() ?
+                "runtime descriptor validation failed" :
+                validation.errors.front();
+        return std::nullopt;
+    }
+    return desc;
+}
+
+static std::optional<runtime_install_node_map> runtime_install_nodes_for_layout(
+        const dist_model_record & record,
+        const desired_model_layout & desired,
+        const std::map<std::string, dist_node_info> & node_map) {
+    if (record.stored_runtime_graph.has_value()) {
+        const runtime_install_node_map map =
+                runtime_install_node_map_from_graph(*record.stored_runtime_graph);
+        if (map.valid()) {
+            return map;
+        }
+    }
+    if (record.stored_runtime_install_nodes.has_value() &&
+            record.stored_runtime_install_nodes->valid()) {
+        return *record.stored_runtime_install_nodes;
+    }
+    if (!record.manifest.has_value() || record.manifest->n_layer == 0) {
+        return std::nullopt;
+    }
+    const int n_layers = static_cast<int>(record.manifest->n_layer);
+    const std::vector<dist_layer_assignment> assignments =
+            assignments_from_desired_layout(desired, node_map, n_layers);
+    if (assignments.empty()) {
+        return std::nullopt;
+    }
+    const model_memory_requirements mem = get_model_memory_for_record(record, 512);
+    if (!mem.valid()) {
+        return std::nullopt;
+    }
+    std::string desc_err;
+    const std::optional<runtime_descriptor> desc =
+            runtime_descriptor_for_record(record, desc_err);
+    if (!desc.has_value()) {
+        return std::nullopt;
+    }
+    const runtime_role_planner_result plan = dist_plan_runtime_graph(
+            *desc, mem, assignments, node_map);
+    if (!plan.success) {
+        return std::nullopt;
+    }
+    const runtime_execution_graph_validation graph_validation =
+            validate_runtime_graph_against_descriptor(*desc, plan.graph);
+    if (!graph_validation.ok()) {
+        return std::nullopt;
+    }
+    runtime_install_node_map map = runtime_install_node_map_from_graph(plan.graph);
+    if (!map.valid()) {
+        return std::nullopt;
+    }
+    return map;
+}
+
+static bool store_runtime_plan_for_layout(
+        const std::string & model_id,
+        const desired_model_layout & desired,
+        const std::map<std::string, dist_node_info> & node_map) {
+    const dist_model_record * record = g_registry.find(model_id);
+    if (!record || !record->manifest.has_value() || record->manifest->n_layer == 0) {
+        return false;
+    }
+    const int n_layers = static_cast<int>(record->manifest->n_layer);
+    const std::vector<dist_layer_assignment> assignments =
+            assignments_from_desired_layout(desired, node_map, n_layers);
+    if (assignments.empty()) {
+        return false;
+    }
+    const model_memory_requirements mem = get_model_memory_for_record(*record, g_n_ctx);
+    if (!mem.valid()) {
+        return false;
+    }
+    std::string desc_err;
+    const std::optional<runtime_descriptor> desc =
+            runtime_descriptor_for_record(*record, desc_err);
+    if (!desc.has_value()) {
+        fprintf(stderr,
+                "orchestrator: runtime descriptor invalid for %s: %s\n",
+                model_id.c_str(),
+                desc_err.c_str());
+        return false;
+    }
+    const runtime_role_planner_result plan = dist_plan_runtime_graph(
+            *desc, mem, assignments, node_map);
+    if (!plan.success) {
+        return false;
+    }
+    const runtime_execution_graph_validation graph_validation =
+            validate_runtime_graph_against_descriptor(*desc, plan.graph);
+    if (!graph_validation.ok()) {
+        fprintf(stderr,
+                "orchestrator: runtime graph invalid for %s: %s\n",
+                model_id.c_str(),
+                graph_validation.errors.empty() ? "unknown" : graph_validation.errors.front().c_str());
+        return false;
+    }
+    runtime_install_node_map install_map = runtime_install_node_map_from_graph(plan.graph);
+    if (!install_map.valid()) {
+        return false;
+    }
+    fprintf(stderr,
+            "orchestrator: runtime plan model=%s embedding=%s output=%s tokenizer=%s\n",
+            model_id.c_str(),
+            install_map.embedding_node.c_str(),
+            install_map.output_head_node.c_str(),
+            install_map.tokenizer_node.c_str());
+    return g_registry.apply_runtime_plan(model_id, plan.graph, std::move(install_map), nullptr);
+}
+
 static std::string default_models_dir() {
     const char * home = std::getenv("HOME");
     if (home != nullptr && home[0] != '\0') {
@@ -1186,9 +1431,47 @@ static bool setup_pipeline(
         dist_session & session,
         std::string & err);
 
+static bool setup_runtime_graph(
+        const std::string & session_id,
+        int n_layers,
+        const std::vector<dist_layer_assignment> & assignments,
+        const std::map<std::string, dist_node_info> & node_map,
+        const model_memory_requirements & mem,
+        dist_session & session,
+        std::string & err);
+
 static bool external_embedding_enabled() {
     const char * v = std::getenv("DIST_EXTERNAL_EMBEDDING");
-    return v != nullptr && v[0] == '1' && v[1] == '\0';
+    if (v == nullptr) {
+        return true;
+    }
+    return v[0] == '1' && v[1] == '\0';
+}
+
+static bool external_output_enabled() {
+    const char * v = std::getenv("DIST_EXTERNAL_OUTPUT");
+    if (v == nullptr) {
+        return true;
+    }
+    return v[0] == '1' && v[1] == '\0';
+}
+
+static bool prepare_service_role(
+        runtime_role_assignment & assign,
+        const json & prep,
+        const std::map<std::string, dist_node_info> & node_map,
+        std::string & artifact,
+        std::string & err,
+        const int timeout_ms = 600000) {
+    const dist_node_info * node = find_node(node_map, assign.node_id);
+    if (!node) {
+        err = "service node missing: " + assign.node_id;
+        return false;
+    }
+    if (prepare_runtime_node(*node, prep, artifact, err, timeout_ms)) {
+        return true;
+    }
+    return false;
 }
 
 static bool setup_runtime_graph(
@@ -1199,13 +1482,48 @@ static bool setup_runtime_graph(
         const model_memory_requirements & mem,
         dist_session & session,
         std::string & err) {
-    runtime_role_planner_result plan = dist_plan_runtime_graph(
-            session.model, n_layers, mem, assignments, node_map);
+    (void) n_layers;
+
+    runtime_role_planner_result plan{};
+    const dist_model_record * record = g_registry.find(session.model);
+    if (record == nullptr) {
+        err = "model record missing";
+        return false;
+    }
+    std::string desc_err;
+    const std::optional<runtime_descriptor> desc =
+            runtime_descriptor_for_record(*record, desc_err);
+    if (!desc.has_value()) {
+        err = "runtime descriptor: " + desc_err;
+        return false;
+    }
+    if (record != nullptr && record->stored_runtime_graph.has_value()) {
+        plan.success = true;
+        plan.graph   = *record->stored_runtime_graph;
+    } else {
+        plan = dist_plan_runtime_graph(
+                *desc, mem, assignments, node_map);
+    }
     if (!plan.success) {
         err = "runtime graph: " + plan.error;
         return false;
     }
+    const runtime_execution_graph_validation graph_validation =
+            validate_runtime_graph_against_descriptor(*desc, plan.graph);
+    if (!graph_validation.ok()) {
+        err = "runtime graph validation: " +
+                (graph_validation.errors.empty() ? "unknown" : graph_validation.errors.front());
+        return false;
+    }
     session.runtime = std::move(plan.graph);
+
+    const auto stage_ptrs = session.runtime.pipeline_stages();
+    if (stage_ptrs.empty()) {
+        err = "runtime graph has no pipeline stages";
+        return false;
+    }
+    const std::string first_pipeline_node = stage_ptrs.front()->node_id;
+    const std::string last_pipeline_node  = stage_ptrs.back()->node_id;
 
     std::set<std::string> touched_nodes;
     for (const auto & a : session.runtime.assignments) {
@@ -1228,10 +1546,16 @@ static bool setup_runtime_graph(
             if (!runtime_role_is_service(a.role)) {
                 continue;
             }
-            const dist_node_info * node = find_node(node_map, a.node_id);
-            if (!node) {
-                err = "service node missing: " + a.node_id;
-                return false;
+            if (a.role == runtime_role::embedding && a.node_id == first_pipeline_node) {
+                // The entry worker already owns token embedding tensors. Avoid
+                // loading a duplicate embedding service on the same constrained
+                // Docker node.
+                continue;
+            }
+            if (a.role == runtime_role::output_head && a.node_id == last_pipeline_node) {
+                // The final worker can execute output head locally when the
+                // service is placed on the same boundary node.
+                continue;
             }
 
             json prep = {
@@ -1241,19 +1565,19 @@ static bool setup_runtime_graph(
                 { "source_url", source_url },
             };
             std::string artifact;
-            if (!prepare_runtime_node(*node, prep, artifact, err, 600000)) {
+            if (!prepare_service_role(a, prep, node_map, artifact, err, 600000)) {
                 return false;
             }
 
-            httplib::Client cli(node->host.c_str(), node->http_port);
+            httplib::Client cli(a.host.c_str(), a.http_port);
             cli.set_connection_timeout(5, 0);
             cli.set_read_timeout(120, 0);
 
-            if (a.role == runtime_role::tokenizer && !artifact.empty()) {
+            if (a.role == runtime_role::tokenizer) {
                 const json cfg = {
                     { "session_id", session_id },
                     { "model_id", session.model },
-                    { "worker_gguf", artifact },
+                    { "worker_gguf", configure_worker_artifact(artifact) },
                 };
                 const auto res = cli.Post("/runtime/tokenizer/configure", cfg.dump(), "application/json");
                 if (!res || res->status != 200) {
@@ -1271,11 +1595,11 @@ static bool setup_runtime_graph(
                     err = a.node_id + " tokenizer configure: invalid response";
                     return false;
                 }
-            } else if (a.role == runtime_role::embedding && !artifact.empty()) {
+            } else if (a.role == runtime_role::embedding) {
                 const json cfg = {
                     { "session_id", session_id },
                     { "model_id", session.model },
-                    { "worker_gguf", artifact },
+                    { "worker_gguf", configure_worker_artifact(artifact) },
                 };
                 const auto res = cli.Post("/runtime/embedding/configure", cfg.dump(), "application/json");
                 if (!res || res->status != 200) {
@@ -1293,15 +1617,26 @@ static bool setup_runtime_graph(
                     err = a.node_id + " embedding configure: invalid response";
                     return false;
                 }
-            } else if (a.role == runtime_role::output_head && !artifact.empty()) {
+            } else if (a.role == runtime_role::output_head) {
                 const json cfg = {
                     { "session_id", session_id },
                     { "model_id", session.model },
-                    { "worker_gguf", artifact },
+                    { "worker_gguf", configure_worker_artifact(artifact) },
                 };
                 const auto res = cli.Post("/runtime/output/configure", cfg.dump(), "application/json");
                 if (!res || res->status != 200) {
                     err = a.node_id + " output configure failed";
+                    return false;
+                }
+                try {
+                    const json j = json::parse(res->body);
+                    if (!j.value("ok", false) || !j.value("output_ready", false)) {
+                        err = a.node_id + " output configure: " +
+                              j.value("error", "output not ready");
+                        return false;
+                    }
+                } catch (...) {
+                    err = a.node_id + " output configure: invalid response";
                     return false;
                 }
             } else if (a.role == runtime_role::sampler) {
@@ -1319,14 +1654,12 @@ static bool setup_runtime_graph(
     }
 
     const int pipe_base = 9100 + (int) (getpid() % 500) + 10;
-    const auto stage_ptrs = session.runtime.pipeline_stages();
-    if (stage_ptrs.empty()) {
-        err = "runtime graph has no pipeline stages";
-        return false;
-    }
-
     const runtime_role_assignment * emb_assign = session.runtime.find_role(runtime_role::embedding);
-    const bool external_embedding = external_embedding_enabled() && emb_assign != nullptr;
+    const runtime_role_assignment * out_assign = session.runtime.find_role(runtime_role::output_head);
+    const bool external_embedding =
+            external_embedding_enabled() && emb_assign != nullptr && emb_assign->node_id != first_pipeline_node;
+    const bool external_output =
+            external_output_enabled() && out_assign != nullptr && out_assign->node_id != last_pipeline_node;
 
     std::vector<dist_pipeline_stage> stages;
     stages.reserve(stage_ptrs.size());
@@ -1378,9 +1711,11 @@ static bool setup_runtime_graph(
             { "peer_bind", "0.0.0.0" },
             { "runtime_role", "pipeline_stage" },
         };
-        if (external_embedding && stage.role == DIST_ROLE_ENTRY && stage.layer_start == 0) {
-            prep["layer_start"] = 1;
+        if (external_embedding && i == 0) {
             prep["external_embedding"] = true;
+        }
+        if (external_output && stage.role == DIST_ROLE_FINAL) {
+            prep["external_output"] = true;
         }
         if (const dist_model_record * record = g_registry.find(session.model)) {
             prep["source_url"] = resolve_model_source_url(*record);
@@ -1417,12 +1752,14 @@ static bool setup_runtime_graph(
             { "layer_end", stage.layer_end },
             { "peer_bind", "0.0.0.0" },
             { "skip_materialize", true },
-            { "worker_gguf", worker_ggufs[(size_t) ri] },
+            { "worker_gguf", configure_worker_artifact(worker_ggufs[(size_t) ri]) },
             { "runtime_role", "pipeline_stage" },
         };
-        if (external_embedding && stage.role == DIST_ROLE_ENTRY && stage.layer_start == 0) {
-            cfg["layer_start"] = 1;
+        if (external_embedding && ri == 0) {
             cfg["external_embedding"] = true;
+        }
+        if (external_output && stage.role == DIST_ROLE_FINAL) {
+            cfg["external_output"] = true;
         }
         if (const dist_model_record * record = g_registry.find(session.model)) {
             cfg["source_url"] = resolve_model_source_url(*record);
@@ -1430,6 +1767,19 @@ static bool setup_runtime_graph(
         if (stage.role == DIST_ROLE_FINAL) {
             cfg["role"] = "final";
             cfg["peer_port"] = stage.peer_port;
+            if (external_output && out_assign != nullptr) {
+                const std::string out_host =
+                        !out_assign->endpoint.host.empty() ? out_assign->endpoint.host : out_assign->host;
+                const int out_port =
+                        out_assign->endpoint.port > 0 ? out_assign->endpoint.port : out_assign->http_port;
+                cfg["output_service"] = {
+                    { "scheme", out_assign->endpoint.scheme.empty() ? "http" : out_assign->endpoint.scheme },
+                    { "host", out_host },
+                    { "port", out_port },
+                    { "node_id", out_assign->node_id },
+                    { "role", runtime_role_name(out_assign->role) },
+                };
+            }
         } else if (stage.role == DIST_ROLE_MIDDLE) {
             const auto & next = stages[(size_t) ri + 1];
             cfg["role"] = "middle";
@@ -1444,20 +1794,38 @@ static bool setup_runtime_graph(
             cfg["next_port"] = next.peer_port;
             cfg["next_is_final"] = (next.role == DIST_ROLE_FINAL);
             if (external_embedding && emb_assign != nullptr) {
+                const std::string emb_host =
+                        !emb_assign->endpoint.host.empty() ? emb_assign->endpoint.host : emb_assign->host;
+                const int emb_port =
+                        emb_assign->endpoint.port > 0 ? emb_assign->endpoint.port : emb_assign->http_port;
                 cfg["external_embedding"] = true;
                 cfg["embedding_service"] = {
-                    { "host", emb_assign->host },
-                    { "port", emb_assign->http_port },
+                    { "scheme", emb_assign->endpoint.scheme.empty() ? "http" : emb_assign->endpoint.scheme },
+                    { "host", emb_host },
+                    { "port", emb_port },
+                    { "node_id", emb_assign->node_id },
+                    { "role", runtime_role_name(emb_assign->role) },
                 };
             }
         }
 
-        if (!configure_node(*node, cfg, err)) {
+        if (!configure_node(*node, cfg, err, 300000)) {
             return false;
         }
 #if !defined(_WIN32)
         usleep(ri == 0 ? 500000 : 200000);
 #endif
+    }
+
+    for (const auto & stage : stages) {
+        const dist_node_info * node = find_node(node_map, stage.node_id);
+        if (!node) {
+            err = "node vanished: " + stage.node_id;
+            return false;
+        }
+        if (!wait_node_worker_ready(*node, stage.role, err, 300000)) {
+            return false;
+        }
     }
 
     for (size_t i = 0; i < stage_ptrs.size(); ++i) {
@@ -1621,7 +1989,7 @@ static bool setup_pipeline(
             { "layer_end", stage.layer_end },
             { "peer_bind", "0.0.0.0" },
             { "skip_materialize", true },
-            { "worker_gguf", worker_ggufs[(size_t) ri] },
+            { "worker_gguf", configure_worker_artifact(worker_ggufs[(size_t) ri]) },
         };
 
         if (const dist_model_record * record = g_registry.find(session.model)) {
@@ -1646,13 +2014,24 @@ static bool setup_pipeline(
             cfg["next_is_final"] = (next.role == DIST_ROLE_FINAL);
         }
 
-        if (!configure_node(*node, cfg, err)) {
+        if (!configure_node(*node, cfg, err, 300000)) {
             return false;
         }
 
 #if !defined(_WIN32)
         usleep(ri == 0 ? 500000 : 200000);
 #endif
+    }
+
+    for (const auto & stage : stages) {
+        const dist_node_info * node = find_node(node_map, stage.node_id);
+        if (!node) {
+            err = "node vanished: " + stage.node_id;
+            return false;
+        }
+        if (!wait_node_worker_ready(*node, stage.role, err, 300000)) {
+            return false;
+        }
     }
 
     session.pipeline         = stages;
@@ -1693,6 +2072,136 @@ static json pipeline_json(const dist_session & session) {
         });
     }
     return stages;
+}
+
+static bool recover_session_pipeline(dist_session & session, std::string & err) {
+    if (session.pipeline.empty()) {
+        err = "empty pipeline";
+        return false;
+    }
+
+    std::map<std::string, dist_node_info> node_map;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        node_map = g_nodes;
+    }
+
+    const runtime_role_assignment * emb_assign = session.runtime.find_role(runtime_role::embedding);
+    const runtime_role_assignment * out_assign = session.runtime.find_role(runtime_role::output_head);
+    const std::string first_pipeline_node = session.pipeline.front().node_id;
+    const std::string last_pipeline_node  = session.pipeline.back().node_id;
+    const bool external_embedding =
+            external_embedding_enabled() && emb_assign != nullptr && emb_assign->node_id != first_pipeline_node;
+    const bool external_output =
+            external_output_enabled() && out_assign != nullptr && out_assign->node_id != last_pipeline_node;
+
+    for (const auto & stage : session.pipeline) {
+        const dist_node_info * node = find_node(node_map, stage.node_id);
+        if (node == nullptr) {
+            err = "pipeline recovery missing node: " + stage.node_id;
+            return false;
+        }
+        shutdown_node(*node);
+    }
+#if !defined(_WIN32)
+    usleep(300000);
+#endif
+
+    for (int ri = (int) session.pipeline.size() - 1; ri >= 0; --ri) {
+        const auto & stage = session.pipeline[(size_t) ri];
+        const dist_node_info * node = find_node(node_map, stage.node_id);
+        if (node == nullptr) {
+            err = "pipeline recovery node vanished: " + stage.node_id;
+            return false;
+        }
+
+        json cfg = {
+            { "session_id", session.session_id },
+            { "model_id", session.model },
+            { "layer_start", stage.layer_start },
+            { "layer_end", stage.layer_end },
+            { "peer_bind", "0.0.0.0" },
+            { "skip_materialize", true },
+            { "runtime_role", "pipeline_stage" },
+        };
+        if (const dist_model_record * record = g_registry.find(session.model)) {
+            cfg["source_url"] = resolve_model_source_url(*record);
+        }
+        if (external_embedding && ri == 0) {
+            cfg["external_embedding"] = true;
+        }
+        if (external_output && stage.role == DIST_ROLE_FINAL) {
+            cfg["external_output"] = true;
+        }
+
+        if (stage.role == DIST_ROLE_FINAL) {
+            cfg["role"] = "final";
+            cfg["peer_port"] = stage.peer_port;
+            if (external_output && out_assign != nullptr) {
+                const std::string out_host =
+                        !out_assign->endpoint.host.empty() ? out_assign->endpoint.host : out_assign->host;
+                const int out_port =
+                        out_assign->endpoint.port > 0 ? out_assign->endpoint.port : out_assign->http_port;
+                cfg["output_service"] = {
+                    { "scheme", out_assign->endpoint.scheme.empty() ? "http" : out_assign->endpoint.scheme },
+                    { "host", out_host },
+                    { "port", out_port },
+                    { "node_id", out_assign->node_id },
+                    { "role", runtime_role_name(out_assign->role) },
+                };
+            }
+        } else if (stage.role == DIST_ROLE_MIDDLE) {
+            const auto & next = session.pipeline[(size_t) ri + 1];
+            cfg["role"] = "middle";
+            cfg["peer_port"] = stage.peer_port;
+            cfg["next_host"] = next.host;
+            cfg["next_port"] = next.peer_port;
+        } else {
+            const auto & next = session.pipeline[(size_t) ri + 1];
+            cfg["role"] = "entry";
+            cfg["ctrl_port"] = stage.ctrl_port;
+            cfg["next_host"] = next.host;
+            cfg["next_port"] = next.peer_port;
+            cfg["next_is_final"] = (next.role == DIST_ROLE_FINAL);
+            if (external_embedding && emb_assign != nullptr) {
+                const std::string emb_host =
+                        !emb_assign->endpoint.host.empty() ? emb_assign->endpoint.host : emb_assign->host;
+                const int emb_port =
+                        emb_assign->endpoint.port > 0 ? emb_assign->endpoint.port : emb_assign->http_port;
+                cfg["external_embedding"] = true;
+                cfg["embedding_service"] = {
+                    { "scheme", emb_assign->endpoint.scheme.empty() ? "http" : emb_assign->endpoint.scheme },
+                    { "host", emb_host },
+                    { "port", emb_port },
+                    { "node_id", emb_assign->node_id },
+                    { "role", runtime_role_name(emb_assign->role) },
+                };
+            }
+        }
+
+        if (!configure_node(*node, cfg, err, 300000)) {
+            err = "pipeline recovery configure " + stage.node_id + ": " + err;
+            return false;
+        }
+#if !defined(_WIN32)
+        usleep(ri == 0 ? 500000 : 200000);
+#endif
+    }
+
+    for (const auto & stage : session.pipeline) {
+        const dist_node_info * node = find_node(node_map, stage.node_id);
+        if (node == nullptr) {
+            err = "pipeline recovery node vanished while waiting: " + stage.node_id;
+            return false;
+        }
+        if (!wait_node_worker_ready(*node, stage.role, err, 300000)) {
+            err = "pipeline recovery readiness " + stage.node_id + ": " + err;
+            return false;
+        }
+    }
+
+    session.configure_count += 1;
+    return true;
 }
 
 static bool run_generation(
@@ -2234,6 +2743,30 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // Gate session on runtime blob coverage matching the stored install plan.
+        if (record->layout.has_value() && record->manifest.has_value()) {
+            actual_model_layout actual;
+            std::set<std::string> online_nodes;
+            poll_installed_layers_from_nodes(model_id, actual, online_nodes);
+
+            const semantic_runtime_descriptor rt =
+                    build_semantic_runtime_descriptor(*record->manifest);
+            const std::optional<runtime_install_node_map> runtime_nodes =
+                    runtime_install_nodes_for_layout(*record, record->layout->desired, node_map);
+            const runtime_install_node_map * runtime_ptr =
+                    runtime_nodes.has_value() ? &*runtime_nodes : nullptr;
+            const runtime_coverage_report rt_cov = compute_runtime_coverage(
+                    rt, record->layout->desired, actual, online_nodes, runtime_ptr);
+
+            if (!rt_cov.fully_ready()) {
+                res.status = 503;
+                json err = rt_cov.to_json();
+                err["error"] = "runtime coverage not ready";
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+        }
+
         dist_session session{};
         session.session_id = make_id("sess");
         session.model      = record->model_id;
@@ -2600,7 +3133,43 @@ int main(int argc, char ** argv) {
         std::string text;
         std::string err;
         json pipeline_timing = json::object();
-        const bool ok = run_generation(session, prompt, max_tokens, out_tokens, text, err, &pipeline_timing);
+        bool ok = run_generation(session, prompt, max_tokens, out_tokens, text, err, &pipeline_timing);
+        if (!ok) {
+            const std::string first_err = err;
+            std::string recovery_err;
+            dist_session recovered = session;
+            if (recover_session_pipeline(recovered, recovery_err)) {
+                json retry_timing = json::object();
+                std::string retry_err;
+                json retry_tokens = json::array();
+                std::string retry_text;
+                if (run_generation(recovered, prompt, max_tokens, retry_tokens, retry_text, retry_err, &retry_timing)) {
+                    ok = true;
+                    out_tokens = std::move(retry_tokens);
+                    text = std::move(retry_text);
+                    pipeline_timing = std::move(retry_timing);
+                    pipeline_timing["recovered_pipeline"] = true;
+                    pipeline_timing["first_error"] = first_err;
+                    {
+                        std::lock_guard<std::mutex> lock(g_mu);
+                        auto it = g_sessions.find(session_id);
+                        if (it != g_sessions.end()) {
+                            it->second = recovered;
+                        }
+                    }
+                } else {
+                    err = first_err + "; retry after pipeline recovery failed: " + retry_err;
+                    pipeline_timing["recovered_pipeline"] = false;
+                    pipeline_timing["recovery_attempted"] = true;
+                    pipeline_timing["recovery_error"] = retry_err;
+                }
+            } else {
+                err = first_err + "; pipeline recovery failed: " + recovery_err;
+                pipeline_timing["recovered_pipeline"] = false;
+                pipeline_timing["recovery_attempted"] = true;
+                pipeline_timing["recovery_error"] = recovery_err;
+            }
+        }
 
         {
             std::lock_guard<std::mutex> lock(g_mu);
@@ -3127,6 +3696,19 @@ int main(int argc, char ** argv) {
 
         if (!force && record->layout.has_value() &&
                 !record->layout->desired.placements.empty()) {
+            if (!record->stored_runtime_graph.has_value()) {
+                std::map<std::string, dist_node_info> node_map;
+                {
+                    std::lock_guard<std::mutex> lock(g_mu);
+                    for (const auto & kv : g_nodes) {
+                        if (kv.second.online) {
+                            node_map[kv.first] = kv.second;
+                        }
+                    }
+                }
+                store_runtime_plan_for_layout(model_id, record->layout->desired, node_map);
+                record = g_registry.find(model_id);
+            }
             const auto & layout = record->layout->desired;
             res.set_content(json({
                 { "status", "ok" },
@@ -3173,6 +3755,19 @@ int main(int argc, char ** argv) {
             res.status = 404;
             res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
             return;
+        }
+
+        {
+            std::map<std::string, dist_node_info> node_map;
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                for (const auto & kv : g_nodes) {
+                    if (kv.second.online) {
+                        node_map[kv.first] = kv.second;
+                    }
+                }
+            }
+            store_runtime_plan_for_layout(model_id, built.layout, node_map);
         }
 
         sync_model_state_from_cluster(model_id, false);
@@ -3302,7 +3897,7 @@ int main(int argc, char ** argv) {
             res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
             return;
         }
-        if (!g_registry.refresh_coverage(model_id, online_nodes, record)) {
+        if (!refresh_model_coverage(model_id, online_nodes, record)) {
             res.status = 500;
             res.set_content(json({ { "error", "coverage refresh failed" } }).dump(), "application/json");
             return;
@@ -3356,7 +3951,7 @@ int main(int argc, char ** argv) {
             res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
             return;
         }
-        g_registry.refresh_coverage(model_id, online_nodes, record);
+        refresh_model_coverage(model_id, online_nodes, record);
 
         const reconciliation_result result = reconcile_layers(
                 record->layout->desired, actual, online_nodes);
@@ -3365,8 +3960,22 @@ int main(int argc, char ** argv) {
         if (record->manifest.has_value()) {
             const semantic_runtime_descriptor rt =
                     build_semantic_runtime_descriptor(*record->manifest);
+            std::map<std::string, dist_node_info> node_map;
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                for (const std::string & nid : online_nodes) {
+                    const auto it = g_nodes.find(nid);
+                    if (it != g_nodes.end()) {
+                        node_map[nid] = it->second;
+                    }
+                }
+            }
+            const std::optional<runtime_install_node_map> runtime_nodes =
+                    runtime_install_nodes_for_layout(*record, record->layout->desired, node_map);
+            const runtime_install_node_map * runtime_ptr =
+                    runtime_nodes.has_value() ? &*runtime_nodes : nullptr;
             coverage = compute_runtime_coverage(
-                    rt, record->layout->desired, actual, online_nodes).layer_coverage;
+                    rt, record->layout->desired, actual, online_nodes, runtime_ptr).layer_coverage;
         }
         g_registry.apply_coverage(model_id, coverage, record);
 
@@ -3544,7 +4153,7 @@ int main(int argc, char ** argv) {
         std::set<std::string> online_nodes;
         poll_installed_layers_from_nodes(model_id, actual, online_nodes);
         g_registry.apply_actual(model_id, actual, record);
-        g_registry.refresh_coverage(model_id, online_nodes, record);
+        refresh_model_coverage(model_id, online_nodes, record);
         record = g_registry.find(model_id);
         if (!record) {
             res.status = 500;

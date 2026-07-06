@@ -7,8 +7,11 @@
 #include "node_agent/layer_store/layer_gguf_assembler.h"
 #include "architecture/semantic_runtime_descriptor.h"
 #include "architecture/worker_requirement.h"
+#include "runtime/runtime_config.h"
 #include "runtime/runtime_role.h"
 #include "runtime/runtime_worker_bind.h"
+#include "runtime/runtime_worker_gguf_resolver.h"
+#include "runtime/llama_layer_store_model_load.h"
 #include "verification/worker_verify.h"
 #include "node_agent/synchronization/synchronization_engine.h"
 #include "orchestrator/install_planner/install_planner.h"
@@ -50,6 +53,9 @@ static BenchmarkResult g_benchmark{};
 static dist_child_process g_entry_worker{};
 static dist_child_process g_middle_worker{};
 static dist_child_process g_final_worker{};
+static std::string g_entry_worker_state_file;
+static std::string g_middle_worker_state_file;
+static std::string g_final_worker_state_file;
 static int g_pipeline_ctrl_port = 0;
 static int g_pipeline_layer_end = 0;
 
@@ -67,9 +73,19 @@ struct node_runtime_stats {
 
 static node_runtime_stats g_runtime_stats;
 static std::string g_entry_worker_gguf;
+static std::string g_entry_model_id;
+static constexpr const char * LAYER_STORE_MODEL_SENTINEL = "layer-store";
+
 static std::string g_tokenizer_service_gguf;
+static std::string g_tokenizer_service_model_id;
 static std::string g_embedding_service_gguf;
+static std::string g_embedding_service_model_id;
+static int32_t g_embedding_service_layer_start = 0;
+static int32_t g_embedding_service_layer_end   = 0;
 static std::string g_output_service_gguf;
+static std::string g_output_service_model_id;
+static int32_t g_output_service_layer_start = 0;
+static int32_t g_output_service_layer_end   = 0;
 static bool g_sampler_service_ready = false;
 static llama_model * g_entry_tokenizer = nullptr;
 static llama_model * g_tokenizer_service_model = nullptr;
@@ -79,7 +95,20 @@ static int32_t g_embedding_service_n_embd = 0;
 static bool g_external_embedding = false;
 static std::string g_embedding_service_host;
 static int g_embedding_service_port = 0;
+static llama_model * g_output_service_model = nullptr;
+static llama_context * g_output_service_ctx = nullptr;
+static llama_sampler * g_output_service_smpl = nullptr;
+static int32_t g_output_service_n_layer = 0;
+static int32_t g_output_service_n_vocab = 0;
+static bool g_external_output = false;
+static std::string g_output_service_host;
+static int g_output_service_port = 0;
+static int g_agent_http_port = 0;
 static std::string g_register_host;
+
+static layer_store get_layer_store(const std::string & model_id);
+
+static worker_role dist_role_to_worker_role(const dist_node_role role);
 
 static void free_embedding_service() {
     if (g_embedding_service_ctx) {
@@ -97,15 +126,36 @@ static bool ensure_embedding_service_loaded(std::string & err) {
     if (g_embedding_service_ctx != nullptr) {
         return true;
     }
-    if (g_embedding_service_gguf.empty()) {
-        err = "embedding service not configured";
-        return false;
-    }
     ggml_backend_load_all();
-    g_embedding_service_model = llama_model_load_from_file(
-            g_embedding_service_gguf.c_str(), llama_model_default_params());
+
+    if (g_embedding_service_gguf.empty() &&
+            !g_embedding_service_model_id.empty() &&
+            runtime_layer_first_enabled()) {
+        layer_store store = get_layer_store(g_embedding_service_model_id);
+        const auto manifest = store.load_manifest();
+        if (!manifest.has_value()) {
+            err = "embedding layer store manifest missing";
+            return false;
+        }
+        runtime_layer_store_model_load_request req{};
+        req.role        = worker_role::embedding;
+        req.layer_start = g_embedding_service_layer_start;
+        req.layer_end   = g_embedding_service_layer_end;
+        g_embedding_service_model = runtime_load_model_from_layer_store(
+                store, *manifest, req, err);
+    } else {
+        if (g_embedding_service_gguf.empty()) {
+            err = "embedding service not configured";
+            return false;
+        }
+        g_embedding_service_model = llama_model_load_from_file(
+                g_embedding_service_gguf.c_str(), llama_model_default_params());
+    }
+
     if (!g_embedding_service_model) {
-        err = "failed to load embedding model";
+        if (err.empty()) {
+            err = "failed to load embedding model";
+        }
         return false;
     }
     g_embedding_service_n_embd = llama_model_n_embd(g_embedding_service_model);
@@ -138,38 +188,64 @@ static bool embedding_service_compute_local(
         llama_memory_clear(llama_get_memory(g_embedding_service_ctx), true);
     }
     std::vector<llama_token> toks(tokens.begin(), tokens.end());
-    const bool all_outputs = tokens.size() > 1;
-    if (all_outputs) {
+    n_embd_out = g_embedding_service_n_embd;
+    hidden_out.resize((size_t) tokens.size() * (size_t) n_embd_out);
+    if (tokens.size() > 1) {
         if (split_gen_decode_tokens(g_embedding_service_ctx, toks, pos_start, true) != 0) {
             err = "embedding forward failed";
             return false;
         }
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            const float * h = llama_get_embeddings_ith(g_embedding_service_ctx, (int32_t) i);
+            if (h == nullptr) {
+                err = "embedding output missing";
+                return false;
+            }
+            std::memcpy(
+                    hidden_out.data() + i * (size_t) n_embd_out,
+                    h,
+                    (size_t) n_embd_out * sizeof(float));
+        }
     } else if (split_gen_decode_one(g_embedding_service_ctx, toks[0], pos_start) != 0) {
         err = "embedding forward failed";
         return false;
-    }
-    n_embd_out = g_embedding_service_n_embd;
-    hidden_out.resize((size_t) tokens.size() * (size_t) n_embd_out);
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        const float * h = all_outputs
-                ? llama_get_embeddings_ith(g_embedding_service_ctx, (int32_t) i)
-                : llama_get_embeddings(g_embedding_service_ctx);
+    } else {
+        const float * h = llama_get_embeddings(g_embedding_service_ctx);
         if (h == nullptr) {
             err = "embedding output missing";
             return false;
         }
-        std::memcpy(
-                hidden_out.data() + i * (size_t) n_embd_out,
-                h,
-                (size_t) n_embd_out * sizeof(float));
+        std::memcpy(hidden_out.data(), h, (size_t) n_embd_out * sizeof(float));
     }
     return true;
 }
 
-static void embedding_service_reset() {
-    if (g_embedding_service_ctx != nullptr) {
-        llama_memory_clear(llama_get_memory(g_embedding_service_ctx), true);
+static bool embedding_service_reset(std::string & err) {
+    const bool local = (!g_embedding_service_gguf.empty() || !g_embedding_service_model_id.empty()) &&
+            (g_embedding_service_host.empty() ||
+             g_embedding_service_host == g_register_host ||
+             g_embedding_service_host == "127.0.0.1" ||
+             g_embedding_service_host == "localhost");
+    if (local) {
+        if (g_embedding_service_ctx != nullptr) {
+            llama_memory_clear(llama_get_memory(g_embedding_service_ctx), true);
+            llama_clear_hidden_state(g_embedding_service_ctx);
+        }
+        return true;
     }
+    if (g_embedding_service_host.empty() || g_embedding_service_port <= 0) {
+        err = "embedding service endpoint not configured";
+        return false;
+    }
+    httplib::Client cli(g_embedding_service_host.c_str(), g_embedding_service_port);
+    cli.set_connection_timeout(10, 0);
+    cli.set_read_timeout(60, 0);
+    const auto res = cli.Post("/runtime/embedding/reset", "{}", "application/json");
+    if (!res || res->status != 200) {
+        err = "remote embedding service reset failed";
+        return false;
+    }
+    return true;
 }
 
 static bool embedding_service_compute_remote(
@@ -225,7 +301,7 @@ static bool embedding_service_compute(
         std::vector<float> & hidden_out,
         int32_t & n_embd_out,
         std::string & err) {
-    const bool local = !g_embedding_service_gguf.empty() &&
+    const bool local = (!g_embedding_service_gguf.empty() || !g_embedding_service_model_id.empty()) &&
             (g_embedding_service_host.empty() ||
              g_embedding_service_host == g_register_host ||
              g_embedding_service_host == "127.0.0.1" ||
@@ -238,10 +314,178 @@ static bool embedding_service_compute(
 
 static bool embedding_service_ready() {
     std::string err;
-    if (!g_embedding_service_gguf.empty()) {
+    if (!g_embedding_service_gguf.empty() || !g_embedding_service_model_id.empty()) {
         return ensure_embedding_service_loaded(err);
     }
     return !g_embedding_service_host.empty() && g_embedding_service_port > 0;
+}
+
+static void free_output_service() {
+    if (g_output_service_smpl) {
+        llama_sampler_free(g_output_service_smpl);
+        g_output_service_smpl = nullptr;
+    }
+    if (g_output_service_ctx) {
+        llama_free(g_output_service_ctx);
+        g_output_service_ctx = nullptr;
+    }
+    if (g_output_service_model) {
+        llama_model_free(g_output_service_model);
+        g_output_service_model = nullptr;
+    }
+    g_output_service_n_layer = 0;
+    g_output_service_n_vocab = 0;
+}
+
+static bool ensure_output_service_loaded(std::string & err) {
+    if (g_output_service_ctx != nullptr) {
+        return true;
+    }
+    ggml_backend_load_all();
+
+    if (g_output_service_gguf.empty() &&
+            !g_output_service_model_id.empty() &&
+            runtime_layer_first_enabled()) {
+        layer_store store = get_layer_store(g_output_service_model_id);
+        const auto manifest = store.load_manifest();
+        if (!manifest.has_value()) {
+            err = "output layer store manifest missing";
+            return false;
+        }
+        runtime_layer_store_model_load_request req{};
+        req.role        = worker_role::output_head;
+        req.layer_start = g_output_service_layer_start;
+        req.layer_end   = g_output_service_layer_end;
+        g_output_service_model = runtime_load_model_from_layer_store(
+                store, *manifest, req, err);
+    } else {
+        if (g_output_service_gguf.empty()) {
+            err = "output service not configured";
+            return false;
+        }
+        g_output_service_model = llama_model_load_from_file(
+                g_output_service_gguf.c_str(), llama_model_default_params());
+    }
+
+    if (!g_output_service_model) {
+        if (err.empty()) {
+            err = "failed to load output model";
+        }
+        return false;
+    }
+    g_output_service_n_layer = llama_model_n_layer(g_output_service_model);
+    g_output_service_n_vocab = llama_vocab_n_tokens(
+            llama_model_get_vocab(g_output_service_model));
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx   = 512;
+    cparams.n_batch = 512;
+    cparams.no_perf = true;
+    g_output_service_ctx = llama_init_from_model(g_output_service_model, cparams);
+    if (!g_output_service_ctx) {
+        err = "failed to create output context";
+        free_output_service();
+        return false;
+    }
+    llama_set_layer_range(g_output_service_ctx, g_output_service_n_layer - 1, g_output_service_n_layer);
+    g_runtime_stats.runtime_load_count++;
+    return true;
+}
+
+static bool output_service_sample_local(
+        const float * hidden,
+        int32_t n_embd,
+        int32_t pos,
+        int32_t & token_out,
+        std::string & err) {
+    if (!ensure_output_service_loaded(err)) {
+        return false;
+    }
+    llama_memory_clear(llama_get_memory(g_output_service_ctx), true);
+    llama_clear_hidden_state(g_output_service_ctx);
+    if (split_gen_decode_hidden(
+                g_output_service_ctx, hidden, 1, n_embd, pos, true, true) != 0) {
+        err = "output forward failed";
+        return false;
+    }
+    if (!g_output_service_smpl) {
+        g_output_service_smpl = split_gen_make_sampler();
+    }
+    token_out = (int32_t) llama_sampler_sample(g_output_service_smpl, g_output_service_ctx, -1);
+    llama_sampler_accept(g_output_service_smpl, (llama_token) token_out);
+    return true;
+}
+
+static bool output_service_sample_remote(
+        const float * hidden,
+        int32_t n_embd,
+        int32_t pos,
+        int32_t & token_out,
+        std::string & err) {
+    if (g_output_service_host.empty() || g_output_service_port <= 0) {
+        err = "output service endpoint not configured";
+        return false;
+    }
+    httplib::Client cli(g_output_service_host.c_str(), g_output_service_port);
+    cli.set_connection_timeout(10, 0);
+    cli.set_read_timeout(120, 0);
+    json hidden_json = json::array();
+    for (int32_t i = 0; i < n_embd; ++i) {
+        hidden_json.push_back(hidden[i]);
+    }
+    const json body = {
+        { "hidden", hidden_json },
+        { "n_embd", n_embd },
+        { "pos", pos },
+    };
+    const auto res = cli.Post("/runtime/output/sample", body.dump(), "application/json");
+    if (!res || res->status != 200) {
+        err = "remote output service failed";
+        return false;
+    }
+    try {
+        const json j = json::parse(res->body);
+        if (!j.value("ok", false)) {
+            err = j.value("error", "sample failed");
+            return false;
+        }
+        token_out = j.value("token_id", -1);
+        if (token_out < 0) {
+            err = "invalid output response";
+            return false;
+        }
+        return true;
+    } catch (...) {
+        err = "invalid output response json";
+        return false;
+    }
+}
+
+static bool output_service_sample(
+        const float * hidden,
+        int32_t n_embd,
+        int32_t pos,
+        int32_t & token_out,
+        std::string & err) {
+    const bool local = !g_output_service_gguf.empty() &&
+            (g_output_service_host.empty() ||
+             g_output_service_host == g_register_host ||
+             g_output_service_host == "127.0.0.1" ||
+             g_output_service_host == "localhost");
+    if (local) {
+        return output_service_sample_local(hidden, n_embd, pos, token_out, err);
+    }
+    return output_service_sample_remote(hidden, n_embd, pos, token_out, err);
+}
+
+static void output_service_reset_local() {
+    if (g_output_service_ctx != nullptr) {
+        llama_memory_clear(llama_get_memory(g_output_service_ctx), true);
+        llama_clear_hidden_state(g_output_service_ctx);
+    }
+    if (g_output_service_smpl != nullptr) {
+        llama_sampler_free(g_output_service_smpl);
+        g_output_service_smpl = nullptr;
+    }
 }
 
 static void free_tokenizer_service() {
@@ -265,14 +509,58 @@ static llama_model_params default_tokenizer_model_params() {
     return params;
 }
 
+static bool apply_service_model_source(
+        const std::string & worker_gguf,
+        const std::string & model_id,
+        std::string & gguf_out,
+        std::string & model_id_out) {
+    if (!worker_gguf.empty() && worker_gguf != LAYER_STORE_MODEL_SENTINEL) {
+        gguf_out       = worker_gguf;
+        model_id_out.clear();
+        return true;
+    }
+    if (!model_id.empty() && runtime_layer_first_enabled()) {
+        gguf_out.clear();
+        model_id_out = model_id;
+        return true;
+    }
+    return false;
+}
+
 static const llama_vocab * tokenizer_service_vocab() {
-    if (!g_tokenizer_service_model && !g_tokenizer_service_gguf.empty()) {
-        ggml_backend_load_all();
-        g_tokenizer_service_model = llama_model_load_from_file(
-                g_tokenizer_service_gguf.c_str(), default_tokenizer_model_params());
+    if (!g_tokenizer_service_model) {
+        if (!g_tokenizer_service_gguf.empty()) {
+            ggml_backend_load_all();
+            g_tokenizer_service_model = llama_model_load_from_file(
+                    g_tokenizer_service_gguf.c_str(), default_tokenizer_model_params());
+        } else if (!g_tokenizer_service_model_id.empty() && runtime_layer_first_enabled()) {
+            layer_store store = get_layer_store(g_tokenizer_service_model_id);
+            const auto manifest = store.load_manifest();
+            std::string load_err;
+            if (manifest.has_value()) {
+                runtime_layer_store_model_load_request req{};
+                req.role           = worker_role::tokenizer;
+                req.params         = default_tokenizer_model_params();
+                req.verify_tensors = false;
+                g_tokenizer_service_model = runtime_load_model_from_layer_store(
+                        store, *manifest, req, load_err);
+            }
+            if (!g_tokenizer_service_model && !load_err.empty()) {
+                fprintf(stderr, "node_agent: tokenizer layer store load: %s\n", load_err.c_str());
+            }
+        }
         if (g_tokenizer_service_model) {
             g_runtime_stats.tokenizer_init_count = 1;
-        } else {
+            if (!g_tokenizer_service_gguf.empty()) {
+                fprintf(stderr,
+                        "node_agent: tokenizer service loaded from %s\n",
+                        g_tokenizer_service_gguf.c_str());
+            } else {
+                fprintf(stderr,
+                        "node_agent: tokenizer service loaded from layer store %s\n",
+                        g_tokenizer_service_model_id.c_str());
+            }
+        } else if (!g_tokenizer_service_gguf.empty()) {
             fprintf(stderr,
                     "node_agent: tokenizer load failed for %s\n",
                     g_tokenizer_service_gguf.c_str());
@@ -282,10 +570,28 @@ static const llama_vocab * tokenizer_service_vocab() {
 }
 
 static const llama_vocab * entry_node_vocab() {
-    if (!g_entry_tokenizer && !g_entry_worker_gguf.empty()) {
-        ggml_backend_load_all();
-        g_entry_tokenizer = llama_model_load_from_file(
-                g_entry_worker_gguf.c_str(), default_tokenizer_model_params());
+    if (!g_entry_tokenizer) {
+        if (!g_entry_worker_gguf.empty() &&
+                g_entry_worker_gguf != LAYER_STORE_MODEL_SENTINEL) {
+            ggml_backend_load_all();
+            g_entry_tokenizer = llama_model_load_from_file(
+                    g_entry_worker_gguf.c_str(), default_tokenizer_model_params());
+        } else if (!g_entry_model_id.empty() && runtime_layer_first_enabled()) {
+            layer_store store = get_layer_store(g_entry_model_id);
+            const auto manifest = store.load_manifest();
+            std::string load_err;
+            if (manifest.has_value()) {
+                runtime_layer_store_model_load_request req{};
+                req.role           = worker_role::tokenizer;
+                req.params         = default_tokenizer_model_params();
+                req.verify_tensors = false;
+                g_entry_tokenizer = runtime_load_model_from_layer_store(
+                        store, *manifest, req, load_err);
+            }
+            if (!g_entry_tokenizer && !load_err.empty()) {
+                fprintf(stderr, "node_agent: entry tokenizer layer store load: %s\n", load_err.c_str());
+            }
+        }
         if (g_entry_tokenizer) {
             g_runtime_stats.tokenizer_init_count = 1;
         }
@@ -495,6 +801,11 @@ static dist_configure_req parse_configure(const json & body) {
     req.peer_bind   = body.value("peer_bind", "0.0.0.0");
     req.next_is_final = body.value("next_is_final", false);
     req.source_url    = body.value("source_url", "");
+    if (body.contains("output_service") && body["output_service"].is_object()) {
+        const auto & os = body["output_service"];
+        req.output_service_host = os.value("host", "");
+        req.output_service_port = os.value("port", 0);
+    }
     return req;
 }
 
@@ -589,6 +900,112 @@ static dist_child_process * worker_proc_slot(const dist_node_role role) {
     }
 }
 
+static std::string * worker_state_file_slot(const dist_node_role role) {
+    switch (role) {
+        case DIST_ROLE_ENTRY:  return &g_entry_worker_state_file;
+        case DIST_ROLE_MIDDLE: return &g_middle_worker_state_file;
+        case DIST_ROLE_FINAL:  return &g_final_worker_state_file;
+        default:               return nullptr;
+    }
+}
+
+static std::string worker_ready_state_file(
+        const dist_node_role role,
+        const std::string & session_id) {
+    std::string base = g_models_dir.empty() ? "/tmp" : g_models_dir;
+    std::string sid = session_id.empty() ? "default" : session_id;
+    for (char & c : sid) {
+        if (!(std::isalnum((unsigned char) c) || c == '-' || c == '_')) {
+            c = '_';
+        }
+    }
+    return base + "/worker-state-" + g_node_id + "-" + dist_role_name(role) + "-" + sid + ".txt";
+}
+
+static std::string read_worker_ready_state_file(const std::string & path) {
+    std::ifstream in(path);
+    std::string state;
+    if (in.good()) {
+        std::getline(in, state);
+    }
+    return state.empty() ? "STARTING" : state;
+}
+
+static std::string worker_ready_state_for_role(const dist_node_role role) {
+    std::string * state_file = worker_state_file_slot(role);
+    const std::string state = read_worker_ready_state_file(state_file ? *state_file : "");
+    dist_child_process * proc = worker_proc_slot(role);
+    if (proc == nullptr || proc->pid == 0) {
+        return state == "STARTING" ? state : "FAILED";
+    }
+    if (!dist_process_is_running(*proc)) {
+        if (state_file != nullptr && !state_file->empty()) {
+            split_gen_write_ready_state(*state_file, "FAILED");
+        }
+        return "FAILED";
+    }
+    return state;
+}
+
+static int worker_ready_state_rank(const std::string & state) {
+    if (state == "FAILED") {
+        return -1;
+    }
+    if (state == "STARTING") {
+        return 0;
+    }
+    if (state == "MODEL_LOADING") {
+        return 1;
+    }
+    if (state == "LISTENER_READY") {
+        return 2;
+    }
+    if (state == "PIPE_READY") {
+        return 3;
+    }
+    if (state == "READY") {
+        return 4;
+    }
+    return 0;
+}
+
+static json worker_ready_states_json() {
+    return {
+        { "entry", worker_ready_state_for_role(DIST_ROLE_ENTRY) },
+        { "middle", worker_ready_state_for_role(DIST_ROLE_MIDDLE) },
+        { "final", worker_ready_state_for_role(DIST_ROLE_FINAL) },
+    };
+}
+
+static bool wait_worker_ready_state(
+        const dist_node_role role,
+        const std::string & state_file,
+        const std::string & target_state,
+        const int timeout_ms,
+        std::string & final_state,
+        std::string & err) {
+    const int target_rank = worker_ready_state_rank(target_state);
+    const auto start = std::chrono::steady_clock::now();
+    while (true) {
+        final_state = read_worker_ready_state_file(state_file);
+        if (worker_ready_state_rank(final_state) >= target_rank) {
+            return true;
+        }
+        if (final_state == "FAILED") {
+            err = std::string(dist_role_name(role)) + " worker failed during startup";
+            return false;
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeout_ms) {
+            err = std::string(dist_role_name(role)) + " worker readiness timeout waiting for " +
+                  target_state + " at state " + final_state;
+            return false;
+        }
+        dist_sleep_ms(100);
+    }
+}
+
 static void stop_worker_for_role(const dist_node_role role) {
     dist_child_process * slot = worker_proc_slot(role);
     if (!slot || slot->pid == 0) {
@@ -597,6 +1014,12 @@ static void stop_worker_for_role(const dist_node_role role) {
     dist_process_kill(*slot);
     dist_process_reap(*slot);
     *slot = {};
+    if (std::string * state_slot = worker_state_file_slot(role)) {
+        if (!state_slot->empty()) {
+            std::remove(state_slot->c_str());
+            state_slot->clear();
+        }
+    }
     if (role == DIST_ROLE_ENTRY) {
         g_pipeline_ctrl_port = 0;
         g_pipeline_layer_end = 0;
@@ -676,16 +1099,17 @@ static bool run_local_pipeline_generate(
     }
     g_runtime_stats.kv_cache_reset_count++;
 
-    if (g_external_embedding) {
-        embedding_service_reset();
+    if (g_external_embedding && !embedding_service_reset(err)) {
+        split_tcp_close(ctrl_fd);
+        return false;
     }
 
     const auto t_prefill0 = std::chrono::steady_clock::now();
     if (g_external_embedding) {
         std::vector<float> hidden;
         int32_t n_embd = 0;
-        if (!embedding_service_compute_local(
-                    prompt_tokens, 0, hidden, n_embd, err, false)) {
+        if (!embedding_service_compute(
+                    prompt_tokens, 0, hidden, n_embd, err)) {
             split_tcp_close(ctrl_fd);
             return false;
         }
@@ -732,7 +1156,7 @@ static bool run_local_pipeline_generate(
         if (g_external_embedding) {
             std::vector<float> hidden;
             int32_t n_embd = 0;
-            if (!embedding_service_compute_local({ cur }, pos, hidden, n_embd, err, false)) {
+            if (!embedding_service_compute({ cur }, pos, hidden, n_embd, err)) {
                 split_tcp_close(ctrl_fd);
                 return false;
             }
@@ -779,6 +1203,29 @@ static bool run_local_pipeline_generate(
     return true;
 }
 
+static bool output_service_ready() {
+    std::string err;
+    if (!g_output_service_gguf.empty() || !g_output_service_model_id.empty()) {
+        return ensure_output_service_loaded(err);
+    }
+    return !g_output_service_host.empty() && g_output_service_port > 0;
+}
+
+static void set_worker_layer_store_env(
+        const dist_configure_req & cfg,
+        const worker_role role,
+        const int32_t layer_start,
+        const int32_t layer_end) {
+    dist_set_env("DIST_RUNTIME_LAYER_FIRST", "1");
+    dist_set_env("DIST_MODEL_ID", cfg.model_id.c_str());
+    if (!g_models_dir.empty()) {
+        dist_set_env("DIST_LAYER_STORE_ROOT", g_models_dir.c_str());
+    }
+    dist_set_env("DIST_WORKER_ROLE", worker_role_to_string(role).c_str());
+    dist_set_env("DIST_WORKER_LAYER_START", std::to_string(layer_start).c_str());
+    dist_set_env("DIST_WORKER_LAYER_END", std::to_string(layer_end).c_str());
+}
+
 static bool start_worker(
         const std::string & agent_bin,
         const dist_configure_req & cfg,
@@ -791,6 +1238,21 @@ static bool start_worker(
         return false;
     }
 
+    int32_t worker_layer_start = cfg.layer_start;
+    int32_t worker_layer_end   = cfg.layer_end;
+    worker_role worker_load_role = dist_role_to_worker_role(cfg.role);
+
+    if (model_path == LAYER_STORE_MODEL_SENTINEL) {
+        if (cfg.model_id.empty()) {
+            err = "model_id required for layer-store worker";
+            return false;
+        }
+        set_worker_layer_store_env(cfg, worker_load_role, worker_layer_start, worker_layer_end);
+    }
+
+    const std::string worker_arg =
+            model_path == LAYER_STORE_MODEL_SENTINEL ? LAYER_STORE_MODEL_SENTINEL : model_path;
+
     const std::string suffix = dist_exe_suffix();
     const std::string dir    = agent_bin;
     std::string bin;
@@ -799,7 +1261,7 @@ static bool start_worker(
     if (cfg.role == DIST_ROLE_ENTRY) {
         bin = dist_join_path(dir, "split_gen3_a" + suffix);
         args = {
-            bin, model_path,
+            bin, worker_arg,
             "--ctrl-port", std::to_string(cfg.ctrl_port),
             "--b-host", cfg.next_host,
             "--b-port", std::to_string(cfg.next_port),
@@ -813,7 +1275,7 @@ static bool start_worker(
     } else if (cfg.role == DIST_ROLE_MIDDLE) {
         bin = dist_join_path(dir, "split_gen3_b" + suffix);
         args = {
-            bin, model_path,
+            bin, worker_arg,
             "--ab-port", std::to_string(cfg.peer_port),
             "--bc-host", cfg.next_host,
             "--bc-port", std::to_string(cfg.next_port),
@@ -824,11 +1286,30 @@ static bool start_worker(
     } else if (cfg.role == DIST_ROLE_FINAL) {
         bin = dist_join_path(dir, "split_gen3_c" + suffix);
         args = {
-            bin, model_path,
+            bin, worker_arg,
             "--bc-port", std::to_string(cfg.peer_port),
             "--layer-start", std::to_string(cfg.layer_start),
             "--bind", cfg.peer_bind,
         };
+        if (cfg.layer_end > cfg.layer_start) {
+            args.push_back("--layer-end");
+            args.push_back(std::to_string(cfg.layer_end));
+        }
+        if (g_external_output) {
+            args.push_back("--external-output");
+            const std::string output_host =
+                    !cfg.output_service_host.empty() ? cfg.output_service_host : g_output_service_host;
+            const int output_port =
+                    cfg.output_service_port > 0 ? cfg.output_service_port : g_output_service_port;
+            if (!output_host.empty()) {
+                args.push_back("--output-http-host");
+                args.push_back(output_host);
+            }
+            if (output_port > 0) {
+                args.push_back("--output-http-port");
+                args.push_back(std::to_string(output_port));
+            }
+        }
     } else {
         err = "invalid role";
         return false;
@@ -847,6 +1328,11 @@ static bool start_worker(
         }
     }
 
+    const std::string ready_file = worker_ready_state_file(cfg.role, cfg.session_id);
+    std::remove(ready_file.c_str());
+    args.push_back("--ready-file");
+    args.push_back(ready_file);
+
     dist_child_process child{};
     if (!dist_process_spawn(args, child, err)) {
         return false;
@@ -855,17 +1341,26 @@ static bool start_worker(
     if (dist_child_process * slot = worker_proc_slot(cfg.role)) {
         *slot = child;
     }
+    if (std::string * state_slot = worker_state_file_slot(cfg.role)) {
+        *state_slot = ready_file;
+    }
     g_runtime_stats.worker_spawn_count++;
-    dist_sleep_ms(300);
+    std::string final_state;
+    if (!wait_worker_ready_state(cfg.role, ready_file, "LISTENER_READY", 120000, final_state, err)) {
+        stop_worker_for_role(cfg.role);
+        return false;
+    }
     return true;
 }
 
 static worker_role dist_role_to_worker_role(const dist_node_role role) {
     switch (role) {
-        case DIST_ROLE_ENTRY:  return worker_role::entry;
-        case DIST_ROLE_MIDDLE: return worker_role::middle;
-        case DIST_ROLE_FINAL:  return worker_role::final;
-        default:               return worker_role::entry;
+        case DIST_ROLE_ENTRY:
+        case DIST_ROLE_MIDDLE:
+        case DIST_ROLE_FINAL:
+            return worker_role::pipeline_stage;
+        default:
+            return worker_role::pipeline_stage;
     }
 }
 
@@ -915,175 +1410,100 @@ static bool embedding_shell_loadable(const std::string & path) {
     return ok;
 }
 
-static std::string configure_materialize_worker_gguf(
+static bool output_shell_loadable(const std::string & path) {
+    if (path.empty()) {
+        return false;
+    }
+    ggml_backend_load_all();
+    llama_model * model = llama_model_load_from_file(path.c_str(), llama_model_default_params());
+    if (!model) {
+        return false;
+    }
+    const int32_t n_layer = llama_model_n_layer(model);
+    const int32_t n_embd  = llama_model_n_embd(model);
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx   = 8;
+    cparams.n_batch = 8;
+    cparams.no_perf = true;
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        llama_model_free(model);
+        return false;
+    }
+    llama_set_layer_range(ctx, n_layer - 1, n_layer);
+    std::vector<float> dummy((size_t) n_embd, 0.0f);
+    const bool ok = split_gen_decode_hidden(ctx, dummy.data(), 1, n_embd, 0, true, true) == 0 &&
+            llama_get_logits(ctx) != nullptr;
+    llama_free(ctx);
+    llama_model_free(model);
+    return ok;
+}
+
+static std::string configure_worker_runtime(
         const dist_configure_req & cfg,
         const json & body,
-        std::string & err) {
-    if (cfg.model_id.empty()) {
-        err = "model_id required for layer-first configure";
+        std::string & err,
+        runtime_worker_gguf_resolve_result * resolve_out = nullptr) {
+    runtime_worker_gguf_request req{};
+    req.cfg = cfg;
+    req.body = body;
+    req.verify_materialization = g_verify_materialization;
+    req.cache_shell_ok = [](const std::string & path, const worker_role role) -> bool {
+        if (role == worker_role::tokenizer) {
+            return tokenizer_shell_loadable(path);
+        }
+        if (role == worker_role::embedding) {
+            return embedding_shell_loadable(path);
+        }
+        if (role == worker_role::output_head) {
+            return output_shell_loadable(path);
+        }
+        return true;
+    };
+
+    const auto resolved = runtime_resolve_worker_gguf(get_layer_store(cfg.model_id), req, err);
+    if (resolve_out != nullptr) {
+        *resolve_out = resolved;
+    }
+    if (!err.empty()) {
         return {};
     }
 
-    layer_store store = get_layer_store(cfg.model_id);
-    const auto manifest = store.load_manifest();
-    if (!manifest.has_value()) {
-        err = "manifest not found in layer store; run install/sync first";
-        return {};
-    }
-
-    if (!store.metadata_bytes().has_value() && !cfg.source_url.empty()) {
-        layer_store_cache_metadata(store, *manifest, cfg.source_url);
-    }
-
-    worker_role role = dist_role_to_worker_role(cfg.role);
-    int32_t mat_layer_start = cfg.layer_start;
-    int32_t mat_layer_end   = cfg.layer_end;
-    if (body.value("external_embedding", false) && cfg.role == DIST_ROLE_ENTRY) {
-        role = worker_role::pipeline_stage;
-        if (mat_layer_start == 0 && mat_layer_end > 1) {
-            mat_layer_start = 1;
-        }
-    } else if (body.contains("runtime_role")) {
-        const runtime_role rt = runtime_role_from_string(body.value("runtime_role", ""));
-        if (rt == runtime_role::pipeline_stage && cfg.role != DIST_ROLE_UNCONFIGURED) {
-            role = dist_role_to_worker_role(cfg.role);
-        } else if (rt != runtime_role::unassigned) {
-            role = worker_role_from_runtime_role(rt);
-        }
-    }
-
-    if (role == worker_role::sampler) {
+    if (resolved.materialize_role == worker_role::sampler) {
         g_sampler_service_ready = true;
         return {};
     }
 
-    if (role != worker_role::tokenizer && !store.metadata_bytes().has_value()) {
-        err = "metadata.bin missing in layer store; run install/sync first";
+    if (resolved.worker_gguf_path.empty()) {
+        if (resolved.bind.tensors_ready) {
+            err.clear();
+            return {};
+        }
+        err = "runtime resolve produced no worker artifact";
         return {};
     }
 
-    const std::string role_name = worker_role_to_string(role);
-    const semantic_runtime_descriptor rt = build_semantic_runtime_descriptor(*manifest);
-
-    if (g_verify_materialization) {
-        std::string verr;
-        if (!verify_worker_materialization_for_role(
-                    store,
-                    *manifest,
-                    role,
-                    mat_layer_start,
-                    mat_layer_end,
-                    verr)) {
-            err = "materialization verification failed: " + verr;
-            return {};
-        }
-    }
-
-    const bool force_materialize = body.value("force_materialize", false) ||
-            std::getenv("DIST_RUNTIME_FORCE_MATERIALIZE") != nullptr;
-    const bool bind_only         = body.value("bind_only", false);
-
-    const runtime_bind_result bind = runtime_bind_worker(
-            store, *manifest, role, mat_layer_start, mat_layer_end);
-    if (!bind.success && !bind.tensors_ready) {
-        err = bind.error.empty() ? "layer store bind failed" : bind.error;
-        return {};
-    }
-
-    if (!force_materialize && bind.cached_gguf_ready && !bind.worker_gguf_path.empty()) {
-        const bool cache_ok = role != worker_role::tokenizer ||
-                              tokenizer_shell_loadable(bind.worker_gguf_path);
-        if (cache_ok) {
-            fprintf(stderr,
-                    "node_agent: using cached %s role=%s layers=[%d,%d)\n",
-                    bind.worker_gguf_path.c_str(),
-                    role_name.c_str(),
-                    mat_layer_start,
-                    mat_layer_end);
-            return bind.worker_gguf_path;
-        }
-        std::error_code ec;
-        std::filesystem::remove(bind.worker_gguf_path, ec);
-        fprintf(stderr,
-                "node_agent: stale cached %s for role=%s, rematerializing\n",
-                bind.worker_gguf_path.c_str(),
-                role_name.c_str());
-    }
-
-    if (bind_only) {
-        if (!bind.tensors_ready) {
-            err = bind.error.empty() ? "tensors not ready in layer store" : bind.error;
-            return {};
-        }
-        if (!bind.materialize_required && !bind.worker_gguf_path.empty()) {
-            return bind.worker_gguf_path;
-        }
-        err.clear();
-        return {};
-    }
-
-    std::string out_path =
-            (store.model_root() / ("worker_" + role_name + ".gguf")).string();
-
-    if (role == worker_role::tokenizer) {
-        // Metadata-only shells list all model tensors in the GGUF header but contain no
-        // weight bytes, so llama cannot load them even with vocab_only. Materialize
-        // entry-equivalent blobs (embedding + globals) without transformer layers.
-        if (!materialize_worker_gguf(
-                    store,
-                    *manifest,
-                    rt,
-                    worker_role::entry,
-                    0,
-                    0,
-                    out_path,
-                    err)) {
-            err = "failed to materialize tokenizer weights: " + err;
-            return {};
-        }
-        if (!tokenizer_shell_loadable(out_path)) {
+    if (resolved.compat_materialized) {
+        if (resolved.materialize_role == worker_role::tokenizer &&
+                !tokenizer_shell_loadable(resolved.worker_gguf_path)) {
             err = "tokenizer gguf not loadable after materialize";
             return {};
         }
-    } else if (role == worker_role::embedding) {
-        if (!materialize_worker_gguf(
-                    store,
-                    *manifest,
-                    rt,
-                    worker_role::entry,
-                    0,
-                    1,
-                    out_path,
-                    err)) {
-            err = "failed to materialize embedding weights: " + err;
-            return {};
-        }
-        if (!embedding_shell_loadable(out_path)) {
+        if (resolved.materialize_role == worker_role::embedding &&
+                !embedding_shell_loadable(resolved.worker_gguf_path)) {
             err = "embedding gguf not loadable after materialize";
             return {};
         }
-    } else if (!materialize_worker_gguf(
-                       store,
-                       *manifest,
-                       rt,
-                       role,
-                       mat_layer_start,
-                       mat_layer_end,
-                       out_path,
-                       err)) {
-        err = "failed to assemble GGUF from layer store for role " + role_name + ": " + err;
-        return {};
+        if (resolved.materialize_role == worker_role::output_head &&
+                !output_shell_loadable(resolved.worker_gguf_path)) {
+            err = "output gguf not loadable after materialize";
+            return {};
+        }
+        g_runtime_stats.materialization_count++;
+        g_runtime_stats.materialization_generation++;
     }
 
-    fprintf(stderr,
-            "node_agent: materialized %s role=%s layers=[%d,%d)\n",
-            out_path.c_str(),
-            role_name.c_str(),
-            mat_layer_start,
-            mat_layer_end);
-    g_runtime_stats.materialization_count++;
-    g_runtime_stats.materialization_generation++;
-    return out_path;
+    return resolved.worker_gguf_path;
 }
 
 int main(int argc, char ** argv) {
@@ -1103,6 +1523,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "node_agent: invalid --listen %s\n", listen.c_str());
         return 1;
     }
+    g_agent_http_port = http_port;
 
     if (g_node_id.empty()) {
         g_node_id = bind_host + ":" + std::to_string(http_port);
@@ -1215,6 +1636,7 @@ int main(int argc, char ** argv) {
                 { "middle", (int) g_middle_worker.pid },
                 { "final", (int) g_final_worker.pid },
             }},
+            { "worker_states", worker_ready_states_json() },
             { "runtime_stats", node_runtime_stats_json() },
         }).dump(), "application/json");
     });
@@ -1229,12 +1651,12 @@ int main(int argc, char ** argv) {
             return;
         }
         const std::string path = body.value("worker_gguf", "");
-        if (path.empty()) {
+        const std::string model_id = body.value("model_id", "");
+        if (!apply_service_model_source(path, model_id, g_tokenizer_service_gguf, g_tokenizer_service_model_id)) {
             res.status = 400;
-            res.set_content(R"({"ok":false,"error":"worker_gguf required"})", "application/json");
+            res.set_content(R"({"ok":false,"error":"worker_gguf or model_id required"})", "application/json");
             return;
         }
-        g_tokenizer_service_gguf = path;
         free_tokenizer_service();
         const bool ready = tokenizer_service_vocab() != nullptr;
         res.set_content(json({
@@ -1314,9 +1736,7 @@ int main(int argc, char ** argv) {
         worker_role role = dist_role_to_worker_role(cfg.role);
         if (body.contains("runtime_role")) {
             const runtime_role rt = runtime_role_from_string(body.value("runtime_role", ""));
-            if (rt == runtime_role::pipeline_stage && cfg.role != DIST_ROLE_UNCONFIGURED) {
-                role = dist_role_to_worker_role(cfg.role);
-            } else if (rt != runtime_role::unassigned) {
+            if (rt != runtime_role::unassigned) {
                 role = worker_role_from_runtime_role(rt);
             }
         }
@@ -1342,10 +1762,17 @@ int main(int argc, char ** argv) {
             return;
         }
         const std::string path = body.value("worker_gguf", "");
-        g_embedding_service_gguf = path;
+        const std::string model_id = body.value("model_id", "");
+        if (!apply_service_model_source(path, model_id, g_embedding_service_gguf, g_embedding_service_model_id)) {
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"worker_gguf or model_id required"})", "application/json");
+            return;
+        }
+        g_embedding_service_layer_start = 0;
+        g_embedding_service_layer_end   = 0;
         free_embedding_service();
         std::string err;
-        const bool ready = path.empty() ? false : ensure_embedding_service_loaded(err);
+        const bool ready = ensure_embedding_service_loaded(err);
         if (!ready) {
             res.status = 500;
             res.set_content(json({
@@ -1360,6 +1787,16 @@ int main(int argc, char ** argv) {
             { "embedding_ready", true },
             { "n_embd", g_embedding_service_n_embd },
         }).dump(), "application/json");
+    });
+
+    svr.Post("/runtime/embedding/reset", [](const httplib::Request &, httplib::Response & res) {
+        std::string err;
+        if (!embedding_service_reset(err)) {
+            res.status = 503;
+            res.set_content(json({ { "ok", false }, { "error", err } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(R"({"ok":true})", "application/json");
     });
 
     svr.Post("/runtime/embedding/embed", [](const httplib::Request & req, httplib::Response & res) {
@@ -1413,10 +1850,71 @@ int main(int argc, char ** argv) {
             return;
         }
         const std::string path = body.value("worker_gguf", "");
-        g_output_service_gguf = path;
+        const std::string model_id = body.value("model_id", "");
+        if (!apply_service_model_source(path, model_id, g_output_service_gguf, g_output_service_model_id)) {
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"worker_gguf or model_id required"})", "application/json");
+            return;
+        }
+        g_output_service_layer_start = 0;
+        g_output_service_layer_end   = 0;
+        free_output_service();
+        std::string err;
+        const bool ready = ensure_output_service_loaded(err);
+        if (!ready) {
+            res.status = 500;
+            res.set_content(json({
+                { "ok", false },
+                { "output_ready", false },
+                { "error", err.empty() ? "output shell failed to load" : err },
+            }).dump(), "application/json");
+            return;
+        }
         res.set_content(json({
-            { "ok", !path.empty() },
-            { "output_ready", !path.empty() },
+            { "ok", true },
+            { "output_ready", true },
+            { "n_vocab", g_output_service_n_vocab },
+        }).dump(), "application/json");
+    });
+
+    svr.Post("/runtime/output/reset", [](const httplib::Request &, httplib::Response & res) {
+        output_service_reset_local();
+        res.set_content(R"({"ok":true})", "application/json");
+    });
+
+    svr.Post("/runtime/output/sample", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"invalid json"})", "application/json");
+            return;
+        }
+        std::vector<float> hidden;
+        if (body.contains("hidden") && body["hidden"].is_array()) {
+            for (const auto & v : body["hidden"]) {
+                hidden.push_back(v.get<float>());
+            }
+        }
+        const int32_t n_embd = body.value("n_embd", (int32_t) hidden.size());
+        const int32_t pos    = body.value("pos", 0);
+        if (hidden.empty() || n_embd <= 0) {
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"hidden required"})", "application/json");
+            return;
+        }
+        int32_t token_id = -1;
+        std::string err;
+        if (!output_service_sample_local(hidden.data(), n_embd, pos, token_id, err)) {
+            res.status = 503;
+            res.set_content(json({ { "ok", false }, { "error", err } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(json({
+            { "ok", true },
+            { "token_id", token_id },
+            { "n_vocab", g_output_service_n_vocab },
         }).dump(), "application/json");
     });
 
@@ -1439,8 +1937,12 @@ int main(int argc, char ** argv) {
         dist_configure_req cfg = parse_configure(body);
         std::string err;
         const std::string rt_role = body.value("runtime_role", "");
-        const std::string worker_gguf = configure_materialize_worker_gguf(cfg, body, err);
-        const bool is_sampler = rt_role == "sampler";
+        runtime_worker_gguf_resolve_result resolved{};
+        const std::string worker_gguf =
+                configure_worker_runtime(cfg, body, err, &resolved);
+        const bool is_sampler = rt_role == "sampler" ||
+                resolved.materialize_role == worker_role::sampler;
+        const bool bind_ready = worker_gguf.empty() && err.empty() && resolved.bind.tensors_ready;
         if (worker_gguf.empty() && !err.empty()) {
             res.status = 500;
             res.set_content(json({
@@ -1450,7 +1952,7 @@ int main(int argc, char ** argv) {
             }).dump(), "application/json");
             return;
         }
-        if (worker_gguf.empty() && !is_sampler) {
+        if (worker_gguf.empty() && !is_sampler && !bind_ready) {
             res.status = 500;
             res.set_content(json({
                 { "status", "error" },
@@ -1462,7 +1964,13 @@ int main(int argc, char ** argv) {
 
         bool tokenizer_ready = false;
         if (rt_role == "tokenizer") {
-            g_tokenizer_service_gguf = worker_gguf;
+            if (worker_gguf.empty() && bind_ready) {
+                g_tokenizer_service_gguf.clear();
+                g_tokenizer_service_model_id = cfg.model_id;
+            } else {
+                g_tokenizer_service_gguf     = worker_gguf;
+                g_tokenizer_service_model_id.clear();
+            }
             free_tokenizer_service();
             tokenizer_ready = tokenizer_service_vocab() != nullptr;
             if (!tokenizer_ready) {
@@ -1476,7 +1984,15 @@ int main(int argc, char ** argv) {
                 return;
             }
         } else if (rt_role == "embedding") {
-            g_embedding_service_gguf = worker_gguf;
+            if (worker_gguf.empty() && bind_ready) {
+                g_embedding_service_gguf.clear();
+                g_embedding_service_model_id   = cfg.model_id;
+                g_embedding_service_layer_start = 0;
+                g_embedding_service_layer_end   = 0;
+            } else {
+                g_embedding_service_gguf     = worker_gguf;
+                g_embedding_service_model_id.clear();
+            }
             free_embedding_service();
             std::string emb_err;
             if (!ensure_embedding_service_loaded(emb_err)) {
@@ -1490,34 +2006,44 @@ int main(int argc, char ** argv) {
                 return;
             }
         } else if (rt_role == "output_head") {
-            g_output_service_gguf = worker_gguf;
+            if (worker_gguf.empty() && bind_ready) {
+                g_output_service_gguf.clear();
+                g_output_service_model_id   = cfg.model_id;
+                g_output_service_layer_start = 0;
+                g_output_service_layer_end   = 0;
+            } else {
+                g_output_service_gguf     = worker_gguf;
+                g_output_service_model_id.clear();
+            }
+            free_output_service();
+            std::string out_err;
+            if (!ensure_output_service_loaded(out_err)) {
+                res.status = 500;
+                res.set_content(json({
+                    { "status", "error" },
+                    { "runtime_ready", false },
+                    { "error", out_err.empty() ? "output service failed to load" : out_err },
+                    { "worker_gguf", worker_gguf },
+                }).dump(), "application/json");
+                return;
+            }
         } else if (is_sampler) {
             g_sampler_service_ready = true;
         } else if (cfg.role == DIST_ROLE_ENTRY) {
-            g_entry_worker_gguf = worker_gguf;
+            if (worker_gguf.empty() && bind_ready) {
+                g_entry_worker_gguf.clear();
+                g_entry_model_id = cfg.model_id;
+            } else {
+                g_entry_worker_gguf = worker_gguf;
+                g_entry_model_id.clear();
+            }
             free_entry_tokenizer();
             tokenizer_ready = entry_node_vocab() != nullptr;
         }
 
-        layer_store store = get_layer_store(cfg.model_id);
-        const auto manifest = store.load_manifest();
-        worker_role bind_role = dist_role_to_worker_role(cfg.role);
-        if (!rt_role.empty()) {
-            const runtime_role rt = runtime_role_from_string(rt_role);
-            if (rt == runtime_role::pipeline_stage) {
-                bind_role = dist_role_to_worker_role(cfg.role);
-            } else if (rt != runtime_role::unassigned) {
-                bind_role = worker_role_from_runtime_role(rt);
-            }
-        }
-        bool tensors_ready = false;
-        bool cached_gguf   = false;
-        if (manifest.has_value()) {
-            const runtime_bind_result bind = runtime_bind_worker(
-                    store, *manifest, bind_role, cfg.layer_start, cfg.layer_end);
-            tensors_ready = bind.tensors_ready;
-            cached_gguf   = bind.cached_gguf_ready;
-        }
+        const runtime_bind_result & bind = resolved.bind;
+        const bool tensors_ready = bind.tensors_ready;
+        const bool cached_gguf   = resolved.from_cache || bind.cached_gguf_ready;
 
         const double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -1527,8 +2053,12 @@ int main(int argc, char ** argv) {
             { "worker_gguf", worker_gguf },
             { "tokenizer_ready", tokenizer_ready },
             { "embedding_ready", rt_role == "embedding" ? embedding_service_ready() : false },
+            { "output_ready", rt_role == "output_head" ? output_service_ready() : false },
             { "tensors_ready", tensors_ready },
             { "cached_gguf", cached_gguf },
+            { "materialize_required", bind.materialize_required },
+            { "compat_materialized", resolved.compat_materialized },
+            { "bind_source", bind_ready && worker_gguf.empty() ? "layer_store" : "compat_gguf" },
             { "materialization_time_ms", ms },
         }).dump(), "application/json");
     });
@@ -1555,21 +2085,35 @@ int main(int argc, char ** argv) {
         if (skip_materialize) {
             worker_model = body.value("worker_gguf", "");
             if (worker_model.empty()) {
-                res.status = 400;
-                res.set_content(json({
-                    { "ok", false },
-                    { "error", "worker_gguf required when skip_materialize=true" },
-                }).dump(), "application/json");
-                return;
+                if (runtime_layer_first_enabled() && !cfg.model_id.empty()) {
+                    worker_model = LAYER_STORE_MODEL_SENTINEL;
+                } else {
+                    res.status = 400;
+                    res.set_content(json({
+                        { "ok", false },
+                        { "error", "worker_gguf required when skip_materialize=true" },
+                    }).dump(), "application/json");
+                    return;
+                }
             }
         } else if (!cfg.model_id.empty()) {
-            const std::string materialized = configure_materialize_worker_gguf(cfg, body, err);
+            runtime_worker_gguf_resolve_result resolved{};
+            const std::string materialized =
+                    configure_worker_runtime(cfg, body, err, &resolved);
             if (materialized.empty()) {
-                res.status = 500;
-                res.set_content(json({ { "ok", false }, { "error", err } }).dump(), "application/json");
-                return;
+                if (err.empty() && resolved.bind.tensors_ready && runtime_layer_first_enabled()) {
+                    worker_model = LAYER_STORE_MODEL_SENTINEL;
+                } else {
+                    if (err.empty() && resolved.bind.tensors_ready) {
+                        err = "tensors bound but compat GGUF required for worker spawn";
+                    }
+                    res.status = 500;
+                    res.set_content(json({ { "ok", false }, { "error", err } }).dump(), "application/json");
+                    return;
+                }
+            } else {
+                worker_model = materialized;
             }
-            worker_model = materialized;
         } else if (worker_model.empty()) {
             res.status = 400;
             res.set_content(json({
@@ -1577,6 +2121,28 @@ int main(int argc, char ** argv) {
                 { "error", "model_id or local --model required" },
             }).dump(), "application/json");
             return;
+        }
+
+        if (cfg.role == DIST_ROLE_ENTRY) {
+            g_external_embedding = body.value("external_embedding", false);
+            if (body.contains("embedding_service") && body["embedding_service"].is_object()) {
+                const auto & es = body["embedding_service"];
+                g_embedding_service_host = es.value("host", "");
+                g_embedding_service_port = es.value("port", 0);
+            } else if (g_external_embedding && !g_embedding_service_gguf.empty()) {
+                g_embedding_service_host.clear();
+                g_embedding_service_port = 0;
+            }
+        } else if (cfg.role == DIST_ROLE_FINAL) {
+            g_external_output = body.value("external_output", false);
+            if (body.contains("output_service") && body["output_service"].is_object()) {
+                const auto & os = body["output_service"];
+                g_output_service_host = os.value("host", "");
+                g_output_service_port = os.value("port", 0);
+            } else if (g_external_output && !g_output_service_gguf.empty()) {
+                g_output_service_host.clear();
+                g_output_service_port = 0;
+            }
         }
 
         if (!start_worker(agent_bin, cfg, worker_model, err)) {
@@ -1590,17 +2156,12 @@ int main(int argc, char ** argv) {
         if (cfg.role == DIST_ROLE_ENTRY) {
             g_pipeline_ctrl_port = cfg.ctrl_port;
             g_pipeline_layer_end   = cfg.layer_end;
-            g_entry_worker_gguf    = worker_model;
-            g_external_embedding   = body.value("external_embedding", false) &&
-                    std::getenv("DIST_EXTERNAL_EMBEDDING") != nullptr &&
-                    std::getenv("DIST_EXTERNAL_EMBEDDING")[0] == '1';
-            if (body.contains("embedding_service") && body["embedding_service"].is_object()) {
-                const auto & es = body["embedding_service"];
-                g_embedding_service_host = es.value("host", "");
-                g_embedding_service_port = es.value("port", 0);
-            } else if (g_external_embedding && !g_embedding_service_gguf.empty()) {
-                g_embedding_service_host.clear();
-                g_embedding_service_port = 0;
+            if (worker_model == LAYER_STORE_MODEL_SENTINEL) {
+                g_entry_worker_gguf.clear();
+                g_entry_model_id = cfg.model_id;
+            } else {
+                g_entry_worker_gguf = worker_model;
+                g_entry_model_id.clear();
             }
         }
 
@@ -1608,6 +2169,8 @@ int main(int argc, char ** argv) {
             { "ok", true },
             { "role", dist_role_name(cfg.role) },
             { "worker_pid", (int) (worker_proc_slot(cfg.role) ? worker_proc_slot(cfg.role)->pid : 0) },
+            { "worker_state", read_worker_ready_state_file(
+                    worker_state_file_slot(cfg.role) ? *worker_state_file_slot(cfg.role) : "") },
         }).dump(), "application/json");
     });
 
@@ -1679,14 +2242,19 @@ int main(int argc, char ** argv) {
         free_entry_tokenizer();
         free_tokenizer_service();
         free_embedding_service();
+        free_output_service();
         g_entry_worker_gguf.clear();
+        g_entry_model_id.clear();
         g_tokenizer_service_gguf.clear();
         g_embedding_service_gguf.clear();
         g_output_service_gguf.clear();
         g_sampler_service_ready = false;
         g_external_embedding = false;
+        g_external_output = false;
         g_embedding_service_host.clear();
         g_embedding_service_port = 0;
+        g_output_service_host.clear();
+        g_output_service_port = 0;
         res.set_content(R"({"ok":true})", "application/json");
     });
 

@@ -6,6 +6,7 @@
 #include "llama-adapter.h"
 
 #include <cstdint>
+#include <chrono>
 #include <vector>
 #include <memory>
 #include <set>
@@ -703,7 +704,8 @@ struct llm_graph_params {
         }
 
         if (cparams.layer_start != other.cparams.layer_start ||
-            cparams.layer_end   != other.cparams.layer_end) {
+            cparams.layer_end   != other.cparams.layer_end ||
+            cparams.skip_output_head != other.cparams.skip_output_head) {
             return false;
         }
 
@@ -865,6 +867,8 @@ struct llm_graph_context {
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+    bool trace_enabled() const;
+    void trace_event(const char * scope, const char * step, const char * phase, double elapsed_ms = -1.0, bool success = true) const;
 
     //
     // common
@@ -972,6 +976,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    ggml_tensor * build_inp_embd_token_only(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_hidden() const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
@@ -1170,6 +1175,30 @@ struct llm_graph_context {
             ggml_tensor * dense_2,
             ggml_tensor * dense_2_b,
             ggml_tensor * dense_3) const;
+};
+
+struct llm_graph_trace_scope {
+    llm_graph_trace_scope(const llm_graph_context & graph, const char * scope, const char * step)
+            : graph(graph), scope(scope), step(step), start(std::chrono::steady_clock::now()), active(graph.trace_enabled()) {
+        if (active) {
+            graph.trace_event(scope, step, "enter");
+        }
+    }
+
+    ~llm_graph_trace_scope() {
+        if (!active) {
+            return;
+        }
+        const auto elapsed = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+        graph.trace_event(scope, step, "exit", elapsed, true);
+    }
+
+    const llm_graph_context & graph;
+    const char * scope;
+    const char * step;
+    std::chrono::steady_clock::time_point start;
+    bool active;
 };
 
 // TODO: better name

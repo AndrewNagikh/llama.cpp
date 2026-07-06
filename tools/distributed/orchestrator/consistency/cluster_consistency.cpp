@@ -1,6 +1,7 @@
 #include "cluster_consistency.h"
 
 #include "architecture/semantic_runtime_descriptor.h"
+#include "runtime/runtime_install_planning.h"
 
 #include <sstream>
 
@@ -101,8 +102,19 @@ consistency_check_result check_cluster_consistency(
 
     const semantic_runtime_descriptor rt =
             build_semantic_runtime_descriptor(*record.manifest);
+
+    std::optional<runtime_install_node_map> runtime_nodes;
+    if (record.stored_runtime_install_nodes.has_value() &&
+            record.stored_runtime_install_nodes->valid()) {
+        runtime_nodes = *record.stored_runtime_install_nodes;
+    } else if (record.stored_runtime_graph.has_value()) {
+        runtime_nodes = runtime_install_node_map_from_graph(*record.stored_runtime_graph);
+    }
+    const runtime_install_node_map * runtime_ptr =
+            runtime_nodes.has_value() && runtime_nodes->valid() ? &*runtime_nodes : nullptr;
+
     const runtime_coverage_report runtime = compute_runtime_coverage(
-            rt, desired, actual, online_nodes);
+            rt, desired, actual, online_nodes, runtime_ptr);
 
     const install_plan stored = record.stored_install_plan.has_value()
             ? *record.stored_install_plan
@@ -123,7 +135,8 @@ consistency_check_result check_cluster_consistency(
             desired,
             actual,
             coverage,
-            source_url);
+            source_url,
+            runtime_ptr);
     if (!rebuilt.success) {
         result.issues.push_back("rebuild install plan failed: " + rebuilt.error);
         return result;

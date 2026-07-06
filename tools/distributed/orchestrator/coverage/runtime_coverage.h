@@ -3,6 +3,7 @@
 #include "architecture/semantic_runtime_descriptor.h"
 #include "coverage.h"
 #include "layout_planner/layout_planner.h"
+#include "runtime/runtime_install_planning.h"
 
 #include <set>
 #include <string>
@@ -31,4 +32,5 @@ runtime_coverage_report compute_runtime_coverage(
         const semantic_runtime_descriptor & rt,
         const desired_model_layout & desired,
         const actual_model_layout & actual,
-        const std::set<std::string> & online_nodes = {});
+        const std::set<std::string> & online_nodes = {},
+        const runtime_install_node_map * runtime_nodes = nullptr);

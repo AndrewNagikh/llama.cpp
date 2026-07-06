@@ -224,6 +224,24 @@ bool dist_process_reap(dist_child_process & proc) {
     return true;
 }
 
+bool dist_process_is_running(dist_child_process & proc) {
+    if (proc.handle == nullptr) {
+        proc.pid = 0;
+        return false;
+    }
+    DWORD code = 0;
+    if (!GetExitCodeProcess(static_cast<HANDLE>(proc.handle), &code)) {
+        return false;
+    }
+    if (code == STILL_ACTIVE) {
+        return true;
+    }
+    CloseHandle(static_cast<HANDLE>(proc.handle));
+    proc.handle = nullptr;
+    proc.pid    = 0;
+    return false;
+}
+
 int dist_process_run_capture_stdout(
         const std::vector<std::string> & argv,
         std::vector<uint8_t> & stdout_bytes,
@@ -342,6 +360,25 @@ bool dist_process_reap(dist_child_process & proc) {
     waitpid(static_cast<pid_t>(proc.pid), nullptr, 0);
     proc.pid = 0;
     return true;
+}
+
+bool dist_process_is_running(dist_child_process & proc) {
+    if (proc.pid <= 0) {
+        return false;
+    }
+    int status = 0;
+    const pid_t r = waitpid(static_cast<pid_t>(proc.pid), &status, WNOHANG);
+    if (r == 0) {
+        return true;
+    }
+    if (r == static_cast<pid_t>(proc.pid)) {
+        proc.pid = 0;
+        return false;
+    }
+    if (errno == ECHILD) {
+        proc.pid = 0;
+    }
+    return false;
 }
 
 int dist_process_run_capture_stdout(
