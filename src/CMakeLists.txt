@@ -36,6 +36,7 @@ add_library(llama
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp
+            llama_perf_hooks.cpp
             unicode-data.cpp
             unicode.cpp
             unicode.h

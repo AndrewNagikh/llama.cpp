@@ -3,6 +3,8 @@
 #include "dist_common.h"
 #include "executors/http_range/http_range_executor.h"
 #include "node_agent/layer_store/layer_gguf_assembler.h"
+#include "../runtime_debug/perf_trace.h"
+#include "../runtime_debug/perf_gpu_sampler.h"
 
 #include <atomic>
 #include <chrono>
@@ -49,6 +51,50 @@ static executor_result execute_verify(const install_operation & op, layer_store 
 }
 
 } // namespace
+
+static const char * install_action_sub(const install_action action) {
+    switch (action) {
+        case install_action::download: return "download";
+        case install_action::verify:   return "verify";
+        case install_action::repair:   return "repair";
+        case install_action::delete_op: return "delete";
+    }
+    return "unknown";
+}
+
+static std::string install_blob_id(const install_operation & op) {
+    if (!op.download.blob_id.empty()) {
+        return op.download.blob_id;
+    }
+    if (op.layer_index >= 0) {
+        return "layer:" + std::to_string(op.layer_index);
+    }
+    return "unknown";
+}
+
+static void emit_install_operation_event(
+        const install_operation & op,
+        const executor_result & result,
+        const int64_t dur_us) {
+    if (!perf_trace_enabled()) {
+        return;
+    }
+    perf_trace_refresh_context();
+    const char * sub = result.success
+            ? install_action_sub(op.action)
+            : "failed";
+    const uint64_t bytes = (op.action == install_action::download ||
+                            op.action == install_action::repair)
+            ? op.download.tensor_length
+            : 0;
+    perf_emit_install_span(
+            "INSTALL_BLOB",
+            sub,
+            install_blob_id(op).c_str(),
+            op.node_id.c_str(),
+            bytes,
+            dur_us);
+}
 
 synchronization_engine::synchronization_engine()
         : executor_(std::make_shared<http_range_download_executor>()) {}
@@ -140,6 +186,7 @@ void synchronization_engine::run_job(
 
     auto run_one = [&](const size_t i) {
         const install_operation & op = operations[i];
+        const int64_t t0_us = static_cast<int64_t>(perf_now_us());
 
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -186,6 +233,9 @@ void synchronization_engine::run_job(
         } else {
             result.error = "unsupported install action";
         }
+
+        const int64_t dur_us = static_cast<int64_t>(perf_now_us()) - t0_us;
+        emit_install_operation_event(op, result, dur_us);
 
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -247,6 +297,9 @@ void synchronization_engine::run_job(
                 layer_store_cache_metadata(store, manifest, source_url);
             }
         }
+    }
+    if (perf_trace_has_active_context()) {
+        perf_gpu_poll_stop();
     }
 }
 

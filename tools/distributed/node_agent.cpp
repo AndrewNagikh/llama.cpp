@@ -26,6 +26,9 @@
 #include "transport/split_tcp_wire.h"
 #include "workers/split_gen_common.h"
 #include "runtime_debug/runtime_debug.h"
+#include "runtime_debug/perf_trace.h"
+#include "runtime_debug/perf_trace_export.h"
+#include "runtime_debug/perf_gpu_sampler.h"
 #include "runtime_debug/trace_recorder.h"
 
 #include <chrono>
@@ -630,6 +633,25 @@ static layer_store get_layer_store(const std::string & model_id) {
     return store;
 }
 
+static void perf_consume_trace_from_body(const json & body, const char * component) {
+    const std::string trace_id = body.value("trace_id", "");
+    const bool perf_trace = body.value("perf_trace", false);
+    if (!perf_trace && !perf_trace_enabled()) {
+        return;
+    }
+    if (perf_trace) {
+        dist_set_env("DIST_PERF_TRACE", "1");
+        if (!g_models_dir.empty()) {
+            dist_set_env("DIST_PERF_TRACE_DIR", (g_models_dir + "/perf_trace").c_str());
+        }
+    }
+    if (!trace_id.empty()) {
+        perf_trace_set_node_id(g_node_id);
+        perf_trace_set_component(component);
+        perf_trace_set_context(trace_id, "session_create", -1);
+    }
+}
+
 static uint64_t now_ms() {
     const auto now = std::chrono::system_clock::now();
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
@@ -1067,10 +1089,37 @@ static bool run_local_pipeline_generate(
         int layer_end,
         std::vector<int32_t> & out_tokens,
         std::string & err,
-        json * timing_out = nullptr) {
+        json * timing_out = nullptr,
+        const std::string * trace_id = nullptr) {
     if (g_pipeline_ctrl_port <= 0) {
         err = "pipeline not configured";
         return false;
+    }
+
+    const bool perf_on = perf_trace_enabled() || (trace_id != nullptr && !trace_id->empty());
+    struct perf_generate_end_guard {
+        bool active = false;
+        ~perf_generate_end_guard() {
+            if (active) {
+                perf_trace_end_generate();
+            }
+        }
+    } generate_guard{};
+
+    struct ttft_end_guard {
+        bool ended = false;
+        ~ttft_end_guard() {
+            if (!ended && perf_trace_enabled()) {
+                perf_trace_end_ttft();
+            }
+        }
+    } ttft_guard;
+
+    if (perf_on && trace_id != nullptr && !trace_id->empty()) {
+        perf_trace_set_node_id(g_node_id);
+        perf_trace_set_component("entry");
+        perf_trace_set_context(*trace_id, "ttft", -1);
+        perf_trace_refresh_context();
     }
 
     dist_debug_load_config();
@@ -1105,6 +1154,7 @@ static bool run_local_pipeline_generate(
     }
 
     const auto t_prefill0 = std::chrono::steady_clock::now();
+    perf_ttft_span prefill_span("TTFT_PREFILL", "entry");
     if (g_external_embedding) {
         std::vector<float> hidden;
         int32_t n_embd = 0;
@@ -1129,6 +1179,24 @@ static bool run_local_pipeline_generate(
 
     const auto t_first_token = std::chrono::steady_clock::now();
 
+    if (perf_on) {
+        char attrs[128];
+        std::snprintf(
+                attrs,
+                sizeof(attrs),
+                "{\"token_id\":%d,\"prefill_ms\":%.3f}",
+                resp.token_id,
+                std::chrono::duration<double, std::milli>(t_first_token - t_prefill0).count());
+        perf_emit_ttft_instant("CLIENT_TTFT", "entry", attrs);
+        perf_trace_end_ttft();
+        ttft_guard.ended = true;
+        if (trace_id != nullptr && !trace_id->empty()) {
+            perf_trace_begin_generate(*trace_id, "decode");
+            generate_guard.active = true;
+            perf_trace_set_context(*trace_id, "decode", -1);
+        }
+    }
+
     if (dbg) {
         dbg->emit_step_begin(debug_step, "prefill", -1, 0, 0);
     }
@@ -1150,6 +1218,9 @@ static bool run_local_pipeline_generate(
     const int n_prompt = (int) prompt_tokens.size();
     for (int step = 1; step < max_new; ++step) {
         const int32_t pos = n_prompt + step - 1;
+        if (perf_on && trace_id != nullptr && !trace_id->empty()) {
+            perf_trace_set_context(*trace_id, "decode", step - 1);
+        }
         if (dbg) {
             dbg->emit_step_begin(debug_step, "decode", cur, pos, 0);
         }
@@ -1199,6 +1270,19 @@ static bool run_local_pipeline_generate(
             { "total_ms", total_ms },
             { "generated_tokens", (int) out_tokens.size() },
         };
+        if (trace_id != nullptr && !trace_id->empty()) {
+            (*timing_out)["trace_id"] = *trace_id;
+        }
+        if (const char * dir = perf_trace_output_dir()) {
+            (*timing_out)["perf_trace_dir"] = dir;
+        }
+        if (trace_id != nullptr && !trace_id->empty()) {
+            (*timing_out)["ttft_trace_dir"] =
+                    perf_trace_config_get().trace_dir + "/" + *trace_id + "/ttft";
+        }
+    }
+    if (perf_on && generate_guard.active) {
+        perf_emit_instant("CLIENT_RESPONSE", perf_category::UNKNOWN, "entry", -1, nullptr);
     }
     return true;
 }
@@ -1326,6 +1410,15 @@ static bool start_worker(
             const std::string trace_dir = g_models_dir + "/traces";
             dist_set_env("LLAMA_DIST_TRACE_DIR", trace_dir.c_str());
         }
+    }
+    if (perf_trace_enabled()) {
+        dist_set_env("DIST_PERF_TRACE", "1");
+        if (!g_models_dir.empty()) {
+            const std::string perf_dir = g_models_dir + "/perf_trace";
+            dist_set_env("DIST_PERF_TRACE_DIR", perf_dir.c_str());
+        }
+        dist_set_env("DIST_NODE_ID", g_node_id.c_str());
+        dist_set_env("DIST_PERF_COMPONENT", dist_role_name(cfg.role).c_str());
     }
 
     const std::string ready_file = worker_ready_state_file(cfg.role, cfg.session_id);
@@ -1590,6 +1683,28 @@ int main(int argc, char ** argv) {
         res.set_content(json({ { "status", "ok" }, { "node_id", g_node_id } }).dump(), "application/json");
     });
 
+    svr.Get("/perf/trace/list", [](const httplib::Request &, httplib::Response & res) {
+        const std::string root = perf_trace_resolve_root(g_models_dir);
+        res.set_content(json({
+            { "node_id", g_node_id },
+            { "root", root },
+            { "files", perf_trace_list_files(root) },
+        }).dump(), "application/json");
+    });
+
+    svr.Get("/perf/trace/file", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string rel = req.get_param_value("rel");
+        const std::string root = perf_trace_resolve_root(g_models_dir);
+        std::string content;
+        if (!perf_trace_read_file(root, rel, content)) {
+            res.status = 404;
+            res.set_content(R"({"error":"not found"})", "application/json");
+            return;
+        }
+        res.set_header("Content-Type", "application/x-ndjson");
+        res.set_content(content, "application/x-ndjson");
+    });
+
     svr.Get("/capabilities", [](const httplib::Request &, httplib::Response & res) {
         dist_node_memory memory{};
         dist_node_cpu cpu{};
@@ -1650,6 +1765,8 @@ int main(int argc, char ** argv) {
             res.set_content(R"({"error":"invalid json"})", "application/json");
             return;
         }
+        perf_consume_trace_from_body(body, "tokenizer");
+        perf_session_span svc_span("SESSION_SERVICE_CONFIGURE", g_node_id.c_str(), "tokenizer");
         const std::string path = body.value("worker_gguf", "");
         const std::string model_id = body.value("model_id", "");
         if (!apply_service_model_source(path, model_id, g_tokenizer_service_gguf, g_tokenizer_service_model_id)) {
@@ -1761,6 +1878,8 @@ int main(int argc, char ** argv) {
             res.set_content(R"({"error":"invalid json"})", "application/json");
             return;
         }
+        perf_consume_trace_from_body(body, "embedding");
+        perf_session_span svc_span("SESSION_SERVICE_CONFIGURE", g_node_id.c_str(), "embedding");
         const std::string path = body.value("worker_gguf", "");
         const std::string model_id = body.value("model_id", "");
         if (!apply_service_model_source(path, model_id, g_embedding_service_gguf, g_embedding_service_model_id)) {
@@ -1849,6 +1968,8 @@ int main(int argc, char ** argv) {
             res.set_content(R"({"error":"invalid json"})", "application/json");
             return;
         }
+        perf_consume_trace_from_body(body, "output");
+        perf_session_span svc_span("SESSION_SERVICE_CONFIGURE", g_node_id.c_str(), "output_head");
         const std::string path = body.value("worker_gguf", "");
         const std::string model_id = body.value("model_id", "");
         if (!apply_service_model_source(path, model_id, g_output_service_gguf, g_output_service_model_id)) {
@@ -1918,7 +2039,15 @@ int main(int argc, char ** argv) {
         }).dump(), "application/json");
     });
 
-    svr.Post("/runtime/sampler/configure", [](const httplib::Request &, httplib::Response & res) {
+    svr.Post("/runtime/sampler/configure", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            body = json::object();
+        }
+        perf_consume_trace_from_body(body, "sampler");
+        perf_session_span svc_span("SESSION_SERVICE_CONFIGURE", g_node_id.c_str(), "sampler");
         g_sampler_service_ready = true;
         res.set_content(json({ { "ok", true }, { "sampler_ready", true } }).dump(), "application/json");
     });
@@ -1933,10 +2062,14 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        perf_consume_trace_from_body(body, "prepare");
+        const std::string rt_role = body.value("runtime_role", "");
+        const std::string role = body.value("role", rt_role.empty() ? "pipeline" : rt_role);
+        perf_session_span prep_span("SESSION_PREPARE_RUNTIME", g_node_id.c_str(), role.c_str());
+
         const auto t0 = std::chrono::steady_clock::now();
         dist_configure_req cfg = parse_configure(body);
         std::string err;
-        const std::string rt_role = body.value("runtime_role", "");
         runtime_worker_gguf_resolve_result resolved{};
         const std::string worker_gguf =
                 configure_worker_runtime(cfg, body, err, &resolved);
@@ -2073,7 +2206,14 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        perf_consume_trace_from_body(body, "configure");
         const dist_configure_req cfg = parse_configure(body);
+        const std::string role_name = dist_role_name(cfg.role);
+        perf_session_span startup_span(
+                "SESSION_WORKER_STARTUP",
+                g_node_id.c_str(),
+                role_name.c_str());
+
         std::string worker_model = g_model_path;
         std::string err;
         const bool skip_materialize = body.value("skip_materialize", false);
@@ -2186,6 +2326,14 @@ int main(int argc, char ** argv) {
 
         const int max_tokens = body.value("max_tokens", 16);
         const int layer_end  = body.value("layer_end", g_pipeline_layer_end);
+        const std::string trace_id = body.value("trace_id", "");
+        const bool perf_trace = body.value("perf_trace", false);
+        if (perf_trace) {
+            dist_set_env("DIST_PERF_TRACE", "1");
+            if (!g_models_dir.empty()) {
+                dist_set_env("DIST_PERF_TRACE_DIR", (g_models_dir + "/perf_trace").c_str());
+            }
+        }
 
         std::vector<int32_t> prompt_tokens;
         if (body.contains("prompt_tokens") && body["prompt_tokens"].is_array()) {
@@ -2215,7 +2363,9 @@ int main(int argc, char ** argv) {
         std::vector<int32_t> out_tokens;
         std::string err;
         json timing = json::object();
-        if (!run_local_pipeline_generate(prompt_tokens, max_tokens, layer_end, out_tokens, err, &timing)) {
+        const std::string * trace_ptr = trace_id.empty() ? nullptr : &trace_id;
+        if (!run_local_pipeline_generate(
+                    prompt_tokens, max_tokens, layer_end, out_tokens, err, &timing, trace_ptr)) {
             res.status = 500;
             res.set_content(json({ { "ok", false }, { "error", err }, { "tokens", json::array() } }).dump(),
                     "application/json");
@@ -2234,6 +2384,7 @@ int main(int argc, char ** argv) {
             { "text", text },
             { "count", out_tokens.size() },
             { "timing", timing },
+            { "trace_id", trace_id },
         }).dump(), "application/json");
     });
 
@@ -2415,6 +2566,21 @@ int main(int argc, char ** argv) {
             res.status = 400;
             res.set_content(R"({"error":"operations array required"})", "application/json");
             return;
+        }
+
+        const std::string trace_id = body.value("trace_id", "");
+        const bool perf_trace = body.value("perf_trace", false);
+        if (perf_trace || perf_trace_enabled()) {
+            dist_set_env("DIST_PERF_TRACE", "1");
+            if (!g_models_dir.empty()) {
+                dist_set_env("DIST_PERF_TRACE_DIR", (g_models_dir + "/perf_trace").c_str());
+            }
+            if (!trace_id.empty()) {
+                perf_trace_set_node_id(g_node_id);
+                perf_trace_set_component("sync");
+                perf_trace_set_context(trace_id, "install", -1);
+                perf_gpu_poll_start();
+            }
         }
 
         std::vector<install_operation> operations;

@@ -9,6 +9,8 @@
 #include "../runtime_debug/runtime_debug.h"
 #include "../runtime_debug/trace_recorder.h"
 #include "../runtime_debug/hidden_transport.h"
+#include "../runtime_debug/perf_trace.h"
+#include "../runtime_debug/perf_ggml.h"
 
 #include <cstdio>
 #include <cstring>
@@ -61,12 +63,18 @@ static bool forward_to_peer(
         trace_recorder * dbg,
         split_gen3_a_resp & resp,
         std::vector<float> & logits_out) {
+    perf_trace_refresh_context();
+    const int32_t tok_idx = (phase && std::strcmp(phase, "decode") == 0) ? debug_step : -1;
+
     std::vector<float> hidden_buf;
+    const int64_t t_ser0 = ggml_time_us();
     if (!gather_stage_hidden(ctx, n_tokens, n_embd, hidden_buf)) {
         fprintf(stderr, "gen3_a: missing hidden state\n");
         return false;
     }
     const float * hidden = hidden_buf.data();
+    const int64_t serialize_us = ggml_time_us() - t_ser0;
+    const int32_t payload_bytes = n_tokens * n_embd * (int32_t) sizeof(float);
 
     hidden_transport_trace tr_send = dist_debug_transport_send(
             debug_step, phase, "ab", n_tokens, n_embd, layer_end, pos_start, hidden, 0.0);
@@ -81,15 +89,21 @@ static bool forward_to_peer(
         fprintf(stderr, "gen3_a: send hidden failed\n");
         return false;
     }
-    const int64_t t1 = ggml_time_us();
+    const int64_t send_us = ggml_time_us() - t0;
     split_gen_pipe_trace("entry", phase, "send_hidden_exit", n_tokens, n_embd, pos_start, -1, layer_end);
+
+    if (perf_trace_enabled()) {
+        perf_trace_set_component("entry");
+        perf_emit_hidden_transfer("entry", tok_idx, "ab", payload_bytes, serialize_us, send_us, 0, 0);
+        perf_emit_span("ENTRY_SEND_END", perf_category::NETWORK, "entry", tok_idx, send_us, nullptr);
+    }
 
     resp.magic          = SPLIT_GEN_MAGIC;
     resp.version        = SPLIT_GEN3_VERSION;
     resp.include_logits = include_logits ? 1 : 0;
     resp.n_vocab        = n_vocab;
     resp.ms_a_compute   = ms_a;
-    resp.ms_ab_xfer     = (t1 - t0) / 1000.0;
+    resp.ms_ab_xfer     = send_us / 1000.0;
     logits_out.clear();
 
     if (next_is_final) {
@@ -241,7 +255,10 @@ int main(int argc, char ** argv) {
         std::vector<int32_t> tokens_i32;
         std::vector<float> hidden_in;
         int32_t hidden_n_embd = 0;
-        if (!split_gen_recv_req(ctrl_fd, req, tokens_i32, &hidden_in, &hidden_n_embd)) {
+        perf_trace_sched_queue_wait_begin();
+        const bool got_req = split_gen_recv_req(ctrl_fd, req, tokens_i32, &hidden_in, &hidden_n_embd);
+        perf_trace_sched_queue_wait_end();
+        if (!got_req) {
             fprintf(stderr, "gen3_a: client disconnected, waiting for next ctrl connection\n");
             split_tcp_close(ctrl_fd);
             break;
@@ -294,6 +311,20 @@ int main(int argc, char ** argv) {
         }
 
         split_gen_pipe_trace("entry", phase, "decode_enter", req.n_tokens, hidden_n_embd > 0 ? hidden_n_embd : n_embd, req.pos_start, layer_start, layer_end);
+        const int32_t tok_idx = (phase && std::strcmp(phase, "decode") == 0) ? debug_step : -1;
+        const bool decode_step = (phase && std::strcmp(phase, "decode") == 0);
+        static int32_t entry_queue_depth = 0;
+        if (decode_step && perf_trace_enabled()) {
+            perf_trace_refresh_context();
+            perf_trace_set_component("entry");
+            perf_emit_instant("ENTRY_RECEIVE", perf_category::NETWORK, "entry", tok_idx, nullptr);
+            perf_emit_queue_depth("entry", tok_idx, entry_queue_depth);
+        }
+        if (decode_step) {
+            entry_queue_depth = std::max(0, entry_queue_depth - 1);
+        }
+        perf_span compute_span("ENTRY_COMPUTE_BEGIN", "ENTRY_COMPUTE_END", perf_category::COMPUTE, "entry");
+        compute_span.set_token_idx(tok_idx);
         if (req.cmd == SPLIT_GEN_CMD_PREFILL) {
             if (layer_start > 0) {
                 fprintf(stderr, "gen3_a: token prefill requires layer_start=0\n");
@@ -372,6 +403,9 @@ int main(int argc, char ** argv) {
 
         if (dbg && resp.token_id >= 0) {
             dbg->emit_token_selected(debug_step, phase, resp.token_id, req.pos_start, false);
+        }
+        if (decode_step) {
+            entry_queue_depth++;
         }
         debug_step++;
         }

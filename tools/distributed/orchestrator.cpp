@@ -21,11 +21,14 @@
 #include "runtime/runtime_graph.h"
 #include "runtime/runtime_role.h"
 #include "runtime/runtime_install_planning.h"
+#include "runtime_debug/perf_trace.h"
+#include "runtime_debug/perf_trace_export.h"
 
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -370,14 +373,49 @@ static void coordinate_install_plan_execute(
         install_plan plan,
         model_manifest manifest,
         std::map<std::string, dist_node_info> nodes) {
+    const bool perf_on = perf_trace_enabled();
+    const std::string trace_id = perf_make_install_trace_id(job_id, model_id);
+    if (perf_on) {
+        perf_trace_set_component("orchestrator");
+        perf_trace_set_node_id("orchestrator");
+        perf_trace_begin_install(trace_id, "install");
+    }
+
     if (nodes.empty()) {
+        if (perf_on) {
+            perf_emit_install_instant("INSTALL_FAILED", "plan", nullptr, nullptr, 0, "{\"error\":\"no online nodes\"}");
+            perf_trace_end_install();
+        }
         set_sync_job_state(job_id, "failed", "no online nodes");
         return;
     }
 
     if (plan.operations.empty()) {
+        if (perf_on) {
+            perf_emit_install_instant(
+                    "INSTALL_FULL_REUSE",
+                    "reuse",
+                    "*",
+                    "cluster",
+                    0,
+                    "{\"operation_count\":0}");
+            perf_trace_end_install();
+        }
         set_sync_job_state(job_id, "completed");
         return;
+    }
+
+    {
+        char attrs[256];
+        std::snprintf(
+                attrs,
+                sizeof(attrs),
+                "{\"operation_count\":%d,\"total_download_bytes\":%llu}",
+                plan.operation_count,
+                static_cast<unsigned long long>(plan.total_download_bytes));
+        if (perf_on) {
+            perf_emit_install_instant("INSTALL_PLAN", "plan", nullptr, nullptr, plan.total_download_bytes, attrs);
+        }
     }
 
     std::map<std::string, std::vector<install_operation>> by_node;
@@ -399,6 +437,8 @@ static void coordinate_install_plan_execute(
         json body = {
             { "operations", json::array() },
             { "manifest", manifest.to_json() },
+            { "trace_id", trace_id },
+            { "perf_trace", perf_on },
         };
         for (const auto & op : kv.second) {
             body["operations"].push_back(op.to_json());
@@ -439,11 +479,17 @@ static void coordinate_install_plan_execute(
     }
 
     if (dispatched == 0) {
+        if (perf_on) {
+            perf_emit_install_instant("INSTALL_FAILED", "plan", nullptr, nullptr, 0, "{\"error\":\"dispatch failed\"}");
+            perf_trace_end_install();
+        }
         set_sync_job_state(job_id, "failed", "failed to dispatch to any node");
         return;
     }
 
     set_sync_job_state(job_id, "running");
+
+    perf_install_span install_wait_span("INSTALL_EXECUTE_WAIT", "plan");
 
     constexpr int max_attempts = 1800;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
@@ -496,7 +542,9 @@ static void coordinate_install_plan_execute(
                 set_sync_job_state(job_id, "completed");
                 actual_model_layout actual;
                 std::set<std::string> online_nodes;
-                poll_installed_layers_from_nodes(model_id, actual, online_nodes);
+                {
+                    perf_install_span reconcile_span("INSTALL_RECONCILE", "plan");
+                    poll_installed_layers_from_nodes(model_id, actual, online_nodes);
                 dist_model_record * record = g_registry.find(model_id);
                 if (record) {
                     g_registry.apply_actual(model_id, actual, record);
@@ -536,13 +584,26 @@ static void coordinate_install_plan_execute(
                     }
                     persist_registry();
                 }
+                }
+                if (perf_on) {
+                    perf_emit_install_instant("INSTALL_COMPLETED", "plan", nullptr, nullptr, 0, nullptr);
+                    perf_trace_end_install();
+                }
             } else {
+                if (perf_on) {
+                    perf_emit_install_instant("INSTALL_FAILED", "plan", nullptr, nullptr, 0, "{\"error\":\"node job failed\"}");
+                    perf_trace_end_install();
+                }
                 set_sync_job_state(job_id, "failed", "one or more node jobs failed");
             }
             return;
         }
     }
 
+    if (perf_on) {
+        perf_emit_install_instant("INSTALL_FAILED", "plan", nullptr, nullptr, 0, "{\"error\":\"timeout\"}");
+        perf_trace_end_install();
+    }
     set_sync_job_state(job_id, "failed", "sync job timed out");
 }
 
@@ -884,17 +945,35 @@ static std::string configure_worker_artifact(const std::string & artifact) {
     return artifact.empty() ? "layer-store" : artifact;
 }
 
+static void perf_attach_trace(json & body) {
+    if (!perf_trace_enabled()) {
+        return;
+    }
+    std::string trace_id;
+    std::string phase;
+    int32_t token_idx = -1;
+    if (perf_trace_get_context(trace_id, phase, token_idx) && !trace_id.empty()) {
+        body["trace_id"]   = trace_id;
+        body["perf_trace"] = true;
+    }
+}
+
 static bool prepare_runtime_node(
         const dist_node_info & node,
         const json & body,
         std::string & worker_gguf_out,
         std::string & err,
         int timeout_ms = 600000) {
+    const std::string role = body.value("role", body.value("runtime_role", "pipeline"));
+    perf_session_span prep_span("SESSION_PREPARE_RUNTIME", node.node_id.c_str(), role.c_str());
+
     httplib::Client cli(node.host.c_str(), node.http_port);
     cli.set_connection_timeout(5, 0);
     cli.set_read_timeout(timeout_ms / 1000, (timeout_ms % 1000) * 1000);
 
-    const auto res = cli.Post("/runtime/prepare", body.dump(), "application/json");
+    json req_body = body;
+    perf_attach_trace(req_body);
+    const auto res = cli.Post("/runtime/prepare", req_body.dump(), "application/json");
     if (!res) {
         err = "no response from " + node.node_id + " prepare at " + node.host + ":" +
               std::to_string(node.http_port);
@@ -952,11 +1031,16 @@ static bool configure_node(
         const json & body,
         std::string & err,
         int timeout_ms = 30000) {
+    const std::string role = body.value("role", "pipeline");
+    perf_session_span cfg_span("SESSION_CONFIGURE_NODE", node.node_id.c_str(), role.c_str());
+
     httplib::Client cli(node.host.c_str(), node.http_port);
     cli.set_connection_timeout(5, 0);
     cli.set_read_timeout(timeout_ms / 1000, (timeout_ms % 1000) * 1000);
 
-    const auto res = cli.Post("/configure", body.dump(), "application/json");
+    json req_body = body;
+    perf_attach_trace(req_body);
+    const auto res = cli.Post("/configure", req_body.dump(), "application/json");
     if (!res) {
         err = "no response from " + node.node_id + " at " + node.host + ":" + std::to_string(node.http_port);
         return false;
@@ -984,6 +1068,9 @@ static bool wait_node_worker_ready(
         const dist_node_role role,
         std::string & err,
         int timeout_ms = 300000) {
+    const std::string role_name = dist_role_name(role);
+    perf_session_span ready_span("SESSION_READY_WAIT", node.node_id.c_str(), role_name.c_str());
+
     httplib::Client cli(node.host.c_str(), node.http_port);
     cli.set_connection_timeout(5, 0);
     cli.set_read_timeout(5, 0);
@@ -1529,15 +1616,18 @@ static bool setup_runtime_graph(
     for (const auto & a : session.runtime.assignments) {
         touched_nodes.insert(a.node_id);
     }
-    for (const auto & nid : touched_nodes) {
-        const dist_node_info * node = find_node(node_map, nid);
-        if (node) {
-            shutdown_node(*node);
+    {
+        perf_session_span shutdown_span("SESSION_SHUTDOWN_NODES", "cluster", "orchestrator");
+        for (const auto & nid : touched_nodes) {
+            const dist_node_info * node = find_node(node_map, nid);
+            if (node) {
+                shutdown_node(*node);
+            }
         }
-    }
 #if !defined(_WIN32)
-    usleep(300000);
+        usleep(300000);
 #endif
+    }
 
     if (const dist_model_record * record = g_registry.find(session.model)) {
         const std::string source_url = resolve_model_source_url(*record);
@@ -1574,11 +1664,17 @@ static bool setup_runtime_graph(
             cli.set_read_timeout(120, 0);
 
             if (a.role == runtime_role::tokenizer) {
-                const json cfg = {
+                json cfg = {
                     { "session_id", session_id },
                     { "model_id", session.model },
                     { "worker_gguf", configure_worker_artifact(artifact) },
                 };
+                perf_attach_trace(cfg);
+                const std::string svc_role = runtime_role_name(a.role);
+                perf_session_span svc_span(
+                        "SESSION_SERVICE_CONFIGURE",
+                        a.node_id.c_str(),
+                        svc_role.c_str());
                 const auto res = cli.Post("/runtime/tokenizer/configure", cfg.dump(), "application/json");
                 if (!res || res->status != 200) {
                     err = a.node_id + " tokenizer configure failed";
@@ -1596,11 +1692,17 @@ static bool setup_runtime_graph(
                     return false;
                 }
             } else if (a.role == runtime_role::embedding) {
-                const json cfg = {
+                json cfg = {
                     { "session_id", session_id },
                     { "model_id", session.model },
                     { "worker_gguf", configure_worker_artifact(artifact) },
                 };
+                perf_attach_trace(cfg);
+                const std::string svc_role = runtime_role_name(a.role);
+                perf_session_span svc_span(
+                        "SESSION_SERVICE_CONFIGURE",
+                        a.node_id.c_str(),
+                        svc_role.c_str());
                 const auto res = cli.Post("/runtime/embedding/configure", cfg.dump(), "application/json");
                 if (!res || res->status != 200) {
                     err = a.node_id + " embedding configure failed";
@@ -1618,11 +1720,17 @@ static bool setup_runtime_graph(
                     return false;
                 }
             } else if (a.role == runtime_role::output_head) {
-                const json cfg = {
+                json cfg = {
                     { "session_id", session_id },
                     { "model_id", session.model },
                     { "worker_gguf", configure_worker_artifact(artifact) },
                 };
+                perf_attach_trace(cfg);
+                const std::string svc_role = runtime_role_name(a.role);
+                perf_session_span svc_span(
+                        "SESSION_SERVICE_CONFIGURE",
+                        a.node_id.c_str(),
+                        svc_role.c_str());
                 const auto res = cli.Post("/runtime/output/configure", cfg.dump(), "application/json");
                 if (!res || res->status != 200) {
                     err = a.node_id + " output configure failed";
@@ -1640,10 +1748,16 @@ static bool setup_runtime_graph(
                     return false;
                 }
             } else if (a.role == runtime_role::sampler) {
-                const json cfg = {
+                json cfg = {
                     { "session_id", session_id },
                     { "model_id", session.model },
                 };
+                perf_attach_trace(cfg);
+                const std::string svc_role = runtime_role_name(a.role);
+                perf_session_span svc_span(
+                        "SESSION_SERVICE_CONFIGURE",
+                        a.node_id.c_str(),
+                        svc_role.c_str());
                 const auto res = cli.Post("/runtime/sampler/configure", cfg.dump(), "application/json");
                 if (!res || res->status != 200) {
                     err = a.node_id + " sampler configure failed";
@@ -2217,6 +2331,26 @@ static bool run_generation(
         return false;
     }
 
+    static std::atomic<int> g_perf_trace_seq{0};
+    std::string trace_id;
+    const bool perf_on = perf_trace_enabled();
+    bool ttft_handed_off = false;
+    if (perf_on) {
+        perf_trace_set_component("orchestrator");
+        perf_trace_set_node_id("orchestrator");
+        trace_id = perf_make_trace_id(g_perf_trace_seq.fetch_add(1) + 1);
+        perf_trace_begin_ttft(trace_id, "ttft");
+    }
+    struct orch_ttft_cleanup {
+        bool active = false;
+        bool *handed_off = nullptr;
+        ~orch_ttft_cleanup() {
+            if (active && handed_off != nullptr && !*handed_off) {
+                perf_trace_end_ttft();
+            }
+        }
+    } ttft_cleanup{perf_on, &ttft_handed_off};
+
     const auto & entry = session.pipeline.front();
     if (entry.http_port <= 0) {
         err = "entry node missing http_port";
@@ -2226,6 +2360,7 @@ static bool run_generation(
     json prompt_tokens_json = json::array();
     const runtime_role_assignment * tok_assign = session.runtime.find_role(runtime_role::tokenizer);
     if (tok_assign != nullptr && tok_assign->http_port > 0) {
+        perf_ttft_span tokenize_span("TTFT_TOKENIZE", "orchestrator");
         httplib::Client tcli(tok_assign->host.c_str(), tok_assign->http_port);
         tcli.set_connection_timeout(10, 0);
         tcli.set_read_timeout(60, 0);
@@ -2257,6 +2392,12 @@ static bool run_generation(
     } else {
         body["prompt"] = prompt;
     }
+    if (perf_on) {
+        body["trace_id"]   = trace_id;
+        body["perf_trace"] = true;
+    }
+
+    ttft_handed_off = true;
 
     httplib::Client cli(entry.host.c_str(), entry.http_port);
     cli.set_connection_timeout(10, 0);
@@ -2302,8 +2443,18 @@ static bool run_generation(
                 }
             }
         }
-        if (timing_out && j.contains("timing")) {
-            *timing_out = j["timing"];
+        if (timing_out) {
+            if (j.contains("timing") && j["timing"].is_object()) {
+                *timing_out = j["timing"];
+            } else {
+                *timing_out = json::object();
+            }
+            if (perf_on) {
+                (*timing_out)["trace_id"] = trace_id;
+                if (const char * dir = perf_trace_output_dir()) {
+                    (*timing_out)["perf_trace_dir"] = dir;
+                }
+            }
         }
         return true;
     } catch (...) {
@@ -2388,6 +2539,28 @@ int main(int argc, char ** argv) {
             { "baseline_delta_bytes", delta },
             { "baseline_delta_mb", static_cast<double>(delta) / (1024.0 * 1024.0) },
         }).dump(), "application/json");
+    });
+
+    svr.Get("/perf/trace/list", [](const httplib::Request &, httplib::Response & res) {
+        const std::string root = perf_trace_resolve_root(g_models_dir);
+        res.set_content(json({
+            { "node_id", "orchestrator" },
+            { "root", root },
+            { "files", perf_trace_list_files(root) },
+        }).dump(), "application/json");
+    });
+
+    svr.Get("/perf/trace/file", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string rel = req.get_param_value("rel");
+        const std::string root = perf_trace_resolve_root(g_models_dir);
+        std::string content;
+        if (!perf_trace_read_file(root, rel, content)) {
+            res.status = 404;
+            res.set_content(R"({"error":"not found"})", "application/json");
+            return;
+        }
+        res.set_header("Content-Type", "application/x-ndjson");
+        res.set_content(content, "application/x-ndjson");
     });
 
     svr.Post("/register", [](const httplib::Request & req, httplib::Response & res) {
@@ -2708,23 +2881,26 @@ int main(int argc, char ** argv) {
         }
 
         std::vector<dist_layer_assignment> assignments;
-        if (record->layout.has_value() &&
-                layout_has_full_coverage(record->layout->desired, n_layers)) {
-            assignments = assignments_from_desired_layout(
-                    record->layout->desired, node_map, n_layers);
-        }
-
-        if (assignments.empty()) {
-            const dist_planner_result plan = dist_plan_layers_memory_aware(mem, planner_nodes);
-            if (!plan.success) {
-                res.status = 503;
-                json err = fit.to_json();
-                err["error"] = plan.error;
-                err["planning_error"] = true;
-                res.set_content(err.dump(), "application/json");
-                return;
+        {
+            perf_session_span layout_span("SESSION_RESOLVE_LAYOUT", "orchestrator", "orchestrator");
+            if (record->layout.has_value() &&
+                    layout_has_full_coverage(record->layout->desired, n_layers)) {
+                assignments = assignments_from_desired_layout(
+                        record->layout->desired, node_map, n_layers);
             }
-            assignments = plan.assignments;
+
+            if (assignments.empty()) {
+                const dist_planner_result plan = dist_plan_layers_memory_aware(mem, planner_nodes);
+                if (!plan.success) {
+                    res.status = 503;
+                    json err = fit.to_json();
+                    err["error"] = plan.error;
+                    err["planning_error"] = true;
+                    res.set_content(err.dump(), "application/json");
+                    return;
+                }
+                assignments = plan.assignments;
+            }
         }
 
         dist_print_planner_report(record->model_id, mem, node_vec, fit, assignments);
@@ -2745,6 +2921,7 @@ int main(int argc, char ** argv) {
 
         // Gate session on runtime blob coverage matching the stored install plan.
         if (record->layout.has_value() && record->manifest.has_value()) {
+            perf_session_span coverage_span("SESSION_COVERAGE_CHECK", "orchestrator", "orchestrator");
             actual_model_layout actual;
             std::set<std::string> online_nodes;
             poll_installed_layers_from_nodes(model_id, actual, online_nodes);
@@ -2767,8 +2944,24 @@ int main(int argc, char ** argv) {
             }
         }
 
+        const std::string session_id = make_id("sess");
+        const bool perf_on = perf_trace_enabled();
+        if (perf_on) {
+            perf_trace_set_component("orchestrator");
+            perf_trace_set_node_id("orchestrator");
+            perf_trace_begin_session(perf_make_session_trace_id(session_id), "session");
+        }
+        struct session_trace_end_guard {
+            bool active = false;
+            ~session_trace_end_guard() {
+                if (active) {
+                    perf_trace_end_session();
+                }
+            }
+        } session_trace_guard{perf_on};
+
         dist_session session{};
-        session.session_id = make_id("sess");
+        session.session_id = session_id;
         session.model      = record->model_id;
 
         std::string err;
@@ -3987,6 +4180,22 @@ int main(int argc, char ** argv) {
         const std::string model_id = req.matches[1];
         dist_rss_scope rss("install_plan", model_id.c_str());
 
+        const bool perf_on = perf_trace_enabled();
+        if (perf_on) {
+            perf_trace_set_component("orchestrator");
+            perf_trace_set_node_id("orchestrator");
+            perf_trace_begin_install("install-plan-" + model_id, "install");
+        }
+        struct install_trace_end_guard {
+            bool active = false;
+            ~install_trace_end_guard() {
+                if (active) {
+                    perf_trace_end_install();
+                }
+            }
+        } install_trace_guard{perf_on};
+        perf_install_span plan_build("INSTALL_PLAN_BUILD", "plan");
+
         dist_model_record * record = g_registry.find(model_id);
         if (!record) {
             res.status = 404;
@@ -4026,6 +4235,23 @@ int main(int argc, char ** argv) {
             { "total_download_bytes", record->stored_install_plan->total_download_bytes },
             { "install_plan", record->stored_install_plan->to_json() },
         }).dump(), "application/json");
+
+        if (perf_on) {
+            char attrs[256];
+            std::snprintf(
+                    attrs,
+                    sizeof(attrs),
+                    "{\"operation_count\":%d,\"total_download_bytes\":%llu}",
+                    record->stored_install_plan->operation_count,
+                    static_cast<unsigned long long>(record->stored_install_plan->total_download_bytes));
+            perf_emit_install_instant(
+                    "INSTALL_PLAN_READY",
+                    "plan",
+                    nullptr,
+                    nullptr,
+                    record->stored_install_plan->total_download_bytes,
+                    attrs);
+        }
     });
 
     // GET /models/{model_id}/install-plan - Return stored install plan.

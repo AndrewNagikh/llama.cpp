@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama_perf_hooks.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1450,7 +1451,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
+            llama_perf_hook_ggml_begin("GGML_BACKEND_SYNC");
             ggml_backend_sched_synchronize(sched.get());
+            llama_perf_hook_ggml_end("GGML_BACKEND_SYNC");
         }
 
         n_reused++;
@@ -1460,11 +1463,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
-
+        llama_perf_hook_ggml_begin("GGML_GRAPH_BUILD");
         gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        llama_perf_hook_ggml_end("GGML_GRAPH_BUILD");
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -2611,7 +2612,9 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    llama_perf_hook_ggml_begin("GGML_GRAPH_EXECUTE");
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    llama_perf_hook_ggml_end("GGML_GRAPH_EXECUTE");
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }

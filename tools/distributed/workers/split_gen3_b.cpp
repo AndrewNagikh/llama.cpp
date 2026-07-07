@@ -9,9 +9,12 @@
 #include "../runtime_debug/runtime_debug.h"
 #include "../runtime_debug/trace_recorder.h"
 #include "../runtime_debug/hidden_transport.h"
+#include "../runtime_debug/perf_trace.h"
+#include "../runtime_debug/perf_ggml.h"
 
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -50,7 +53,7 @@ static bool forward_to_c(
         fprintf(stderr, "gen3_b: send hidden to C failed\n");
         return false;
     }
-    const int64_t t1 = ggml_time_us();
+    const int64_t send_us = ggml_time_us() - t0;
 
     split_gen3_c_resp cresp{};
     if (!split_gen3_recv_c_resp(bc_fd, cresp)) {
@@ -58,11 +61,21 @@ static bool forward_to_c(
         return false;
     }
 
+    if (perf_trace_enabled()) {
+        const int32_t tok_idx = (phase && std::strcmp(phase, "decode") == 0) ? debug_step : -1;
+        const int32_t payload_bytes = n_tokens * n_embd * (int32_t) sizeof(float);
+        perf_trace_set_component("middle");
+        perf_emit_hidden_transfer("middle", tok_idx, "bc", payload_bytes, 0, send_us, 0, 0);
+        if (phase && std::strcmp(phase, "decode") == 0) {
+            perf_emit_span("MIDDLE_SEND_END", perf_category::NETWORK, "middle", tok_idx, send_us, nullptr);
+        }
+    }
+
     resp.magic       = SPLIT_GEN_MAGIC;
     resp.token_id    = cresp.token_id;
     resp.n_vocab     = cresp.n_vocab;
     resp.ms_b_compute = ms_b;
-    resp.ms_bc_xfer   = (t1 - t0) / 1000.0;
+    resp.ms_bc_xfer   = send_us / 1000.0;
     resp.ms_c_compute = cresp.ms_compute;
     resp.ms_c_sample  = cresp.ms_sample;
     return true;
@@ -232,9 +245,13 @@ int main(int argc, char ** argv) {
     }
 
     bool normal_shutdown = false;
+    static int32_t queue_depth = 0;
     while (true) {
         split_ab_cmd cmd;
-        if (!split_ab_recv_cmd(ab_fd, cmd)) {
+        perf_trace_sched_queue_wait_begin();
+        const bool got_cmd = split_ab_recv_cmd(ab_fd, cmd);
+        perf_trace_sched_queue_wait_end();
+        if (!got_cmd) {
             fprintf(stderr, "gen3_b: recv cmd failed\n");
             break;
         }
@@ -259,12 +276,27 @@ int main(int argc, char ** argv) {
         }
 
         split_tcp_hidden_msg msg;
-        if (!split_ab_recv_hidden(ab_fd, msg)) {
+        perf_trace_sched_queue_wait_begin();
+        const bool got_hidden = split_ab_recv_hidden(ab_fd, msg);
+        perf_trace_sched_queue_wait_end();
+        if (!got_hidden) {
             fprintf(stderr, "gen3_b: recv hidden failed\n");
             break;
         }
 
+        perf_trace_refresh_context();
         const char * phase = msg.header.n_tokens > 1 ? "prefill" : "decode";
+        const int32_t tok_idx = (std::strcmp(phase, "decode") == 0) ? debug_step : -1;
+        const bool decode_step = (std::strcmp(phase, "decode") == 0);
+        if (decode_step && perf_trace_enabled()) {
+            perf_trace_set_component("middle");
+            perf_emit_instant("MIDDLE_RECEIVE", perf_category::NETWORK, "middle", tok_idx, nullptr);
+            perf_emit_queue_depth("middle", tok_idx, queue_depth);
+        }
+        if (decode_step) {
+            queue_depth = std::max(0, queue_depth - 1);
+        }
+
         hidden_transport_trace tr_recv = dist_debug_transport_recv(
                 debug_step, phase, "ab",
                 msg.header.n_tokens, msg.header.n_embd, msg.header.layer_end,
@@ -288,6 +320,8 @@ int main(int argc, char ** argv) {
         std::vector<float> out_hidden;
         split_gen_pipe_trace("middle", phase, "decode_enter",
                 msg.header.n_tokens, n_embd, msg.meta.pos_start, layer_start, layer_end);
+        perf_span compute_span("MIDDLE_COMPUTE_BEGIN", "MIDDLE_COMPUTE_END", perf_category::COMPUTE, "middle");
+        compute_span.set_token_idx(tok_idx);
         if (!run_b_layers(ctx, msg, n_embd, layer_start, layer_end, ms_b, out_hidden)) {
             fprintf(stderr, "gen3_b: decode failed\n");
             break;
@@ -326,6 +360,9 @@ int main(int argc, char ** argv) {
         }
         if (dbg && resp.token_id >= 0) {
             dbg->emit_token_selected(debug_step, phase, resp.token_id, msg.meta.pos_start, false);
+        }
+        if (decode_step) {
+            queue_depth++;
         }
         debug_step++;
     }

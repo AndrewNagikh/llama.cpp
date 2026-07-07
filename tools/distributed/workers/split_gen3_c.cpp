@@ -9,6 +9,8 @@
 #include "../runtime_debug/runtime_debug.h"
 #include "../runtime_debug/trace_recorder.h"
 #include "../runtime_debug/hidden_transport.h"
+#include "../runtime_debug/perf_trace.h"
+#include "../runtime_debug/perf_ggml.h"
 
 #include "llama-distributed.h"
 
@@ -264,9 +266,13 @@ int main(int argc, char ** argv) {
     }
 
     bool normal_shutdown = false;
+    static int32_t final_queue_depth = 0;
     while (true) {
         split_ab_cmd cmd;
-        if (!split_ab_recv_cmd(bc_fd, cmd)) {
+        perf_trace_sched_queue_wait_begin();
+        const bool got_cmd = split_ab_recv_cmd(bc_fd, cmd);
+        perf_trace_sched_queue_wait_end();
+        if (!got_cmd) {
             fprintf(stderr, "gen3_c: recv cmd failed\n");
             break;
         }
@@ -293,12 +299,27 @@ int main(int argc, char ** argv) {
         }
 
         split_tcp_hidden_msg msg;
-        if (!split_ab_recv_hidden(bc_fd, msg)) {
+        perf_trace_sched_queue_wait_begin();
+        const bool got_hidden = split_ab_recv_hidden(bc_fd, msg);
+        perf_trace_sched_queue_wait_end();
+        if (!got_hidden) {
             fprintf(stderr, "gen3_c: recv hidden failed\n");
             break;
         }
 
         const char * phase = msg.header.n_tokens > 1 ? "prefill" : "decode";
+        const int32_t tok_idx = (std::strcmp(phase, "decode") == 0) ? debug_step : -1;
+        const bool decode_step = (std::strcmp(phase, "decode") == 0);
+        perf_trace_refresh_context();
+        if (decode_step && perf_trace_enabled()) {
+            perf_trace_set_component("final");
+            perf_emit_instant("FINAL_RECEIVE", perf_category::NETWORK, "final", tok_idx, nullptr);
+            perf_emit_queue_depth("final", tok_idx, final_queue_depth);
+        }
+        if (decode_step) {
+            final_queue_depth = std::max(0, final_queue_depth - 1);
+        }
+
         hidden_transport_trace tr_recv = dist_debug_transport_recv(
                 debug_step, phase, "bc",
                 msg.header.n_tokens, msg.header.n_embd, msg.header.layer_end,
@@ -339,6 +360,8 @@ int main(int argc, char ** argv) {
                     msg.header.n_tokens, n_emb, msg.meta.pos_start, layer_start, effective_layer_end);
             const float * sample_hidden = out_hidden.data() + (size_t) sample_idx * (size_t) n_emb;
             const int64_t t1 = ggml_time_us();
+            perf_span sample_span("SAMPLER_BEGIN", "SAMPLER_END", perf_category::SAMPLING, "final");
+            sample_span.set_token_idx(tok_idx);
             if (output_http_port <= 0 ||
                     !output_service_sample_http(
                             output_http_host, output_http_port,
@@ -361,6 +384,8 @@ int main(int argc, char ** argv) {
             const int64_t t0 = ggml_time_us();
             split_gen_pipe_trace("final", phase, "decode_enter",
                     msg.header.n_tokens, msg.header.n_embd, msg.meta.pos_start, layer_start, n_layer);
+            perf_span compute_span("FINAL_COMPUTE_BEGIN", "FINAL_COMPUTE_END", perf_category::COMPUTE, "final");
+            compute_span.set_token_idx(tok_idx);
             if (split_gen_decode_hidden(ctx, msg.data.data(), msg.header.n_tokens, msg.header.n_embd,
                         msg.meta.pos_start, true) != 0) {
                 fprintf(stderr, "gen3_c: decode failed\n");
@@ -377,6 +402,8 @@ int main(int argc, char ** argv) {
             }
 
             const int64_t t1 = ggml_time_us();
+            perf_span sample_span("SAMPLER_BEGIN", "SAMPLER_END", perf_category::SAMPLING, "final");
+            sample_span.set_token_idx(tok_idx);
             bool used_argmax = false;
             const llama_token sampled = static_cast<llama_token>(
                     dist_debug_sample_or_argmax(smpl, ctx, -1, &used_argmax));
@@ -407,6 +434,9 @@ int main(int argc, char ** argv) {
         if (!split_gen3_send_c_resp(bc_fd, resp)) {
             fprintf(stderr, "gen3_c: send resp failed\n");
             break;
+        }
+        if (decode_step) {
+            final_queue_depth++;
         }
         debug_step++;
     }

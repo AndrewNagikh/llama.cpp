@@ -29,12 +29,17 @@ services:
       DIST_RUNTIME_LAYER_FIRST: ${DIST_RUNTIME_LAYER_FIRST:-1}
       DIST_GRAPH_TRACE: ${DIST_GRAPH_TRACE:-0}
       DIST_PIPE_TRACE: ${DIST_PIPE_TRACE:-0}
+      DIST_PERF_TRACE: ${DIST_PERF_TRACE:-0}
+      DIST_PERF_TRACE_GGML: ${DIST_PERF_TRACE_GGML:-0}
+      DIST_PERF_GPU_POLL_MS: ${DIST_PERF_GPU_POLL_MS:-100}
+      DIST_PERF_TRACE_DIR: /data/models/perf_trace
     env_file:
       - ../../../../.env
     ports:
       - "9000:9000"
     volumes:
       - dist-models:/data/models
+      - dist-perf-trace:/data/models/perf_trace
     networks:
       dist-net:
         aliases:
@@ -68,12 +73,17 @@ services:
       DIST_RUNTIME_LAYER_FIRST: ${DIST_RUNTIME_LAYER_FIRST:-1}
       DIST_GRAPH_TRACE: ${DIST_GRAPH_TRACE:-0}
       DIST_PIPE_TRACE: ${DIST_PIPE_TRACE:-0}
+      DIST_PERF_TRACE: ${DIST_PERF_TRACE:-0}
+      DIST_PERF_TRACE_GGML: ${DIST_PERF_TRACE_GGML:-0}
+      DIST_PERF_GPU_POLL_MS: ${DIST_PERF_GPU_POLL_MS:-100}
+      DIST_PERF_TRACE_DIR: /data/models/perf_trace
     env_file:
       - ../../../../.env
     ports:
       - "9001:9001"
     volumes:
       - dist-models-a:/data/models
+      - dist-perf-trace:/data/models/perf_trace
     networks:
       dist-net:
         aliases:
@@ -104,12 +114,17 @@ services:
       DIST_RUNTIME_LAYER_FIRST: ${DIST_RUNTIME_LAYER_FIRST:-1}
       DIST_GRAPH_TRACE: ${DIST_GRAPH_TRACE:-0}
       DIST_PIPE_TRACE: ${DIST_PIPE_TRACE:-0}
+      DIST_PERF_TRACE: ${DIST_PERF_TRACE:-0}
+      DIST_PERF_TRACE_GGML: ${DIST_PERF_TRACE_GGML:-0}
+      DIST_PERF_GPU_POLL_MS: ${DIST_PERF_GPU_POLL_MS:-100}
+      DIST_PERF_TRACE_DIR: /data/models/perf_trace
     env_file:
       - ../../../../.env
     ports:
       - "9002:9002"
     volumes:
       - dist-models-b:/data/models
+      - dist-perf-trace:/data/models/perf_trace
     networks:
       dist-net:
         aliases:
@@ -140,12 +155,17 @@ services:
       DIST_RUNTIME_LAYER_FIRST: ${DIST_RUNTIME_LAYER_FIRST:-1}
       DIST_GRAPH_TRACE: ${DIST_GRAPH_TRACE:-0}
       DIST_PIPE_TRACE: ${DIST_PIPE_TRACE:-0}
+      DIST_PERF_TRACE: ${DIST_PERF_TRACE:-0}
+      DIST_PERF_TRACE_GGML: ${DIST_PERF_TRACE_GGML:-0}
+      DIST_PERF_GPU_POLL_MS: ${DIST_PERF_GPU_POLL_MS:-100}
+      DIST_PERF_TRACE_DIR: /data/models/perf_trace
     env_file:
       - ../../../../.env
     ports:
       - "9003:9003"
     volumes:
       - dist-models-c:/data/models
+      - dist-perf-trace:/data/models/perf_trace
     networks:
       dist-net:
         aliases:
@@ -159,6 +179,7 @@ volumes:
   dist-models-a:
   dist-models-b:
   dist-models-c:
+  dist-perf-trace:
 
 networks:
   dist-net:

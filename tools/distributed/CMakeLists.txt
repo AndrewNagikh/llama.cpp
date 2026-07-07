@@ -17,6 +17,10 @@ set(DIST_RUNTIME_DEBUG_SOURCES
     runtime_debug/runtime_debug.cpp
     runtime_debug/tensor_stats.cpp
     runtime_debug/trace_recorder.cpp
+    runtime_debug/perf_trace.cpp
+    runtime_debug/perf_trace_export.cpp
+    runtime_debug/perf_gpu_sampler.cpp
+    runtime_debug/perf_ggml.cpp
     runtime_debug/debug_hooks.cpp
     runtime_debug/layer_trace.cpp
     runtime_debug/runtime_state.cpp
@@ -198,6 +202,8 @@ set(DIST_VERIFY_RUNTIME_SOURCES
 function(dist_link_platform_libs target)
     if (WIN32)
         target_link_libraries(${target} PRIVATE ws2_32)
+    elseif (CMAKE_SYSTEM_NAME MATCHES "Linux|Darwin")
+        target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
     endif()
 endfunction()
 
@@ -269,6 +275,10 @@ dist_add_exe(orchestrator orchestrator.cpp)
 target_sources(orchestrator PRIVATE
     ${DIST_PLATFORM_SOURCES}
     ${DIST_RUNTIME_SOURCES}
+    runtime_debug/perf_trace.cpp
+    runtime_debug/perf_trace_export.cpp
+    runtime_debug/perf_gpu_sampler.cpp
+    runtime_debug/perf_ggml.cpp
     dist_http_fetch.cpp
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
@@ -436,6 +446,14 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-runtime-config PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(test-runtime-config PRIVATE cxx_std_17)
     target_link_libraries(test-runtime-config PRIVATE Threads::Threads)
+
+    add_executable(test-perf-trace test-perf-trace.cpp runtime_debug/perf_trace.cpp runtime_debug/perf_gpu_sampler.cpp)
+    target_include_directories(test-perf-trace PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-perf-trace PRIVATE cxx_std_17)
+    target_link_libraries(test-perf-trace PRIVATE Threads::Threads)
+    if (CMAKE_SYSTEM_NAME MATCHES "Linux|Darwin")
+        target_link_libraries(test-perf-trace PRIVATE ${CMAKE_DL_LIBS})
+    endif()
 
     set(RUNTIME_DESCRIPTOR_TEST_SOURCES
         runtime/runtime_descriptor.cpp
