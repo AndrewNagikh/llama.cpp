@@ -24,6 +24,9 @@
 
 #include "ggml-backend.h"
 #include "transport/split_tcp_wire.h"
+#include "transport/split_wave_wire.h"
+#include "transport/runtime_protocol.h"
+#include "transport/runtime_entry_queue.h"
 #include "workers/split_gen_common.h"
 #include "runtime_debug/runtime_debug.h"
 #include "runtime_debug/perf_trace.h"
@@ -61,6 +64,8 @@ static std::string g_middle_worker_state_file;
 static std::string g_final_worker_state_file;
 static int g_pipeline_ctrl_port = 0;
 static int g_pipeline_layer_end = 0;
+static std::string g_pipeline_session_id;
+static uint32_t g_pipeline_protocol = DIST_RUNTIME_PROTOCOL_V1;
 
 struct node_runtime_stats {
     int configure_count        = 0;
@@ -1054,6 +1059,48 @@ static void stop_all_workers() {
     stop_worker_for_role(DIST_ROLE_FINAL);
 }
 
+static bool pipeline_connect_and_negotiate(int & ctrl_fd, std::string & err) {
+    ctrl_fd = split_tcp_connect_retry("127.0.0.1", g_pipeline_ctrl_port, 300, 100);
+    if (ctrl_fd < 0) {
+        err = "failed to connect to local pipeline ctrl port";
+        return false;
+    }
+
+    if (!runtime_protocol_v2_enabled()) {
+        g_pipeline_protocol = DIST_RUNTIME_PROTOCOL_V1;
+        runtime_protocol_log_v1_deprecation("node_agent");
+        return true;
+    }
+
+    uint32_t agreed     = DIST_RUNTIME_PROTOCOL_V1;
+    uint32_t server_max = DIST_RUNTIME_PROTOCOL_V1;
+    if (!runtime_protocol_negotiate(
+                ctrl_fd,
+                g_pipeline_session_id,
+                DIST_RUNTIME_PROTOCOL_V2,
+                agreed,
+                server_max)) {
+        err = "protocol negotiation failed";
+        split_tcp_close(ctrl_fd);
+        ctrl_fd = -1;
+        return false;
+    }
+
+    g_pipeline_protocol = agreed;
+    if (agreed < DIST_RUNTIME_PROTOCOL_V2) {
+        runtime_protocol_log_v1_deprecation("node_agent");
+    }
+    if (agreed >= DIST_RUNTIME_PROTOCOL_V2 &&
+            !runtime_protocol_exchange_v2_handshake(
+                    ctrl_fd, g_pipeline_session_id, agreed, server_max)) {
+        err = "protocol v2 handshake failed";
+        split_tcp_close(ctrl_fd);
+        ctrl_fd = -1;
+        return false;
+    }
+    return true;
+}
+
 static bool pipeline_gen3_send_recv(
         int ctrl_fd,
         split_gen_cmd cmd,
@@ -1131,9 +1178,8 @@ static bool run_local_pipeline_generate(
     g_runtime_stats.context_create_count++;
 
     const auto t_total0 = std::chrono::steady_clock::now();
-    int ctrl_fd = split_tcp_connect_retry("127.0.0.1", g_pipeline_ctrl_port, 300, 100);
-    if (ctrl_fd < 0) {
-        err = "failed to connect to local pipeline ctrl port";
+    int ctrl_fd = -1;
+    if (!pipeline_connect_and_negotiate(ctrl_fd, err)) {
         return false;
     }
 
@@ -1153,6 +1199,9 @@ static bool run_local_pipeline_generate(
         return false;
     }
 
+    const bool use_entry_queue = runtime_entry_queue_client_enabled(g_pipeline_protocol);
+    const bool client_pipeline = runtime_client_pipeline_client_enabled(g_pipeline_protocol);
+
     const auto t_prefill0 = std::chrono::steady_clock::now();
     perf_ttft_span prefill_span("TTFT_PREFILL", "entry");
     if (g_external_embedding) {
@@ -1163,10 +1212,26 @@ static bool run_local_pipeline_generate(
             split_tcp_close(ctrl_fd);
             return false;
         }
-        if (!pipeline_gen3_send_hidden_recv(
+        if (use_entry_queue) {
+            if (!pipeline_gen3_roundtrip_hidden_queued(
+                        ctrl_fd, SPLIT_GEN_CMD_PREFILL_HIDDEN, (int32_t) prompt_tokens.size(), n_embd,
+                        0, layer_end, hidden.data(), resp, false, nullptr)) {
+                err = "prefill hidden failed";
+                split_tcp_close(ctrl_fd);
+                return false;
+            }
+        } else if (!pipeline_gen3_send_hidden_recv(
                     ctrl_fd, SPLIT_GEN_CMD_PREFILL_HIDDEN, (int32_t) prompt_tokens.size(), n_embd,
                     0, layer_end, hidden.data(), resp)) {
             err = "prefill hidden failed";
+            split_tcp_close(ctrl_fd);
+            return false;
+        }
+    } else if (use_entry_queue) {
+        if (!pipeline_gen3_roundtrip_queued(
+                    ctrl_fd, SPLIT_GEN_CMD_PREFILL, (int32_t) prompt_tokens.size(), 0,
+                    layer_end, prompt_tokens.data(), resp, false, nullptr)) {
+            err = "prefill failed";
             split_tcp_close(ctrl_fd);
             return false;
         }
@@ -1216,6 +1281,7 @@ static bool run_local_pipeline_generate(
     int32_t cur = resp.token_id;
 
     const int n_prompt = (int) prompt_tokens.size();
+    bool pending_wave = false;
     for (int step = 1; step < max_new; ++step) {
         const int32_t pos = n_prompt + step - 1;
         if (perf_on && trace_id != nullptr && !trace_id->empty()) {
@@ -1224,24 +1290,117 @@ static bool run_local_pipeline_generate(
         if (dbg) {
             dbg->emit_step_begin(debug_step, "decode", cur, pos, 0);
         }
-        if (g_external_embedding) {
-            std::vector<float> hidden;
-            int32_t n_embd = 0;
-            if (!embedding_service_compute({ cur }, pos, hidden, n_embd, err)) {
+
+        if (!use_entry_queue) {
+            if (g_external_embedding) {
+                std::vector<float> hidden;
+                int32_t n_embd = 0;
+                if (!embedding_service_compute({ cur }, pos, hidden, n_embd, err)) {
+                    split_tcp_close(ctrl_fd);
+                    return false;
+                }
+                if (!pipeline_gen3_send_hidden_recv(
+                            ctrl_fd, SPLIT_GEN_CMD_DECODE_HIDDEN, 1, n_embd, pos, layer_end,
+                            hidden.data(), resp)) {
+                    err = "decode hidden failed at step " + std::to_string(step);
+                    split_tcp_close(ctrl_fd);
+                    return false;
+                }
+            } else if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur, resp)) {
+                err = "decode failed at step " + std::to_string(step);
                 split_tcp_close(ctrl_fd);
                 return false;
             }
-            if (!pipeline_gen3_send_hidden_recv(
-                        ctrl_fd, SPLIT_GEN_CMD_DECODE_HIDDEN, 1, n_embd, pos, layer_end,
-                        hidden.data(), resp)) {
-                err = "decode hidden failed at step " + std::to_string(step);
+        } else {
+            if (!pending_wave) {
+                if (g_external_embedding) {
+                    std::vector<float> hidden;
+                    int32_t n_embd = 0;
+                    if (!embedding_service_compute({ cur }, pos, hidden, n_embd, err)) {
+                        split_tcp_close(ctrl_fd);
+                        return false;
+                    }
+                    if (!pipeline_send_gen_hidden_req(
+                                ctrl_fd, SPLIT_GEN_CMD_DECODE_HIDDEN, 1, n_embd, pos, layer_end,
+                                hidden.data())) {
+                        err = "decode hidden send failed at step " + std::to_string(step);
+                        split_tcp_close(ctrl_fd);
+                        return false;
+                    }
+                } else if (!pipeline_send_gen_req(
+                                   ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur)) {
+                    err = "decode send failed at step " + std::to_string(step);
+                    split_tcp_close(ctrl_fd);
+                    return false;
+                }
+                int32_t depth = 0;
+                int32_t wave_id = -1;
+                if (!pipeline_recv_queue_ack(ctrl_fd, depth, wave_id)) {
+                    err = "decode queue ack failed at step " + std::to_string(step);
+                    split_tcp_close(ctrl_fd);
+                    return false;
+                }
+            }
+
+            int32_t token_id = -1;
+            int32_t ready_wave = -1;
+            if (!pipeline_recv_token_ready(ctrl_fd, token_id, ready_wave)) {
+                err = "decode token ready failed at step " + std::to_string(step);
                 split_tcp_close(ctrl_fd);
                 return false;
             }
-        } else if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur, resp)) {
-            err = "decode failed at step " + std::to_string(step);
-            split_tcp_close(ctrl_fd);
-            return false;
+            cur = token_id;
+            resp.token_id = token_id;
+            pending_wave = false;
+
+            if (client_pipeline && step + 1 < max_new) {
+                const int32_t next_pos = n_prompt + step;
+                if (g_external_embedding) {
+                    std::vector<float> next_hidden;
+                    int32_t next_n_embd = 0;
+                    if (!embedding_service_compute({ cur }, next_pos, next_hidden, next_n_embd, err)) {
+                        split_tcp_close(ctrl_fd);
+                        return false;
+                    }
+                    if (!pipeline_send_gen_hidden_req(
+                                ctrl_fd, SPLIT_GEN_CMD_DECODE_HIDDEN, 1, next_n_embd, next_pos,
+                                layer_end, next_hidden.data())) {
+                        err = "decode hidden pipeline send failed at step " + std::to_string(step);
+                        split_tcp_close(ctrl_fd);
+                        return false;
+                    }
+                } else if (!pipeline_send_gen_req(
+                                   ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, next_pos, layer_end, &cur)) {
+                    err = "decode pipeline send failed at step " + std::to_string(step);
+                    split_tcp_close(ctrl_fd);
+                    return false;
+                }
+                int32_t depth2 = 0;
+                int32_t wave2 = -1;
+                if (!pipeline_recv_queue_ack(ctrl_fd, depth2, wave2)) {
+                    err = "decode pipeline ack failed at step " + std::to_string(step);
+                    split_tcp_close(ctrl_fd);
+                    return false;
+                }
+                pending_wave = true;
+            }
+
+            if (client_pipeline && step + 1 >= max_new) {
+                if (!pipeline_send_drain_pending(ctrl_fd, layer_end)) {
+                    err = "decode drain failed at step " + std::to_string(step);
+                    split_tcp_close(ctrl_fd);
+                    return false;
+                }
+            }
+
+            if (!pipeline_recv_gen_complete(ctrl_fd, resp)) {
+                err = "decode complete failed at step " + std::to_string(step);
+                split_tcp_close(ctrl_fd);
+                return false;
+            }
+            if (resp.token_id < 0) {
+                resp.token_id = cur;
+            }
         }
         if (resp.token_id < 0) {
             err = "pipeline error at step " + std::to_string(step);
@@ -2296,6 +2455,8 @@ int main(int argc, char ** argv) {
         if (cfg.role == DIST_ROLE_ENTRY) {
             g_pipeline_ctrl_port = cfg.ctrl_port;
             g_pipeline_layer_end   = cfg.layer_end;
+            g_pipeline_session_id  = cfg.session_id;
+            g_pipeline_protocol    = DIST_RUNTIME_PROTOCOL_V1;
             if (worker_model == LAYER_STORE_MODEL_SENTINEL) {
                 g_entry_worker_gguf.clear();
                 g_entry_model_id = cfg.model_id;

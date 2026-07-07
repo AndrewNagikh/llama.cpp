@@ -15,6 +15,7 @@ int main() {
     perf_trace_set_node_id("test-node");
     perf_trace_set_component("entry");
     perf_trace_begin_generate("trace-000001", "decode");
+    perf_trace_set_context("trace-000001", "decode", 0, 1);
     perf_emit_span("ENTRY_COMPUTE_END", perf_category::COMPUTE, "entry", 0, 5000, nullptr);
     perf_trace_end_generate();
 

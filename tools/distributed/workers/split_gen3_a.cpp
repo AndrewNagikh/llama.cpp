@@ -4,17 +4,24 @@
 #include "ggml.h"
 #include "split_gen_model_load.h"
 #include "split_gen_common.h"
-#include "../transport/split_tcp_wire.h"
 #include "../runtime_debug/debug_hooks.h"
 #include "../runtime_debug/runtime_debug.h"
 #include "../runtime_debug/trace_recorder.h"
 #include "../runtime_debug/hidden_transport.h"
+#include "../transport/split_tcp_wire.h"
+#include "../transport/runtime_protocol.h"
 #include "../runtime_debug/perf_trace.h"
 #include "../runtime_debug/perf_ggml.h"
+#include "wave_inbound_queue.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 static void usage(const char * prog) {
@@ -64,6 +71,7 @@ static bool forward_to_peer(
         split_gen3_a_resp & resp,
         std::vector<float> & logits_out) {
     perf_trace_refresh_context();
+    perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
     const int32_t tok_idx = (phase && std::strcmp(phase, "decode") == 0) ? debug_step : -1;
 
     std::vector<float> hidden_buf;
@@ -134,6 +142,538 @@ static bool forward_to_peer(
     resp.ms_c_compute = mid.ms_c_compute;
     resp.ms_c_sample  = mid.ms_c_sample;
     return true;
+}
+
+static bool send_hidden_to_b_only(
+        int peer_fd,
+        llama_context * ctx,
+        int32_t n_tokens,
+        int32_t n_embd,
+        int32_t layer_end,
+        int32_t pos_start,
+        bool include_logits,
+        int32_t debug_step,
+        const char * phase,
+        trace_recorder * dbg,
+        double ms_a,
+        double & ms_ab_xfer_out) {
+    perf_trace_refresh_context();
+    perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
+    const int32_t tok_idx = (phase && std::strcmp(phase, "decode") == 0) ? debug_step : -1;
+
+    std::vector<float> hidden_buf;
+    const int64_t t_ser0 = ggml_time_us();
+    if (!gather_stage_hidden(ctx, n_tokens, n_embd, hidden_buf)) {
+        fprintf(stderr, "gen3_a: missing hidden state\n");
+        return false;
+    }
+    const float * hidden = hidden_buf.data();
+    const int64_t serialize_us = ggml_time_us() - t_ser0;
+    const int32_t payload_bytes = n_tokens * n_embd * (int32_t) sizeof(float);
+
+    hidden_transport_trace tr_send = dist_debug_transport_send(
+            debug_step, phase, "ab", n_tokens, n_embd, layer_end, pos_start, hidden, 0.0);
+    if (dbg) {
+        dbg->emit_transport(tr_send);
+    }
+
+    const int64_t t0 = ggml_time_us();
+    split_gen_pipe_trace("entry", phase, "send_hidden_enter", n_tokens, n_embd, pos_start, -1, layer_end);
+    if (!split_ab_send_hidden(peer_fd, n_tokens, n_embd, layer_end, pos_start,
+            include_logits ? 1 : 0, hidden)) {
+        fprintf(stderr, "gen3_a: send hidden failed\n");
+        return false;
+    }
+    const int64_t send_us = ggml_time_us() - t0;
+    ms_ab_xfer_out = send_us / 1000.0;
+    split_gen_pipe_trace("entry", phase, "send_hidden_exit", n_tokens, n_embd, pos_start, -1, layer_end);
+
+    if (perf_trace_enabled()) {
+        perf_trace_set_component("entry");
+        perf_emit_hidden_transfer("entry", tok_idx, "ab", payload_bytes, serialize_us, send_us, 0, 0);
+        perf_emit_span("ENTRY_SEND_END", perf_category::NETWORK, "entry", tok_idx, send_us, nullptr);
+    }
+    (void) ms_a;
+    return true;
+}
+
+struct entry_ab_pending {
+    split_gen_a_req req{};
+    int32_t         wave_id       = -1;
+    int32_t         debug_step    = 0;
+    bool            decode_step   = false;
+    bool            include_logits = false;
+    double          ms_a          = 0.0;
+    double          ms_ab_xfer    = 0.0;
+};
+
+struct entry_stage_state {
+    llama_context * ctx          = nullptr;
+    int             b_fd         = -1;
+    int             ctrl_fd      = -1;
+    int             layer_start  = 0;
+    int             layer_end    = 0;
+    int             n_embd       = 0;
+    int             n_vocab      = 0;
+    bool            next_is_final = false;
+    trace_recorder * dbg         = nullptr;
+    int32_t *       debug_step   = nullptr;
+    int32_t *       entry_queue_depth = nullptr;
+};
+
+static bool entry_process_work_item(
+        const entry_stage_state & st,
+        wave_work_item & item,
+        const bool send_early_token,
+        std::mutex * ctrl_mu,
+        const bool pipeline_ab,
+        std::mutex * ab_mu,
+        std::deque<entry_ab_pending> * ab_pending) {
+    split_gen_a_req & req = item.req;
+    std::vector<int32_t> & tokens_i32 = item.tokens;
+    std::vector<float> & hidden_in = item.hidden;
+    const int32_t hidden_n_embd = item.hidden_n_embd;
+    const int ctrl_fd = st.ctrl_fd;
+
+    const int64_t t0 = ggml_time_us();
+    int decode_rc = 0;
+    const char * phase = (req.cmd == SPLIT_GEN_CMD_PREFILL ||
+                          req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) ? "prefill" : "decode";
+    const int32_t in_tok = tokens_i32.empty() ? -1 : tokens_i32[0];
+    const int32_t wave_id = item.wave_id >= 0
+            ? item.wave_id
+            : perf_trace_wave_id_from_step(phase, st.debug_step ? *st.debug_step : 0);
+
+    if (st.dbg) {
+        st.dbg->emit_step_begin(st.debug_step ? *st.debug_step : 0, phase, in_tok, req.pos_start, 0);
+        dist_debug_log_position(st.dbg, st.debug_step ? *st.debug_step : 0, phase, st.ctx, req.pos_start,
+                req.cmd == SPLIT_GEN_CMD_PREFILL || req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN
+                        ? req.n_tokens : 1,
+                1);
+    }
+
+    split_gen_pipe_trace("entry", phase, "decode_enter", req.n_tokens, hidden_n_embd > 0 ? hidden_n_embd : st.n_embd,
+            req.pos_start, st.layer_start, st.layer_end);
+    const int32_t tok_idx = (phase && std::strcmp(phase, "decode") == 0 && st.debug_step)
+            ? *st.debug_step : -1;
+    const bool decode_step = (phase && std::strcmp(phase, "decode") == 0);
+    if (decode_step && perf_trace_enabled()) {
+        perf_trace_refresh_context();
+        perf_trace_set_wave_id(wave_id);
+        perf_trace_set_component("entry");
+        perf_emit_instant("ENTRY_RECEIVE", perf_category::NETWORK, "entry", tok_idx, nullptr);
+        if (st.entry_queue_depth) {
+            perf_emit_queue_depth("entry", tok_idx, *st.entry_queue_depth);
+            *st.entry_queue_depth = std::max(0, *st.entry_queue_depth - 1);
+        }
+    }
+    perf_span compute_span("ENTRY_COMPUTE_BEGIN", "ENTRY_COMPUTE_END", perf_category::COMPUTE, "entry");
+    if (perf_trace_enabled()) {
+        perf_trace_set_wave_id(wave_id);
+    }
+    compute_span.set_token_idx(tok_idx);
+    if (req.cmd == SPLIT_GEN_CMD_PREFILL) {
+        if (st.layer_start > 0) {
+            fprintf(stderr, "gen3_a: token prefill requires layer_start=0\n");
+            return false;
+        }
+        std::vector<llama_token> tokens((size_t) req.n_tokens);
+        for (int32_t i = 0; i < req.n_tokens; ++i) {
+            tokens[i] = (llama_token) tokens_i32[i];
+        }
+        decode_rc = split_gen_decode_tokens(st.ctx, tokens, req.pos_start, true);
+    } else if (req.cmd == SPLIT_GEN_CMD_DECODE) {
+        if (st.layer_start > 0) {
+            fprintf(stderr, "gen3_a: token decode requires layer_start=0\n");
+            return false;
+        }
+        decode_rc = split_gen_decode_one(st.ctx, (llama_token) tokens_i32[0], req.pos_start);
+    } else if (req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) {
+        const int32_t n_emb = hidden_n_embd > 0 ? hidden_n_embd : st.n_embd;
+        decode_rc = split_gen_decode_hidden(
+                st.ctx, hidden_in.data(), req.n_tokens, n_emb, req.pos_start, true, st.layer_start > 0);
+    } else if (req.cmd == SPLIT_GEN_CMD_DECODE_HIDDEN) {
+        const int32_t n_emb = hidden_n_embd > 0 ? hidden_n_embd : st.n_embd;
+        decode_rc = split_gen_decode_hidden(
+                st.ctx, hidden_in.data(), 1, n_emb, req.pos_start, true, st.layer_start > 0);
+    } else {
+        fprintf(stderr, "gen3_a: unknown cmd %u\n", req.cmd);
+        return false;
+    }
+    split_gen_pipe_trace("entry", phase, "decode_exit", req.n_tokens, hidden_n_embd > 0 ? hidden_n_embd : st.n_embd,
+            req.pos_start, st.layer_start, st.layer_end);
+
+    const double ms_a = (ggml_time_us() - t0) / 1000.0;
+    if (decode_rc != 0) {
+        fprintf(stderr, "gen3_a: decode failed cmd=%u\n", req.cmd);
+        return false;
+    }
+
+    const int32_t n_out = (req.cmd == SPLIT_GEN_CMD_PREFILL ||
+                           req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) ? req.n_tokens : 1;
+    const int32_t le = req.layer_end > 0 ? req.layer_end : st.layer_end;
+
+    if (st.dbg) {
+        dist_debug_log_kv(st.dbg, st.debug_step ? *st.debug_step : 0, phase, st.ctx, 0);
+        dist_debug_log_hidden_out(st.dbg, st.debug_step ? *st.debug_step : 0, phase, st.ctx, n_out, st.n_embd, "entry");
+        std::vector<int32_t> pos_buf((size_t) n_out);
+        std::vector<int32_t> tok_buf((size_t) n_out);
+        for (int32_t i = 0; i < n_out; ++i) {
+            pos_buf[(size_t) i] = req.pos_start + i;
+            tok_buf[(size_t) i] = (i < (int32_t) tokens_i32.size()) ? tokens_i32[(size_t) i] : -1;
+        }
+        dist_debug_log_runtime_state(
+                st.dbg, st.debug_step ? *st.debug_step : 0, phase, "entry", st.ctx, n_out,
+                tok_buf.data(), pos_buf.data(), -1, in_tok);
+    }
+
+    split_gen3_a_resp resp{};
+    std::vector<float> logits;
+
+    if (pipeline_ab && ab_mu != nullptr && ab_pending != nullptr) {
+        entry_ab_pending pending;
+        pending.req            = req;
+        pending.wave_id        = wave_id;
+        pending.debug_step     = st.debug_step ? *st.debug_step : 0;
+        pending.decode_step    = decode_step;
+        pending.include_logits = req.include_logits != 0;
+        pending.ms_a           = ms_a;
+        pending.ms_ab_xfer     = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(*ab_mu);
+            ab_pending->push_back(pending);
+        }
+        double ms_ab_xfer = 0.0;
+        if (!send_hidden_to_b_only(st.b_fd, st.ctx, n_out, st.n_embd, le, req.pos_start,
+                    req.include_logits != 0, st.debug_step ? *st.debug_step : 0, phase, st.dbg,
+                    ms_a, ms_ab_xfer)) {
+            std::lock_guard<std::mutex> lock(*ab_mu);
+            if (!ab_pending->empty()) {
+                ab_pending->pop_back();
+            }
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(*ab_mu);
+            if (!ab_pending->empty()) {
+                ab_pending->back().ms_ab_xfer = ms_ab_xfer;
+            }
+        }
+    } else {
+        if (!forward_to_peer(st.b_fd, st.ctx, n_out, st.n_embd, le, req.pos_start,
+                req.include_logits != 0, st.n_vocab, ms_a, st.next_is_final,
+                st.debug_step ? *st.debug_step : 0, phase, st.dbg, resp, logits)) {
+            return false;
+        }
+
+        if (send_early_token && ctrl_mu != nullptr) {
+            std::lock_guard<std::mutex> lock(*ctrl_mu);
+            if (!split_gen_send_token_ready(ctrl_fd, resp.token_id, req.pos_start, wave_id)) {
+                return false;
+            }
+        }
+
+        if (ctrl_mu != nullptr) {
+            std::lock_guard<std::mutex> lock(*ctrl_mu);
+            if (!split_gen3_send_a_resp(ctrl_fd, resp, logits.empty() ? nullptr : logits.data(), st.n_vocab)) {
+                fprintf(stderr, "gen3_a: send resp failed\n");
+                return false;
+            }
+        } else if (!split_gen3_send_a_resp(ctrl_fd, resp, logits.empty() ? nullptr : logits.data(), st.n_vocab)) {
+            fprintf(stderr, "gen3_a: send resp failed\n");
+            return false;
+        }
+
+        if (st.dbg && resp.token_id >= 0) {
+            st.dbg->emit_token_selected(st.debug_step ? *st.debug_step : 0, phase, resp.token_id, req.pos_start, false);
+        }
+    }
+
+    if (decode_step && st.entry_queue_depth) {
+        (*st.entry_queue_depth)++;
+    }
+    if (st.debug_step) {
+        (*st.debug_step)++;
+    }
+    return true;
+}
+
+static bool entry_handle_control_cmd(
+        const entry_stage_state & st,
+        const split_gen_a_req & req,
+        int32_t & debug_step,
+        bool & normal_shutdown) {
+    const int ctrl_fd = st.ctrl_fd;
+    const int b_fd = st.b_fd;
+
+    if (req.cmd == SPLIT_GEN_CMD_PROTO_NEGOTIATE) {
+        return runtime_protocol_handle_negotiate_server(ctrl_fd, req);
+    }
+    if (req.cmd == SPLIT_GEN_CMD_SHUTDOWN) {
+        split_ab_send_shutdown(b_fd);
+        split_gen3_a_resp resp{};
+        resp.magic   = SPLIT_GEN_MAGIC;
+        resp.version = SPLIT_GEN3_VERSION;
+        split_gen3_send_a_resp(ctrl_fd, resp, nullptr, 0);
+        normal_shutdown = true;
+        return true;
+    }
+    if (req.cmd == SPLIT_GEN_CMD_RESET) {
+        llama_memory_clear(llama_get_memory(st.ctx), true);
+        llama_clear_hidden_state(st.ctx);
+        debug_step = 0;
+        if (st.dbg) {
+            st.dbg->emit_step_begin(0, "reset", -1, 0, 0);
+        }
+        split_ab_send_reset(b_fd);
+        split_gen3_a_resp resp{};
+        resp.magic    = SPLIT_GEN_MAGIC;
+        resp.version  = SPLIT_GEN3_VERSION;
+        resp.token_id = -1;
+        split_gen3_send_a_resp(ctrl_fd, resp, nullptr, 0);
+        return true;
+    }
+    return false;
+}
+
+static bool entry_run_queued_session(
+        entry_stage_state st,
+        wave_inbound_queue & queue,
+        int32_t & debug_step,
+        bool & normal_shutdown,
+        bool & pipe_failed) {
+    std::mutex ctrl_mu;
+    std::mutex ab_mu;
+    std::deque<entry_ab_pending> ab_pending;
+    std::deque<split_gen3_a_resp> deferred_completes;
+    std::mutex deferred_mu;
+    std::atomic<bool> stop{ false };
+    std::atomic<int> processor_active{ 0 };
+    int32_t entry_queue_depth = 0;
+    st.debug_step = &debug_step;
+    st.entry_queue_depth = &entry_queue_depth;
+    const bool pipeline_ab = runtime_stage_queue_enabled();
+    const bool defer_complete = pipeline_ab && runtime_client_pipeline_enabled();
+
+    auto flush_deferred_complete = [&]() {
+        split_gen3_a_resp deferred{};
+        {
+            std::lock_guard<std::mutex> dlock(deferred_mu);
+            if (deferred_completes.empty()) {
+                return;
+            }
+            deferred = deferred_completes.front();
+            deferred_completes.pop_front();
+        }
+        std::lock_guard<std::mutex> lock(ctrl_mu);
+        if (!split_gen3_send_a_resp(st.ctrl_fd, deferred, nullptr, st.n_vocab)) {
+            fprintf(stderr, "gen3_a: deferred complete failed\n");
+            pipe_failed = true;
+            stop.store(true);
+        }
+    };
+
+    std::thread ab_responder;
+    if (pipeline_ab) {
+        ab_responder = std::thread([&] {
+            while (!stop.load() || !ab_pending.empty()) {
+                entry_ab_pending pending;
+                {
+                    std::unique_lock<std::mutex> lock(ab_mu);
+                    while (!stop.load() && ab_pending.empty()) {
+                        lock.unlock();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        lock.lock();
+                    }
+                    if (ab_pending.empty()) {
+                        break;
+                    }
+                    pending = ab_pending.front();
+                    ab_pending.pop_front();
+                }
+
+                split_gen3_a_resp resp{};
+                resp.magic          = SPLIT_GEN_MAGIC;
+                resp.version        = SPLIT_GEN3_VERSION;
+                resp.include_logits = 0;
+                resp.n_vocab        = st.n_vocab;
+
+                if (st.next_is_final) {
+                    split_gen3_c_resp cresp{};
+                    if (!split_gen3_recv_c_resp(st.b_fd, cresp)) {
+                        if (!stop.load()) {
+                            pipe_failed = true;
+                        }
+                        stop.store(true);
+                        break;
+                    }
+                    resp.token_id     = cresp.token_id;
+                    resp.ms_a_compute = pending.ms_a;
+                    resp.ms_ab_xfer   = pending.ms_ab_xfer;
+                    resp.ms_b_compute = 0.0;
+                    resp.ms_bc_xfer   = 0.0;
+                    resp.ms_c_compute = cresp.ms_compute;
+                    resp.ms_c_sample  = cresp.ms_sample;
+                } else {
+                    split_gen3_mid_resp mid{};
+                    if (!split_gen3_recv_mid_resp(st.b_fd, mid)) {
+                        if (!stop.load()) {
+                            pipe_failed = true;
+                        }
+                        stop.store(true);
+                        break;
+                    }
+                    resp.token_id     = mid.token_id;
+                    resp.ms_a_compute = pending.ms_a;
+                    resp.ms_ab_xfer   = pending.ms_ab_xfer;
+                    resp.ms_b_compute = mid.ms_b_compute;
+                    resp.ms_bc_xfer   = mid.ms_bc_xfer;
+                    resp.ms_c_compute = mid.ms_c_compute;
+                    resp.ms_c_sample  = mid.ms_c_sample;
+                }
+
+                const char * phase = pending.decode_step ? "decode" : "prefill";
+                if (st.dbg) {
+                    dist_debug_log_runtime_state(
+                            st.dbg, pending.debug_step, phase, "entry", st.ctx, 1,
+                            nullptr, nullptr, -1, resp.token_id);
+                    if (resp.token_id >= 0) {
+                        st.dbg->emit_token_selected(
+                                pending.debug_step, phase, resp.token_id, pending.req.pos_start, false);
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(ctrl_mu);
+                    if (!split_gen_send_token_ready(
+                                st.ctrl_fd, resp.token_id, pending.req.pos_start, pending.wave_id)) {
+                        pipe_failed = true;
+                        stop.store(true);
+                        break;
+                    }
+                    std::lock_guard<std::mutex> dlock(deferred_mu);
+                    deferred_completes.push_back(resp);
+                }
+                if (!defer_complete || !pending.decode_step) {
+                    flush_deferred_complete();
+                }
+            }
+        });
+    }
+
+    std::thread receiver([&] {
+        while (!stop.load()) {
+            split_gen_a_req req{};
+            std::vector<int32_t> tokens_i32;
+            std::vector<float> hidden_in;
+            int32_t hidden_n_embd = 0;
+            perf_trace_sched_queue_wait_begin();
+            const bool got_req = split_gen_recv_req(st.ctrl_fd, req, tokens_i32, &hidden_in, &hidden_n_embd);
+            perf_trace_sched_queue_wait_end();
+            if (!got_req) {
+                stop.store(true);
+                break;
+            }
+
+            if (req.cmd == SPLIT_GEN_CMD_PROTO_NEGOTIATE ||
+                    req.cmd == SPLIT_GEN_CMD_SHUTDOWN ||
+                    req.cmd == SPLIT_GEN_CMD_RESET) {
+                int32_t local_step = debug_step;
+                bool shutdown = false;
+                if (!entry_handle_control_cmd(st, req, local_step, shutdown)) {
+                    stop.store(true);
+                    break;
+                }
+                debug_step = local_step;
+                if (shutdown) {
+                    normal_shutdown = true;
+                    stop.store(true);
+                    break;
+                }
+                continue;
+            }
+
+            if (req.cmd == SPLIT_GEN_CMD_DRAIN_PENDING) {
+                flush_deferred_complete();
+                continue;
+            }
+
+            const char * phase = (req.cmd == SPLIT_GEN_CMD_PREFILL ||
+                                  req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) ? "prefill" : "decode";
+            wave_work_item item;
+            item.req           = req;
+            item.tokens        = std::move(tokens_i32);
+            item.hidden        = std::move(hidden_in);
+            item.hidden_n_embd = hidden_n_embd;
+            item.wave_id       = perf_trace_wave_id_from_step(phase, debug_step);
+            const int32_t queued_wave_id = item.wave_id;
+
+            const int32_t ack_depth = queue.observable_depth(true) + 1;
+            {
+                std::lock_guard<std::mutex> lock(ctrl_mu);
+                if (!split_gen_send_queue_ack(st.ctrl_fd, ack_depth, queued_wave_id, 0)) {
+                    stop.store(true);
+                    break;
+                }
+            }
+            if (defer_complete) {
+                flush_deferred_complete();
+            }
+
+            queue.push(std::move(item));
+            entry_queue_depth = ack_depth;
+            if (perf_trace_enabled()) {
+                perf_trace_set_wave_id(queued_wave_id);
+                perf_emit_instant("WAVE_QUEUED", perf_category::WAIT, "entry", -1, nullptr);
+                perf_emit_queue_depth("entry", -1, entry_queue_depth);
+            }
+        }
+    });
+
+    while (!stop.load() || queue.depth() > 0) {
+        wave_work_item item;
+        if (!queue.try_pop(item)) {
+            if (stop.load()) {
+                break;
+            }
+            queue.pop(item);
+        }
+        processor_active.fetch_add(1);
+        if (!entry_process_work_item(
+                    st, item, true, &ctrl_mu, pipeline_ab,
+                    pipeline_ab ? &ab_mu : nullptr,
+                    pipeline_ab ? &ab_pending : nullptr)) {
+            pipe_failed = true;
+            stop.store(true);
+            processor_active.fetch_sub(1);
+            break;
+        }
+        processor_active.fetch_sub(1);
+        if (pipeline_ab && queue.depth() == 0 && processor_active.load() == 0) {
+            flush_deferred_complete();
+        }
+    }
+
+    while (pipeline_ab) {
+        bool has_deferred = false;
+        {
+            std::lock_guard<std::mutex> dlock(deferred_mu);
+            has_deferred = !deferred_completes.empty();
+        }
+        if (!has_deferred) {
+            break;
+        }
+        flush_deferred_complete();
+    }
+
+    stop.store(true);
+    if (receiver.joinable()) {
+        receiver.join();
+    }
+    if (ab_responder.joinable()) {
+        ab_responder.join();
+    }
+    return !pipe_failed;
 }
 
 int main(int argc, char ** argv) {
@@ -250,6 +790,33 @@ int main(int argc, char ** argv) {
             continue;
         }
 
+        int32_t entry_queue_depth_sync = 0;
+        entry_stage_state st{
+            ctx, b_fd, ctrl_fd, layer_start, layer_end, n_embd, n_vocab,
+            next_is_final, dbg, &debug_step, &entry_queue_depth_sync
+        };
+
+        if (runtime_entry_queue_enabled()) {
+            wave_inbound_queue queue(runtime_entry_queue_max_depth());
+            if (!entry_run_queued_session(st, queue, debug_step, normal_shutdown, pipe_failed)) {
+                split_tcp_close(ctrl_fd);
+            } else {
+                split_tcp_close(ctrl_fd);
+            }
+            if (normal_shutdown) {
+                split_tcp_close(b_fd);
+                split_tcp_close(listen_fd);
+                llama_free(ctx);
+                llama_model_free(model);
+                split_gen_write_ready_state(ready_file, "STOPPED");
+                return 0;
+            }
+            if (pipe_failed) {
+                break;
+            }
+            continue;
+        }
+
         while (true) {
         split_gen_a_req req{};
         std::vector<int32_t> tokens_i32;
@@ -264,150 +831,49 @@ int main(int argc, char ** argv) {
             break;
         }
 
-        if (req.cmd == SPLIT_GEN_CMD_SHUTDOWN) {
-            split_ab_send_shutdown(b_fd);
-            split_gen3_a_resp resp{};
-            resp.magic   = SPLIT_GEN_MAGIC;
-            resp.version = SPLIT_GEN3_VERSION;
-            split_gen3_send_a_resp(ctrl_fd, resp, nullptr, 0);
-            split_tcp_close(ctrl_fd);
-            split_tcp_close(b_fd);
-            split_tcp_close(listen_fd);
-
-            llama_free(ctx);
-            llama_model_free(model);
-            split_gen_write_ready_state(ready_file, "STOPPED");
-            return 0;
-        }
-
-        if (req.cmd == SPLIT_GEN_CMD_RESET) {
-            llama_memory_clear(llama_get_memory(ctx), true);
-            llama_clear_hidden_state(ctx);
-            debug_step = 0;
-            if (dbg) {
-                dbg->emit_step_begin(0, "reset", -1, 0, 0);
+        if (req.cmd == SPLIT_GEN_CMD_PROTO_NEGOTIATE ||
+                req.cmd == SPLIT_GEN_CMD_SHUTDOWN ||
+                req.cmd == SPLIT_GEN_CMD_RESET) {
+            if (req.cmd == SPLIT_GEN_CMD_SHUTDOWN) {
+                if (!entry_handle_control_cmd({
+                        ctx, b_fd, ctrl_fd, layer_start, layer_end, n_embd, n_vocab,
+                        next_is_final, dbg, &debug_step, &entry_queue_depth_sync
+                    }, req, debug_step, normal_shutdown)) {
+                    split_tcp_close(ctrl_fd);
+                    break;
+                }
+                split_tcp_close(ctrl_fd);
+                split_tcp_close(b_fd);
+                split_tcp_close(listen_fd);
+                llama_free(ctx);
+                llama_model_free(model);
+                split_gen_write_ready_state(ready_file, "STOPPED");
+                return 0;
             }
-            split_ab_send_reset(b_fd);
-            split_gen3_a_resp resp{};
-            resp.magic   = SPLIT_GEN_MAGIC;
-            resp.version = SPLIT_GEN3_VERSION;
-            resp.token_id = -1;
-            split_gen3_send_a_resp(ctrl_fd, resp, nullptr, 0);
+            if (!entry_handle_control_cmd({
+                    ctx, b_fd, ctrl_fd, layer_start, layer_end, n_embd, n_vocab,
+                    next_is_final, dbg, &debug_step, &entry_queue_depth_sync
+                }, req, debug_step, normal_shutdown)) {
+                split_tcp_close(ctrl_fd);
+                break;
+            }
             continue;
         }
 
-        const int64_t t0 = ggml_time_us();
-        int decode_rc = 0;
+        wave_work_item item;
+        item.req           = req;
+        item.tokens        = std::move(tokens_i32);
+        item.hidden        = std::move(hidden_in);
+        item.hidden_n_embd = hidden_n_embd;
         const char * phase = (req.cmd == SPLIT_GEN_CMD_PREFILL ||
                               req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) ? "prefill" : "decode";
-        const int32_t in_tok = tokens_i32.empty() ? -1 : tokens_i32[0];
+        item.wave_id = perf_trace_wave_id_from_step(phase, debug_step);
 
-        if (dbg) {
-            dbg->emit_step_begin(debug_step, phase, in_tok, req.pos_start, 0);
-            dist_debug_log_position(dbg, debug_step, phase, ctx, req.pos_start,
-                    req.cmd == SPLIT_GEN_CMD_PREFILL || req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN
-                            ? req.n_tokens : 1,
-                    1);
-        }
-
-        split_gen_pipe_trace("entry", phase, "decode_enter", req.n_tokens, hidden_n_embd > 0 ? hidden_n_embd : n_embd, req.pos_start, layer_start, layer_end);
-        const int32_t tok_idx = (phase && std::strcmp(phase, "decode") == 0) ? debug_step : -1;
-        const bool decode_step = (phase && std::strcmp(phase, "decode") == 0);
-        static int32_t entry_queue_depth = 0;
-        if (decode_step && perf_trace_enabled()) {
-            perf_trace_refresh_context();
-            perf_trace_set_component("entry");
-            perf_emit_instant("ENTRY_RECEIVE", perf_category::NETWORK, "entry", tok_idx, nullptr);
-            perf_emit_queue_depth("entry", tok_idx, entry_queue_depth);
-        }
-        if (decode_step) {
-            entry_queue_depth = std::max(0, entry_queue_depth - 1);
-        }
-        perf_span compute_span("ENTRY_COMPUTE_BEGIN", "ENTRY_COMPUTE_END", perf_category::COMPUTE, "entry");
-        compute_span.set_token_idx(tok_idx);
-        if (req.cmd == SPLIT_GEN_CMD_PREFILL) {
-            if (layer_start > 0) {
-                fprintf(stderr, "gen3_a: token prefill requires layer_start=0\n");
-                split_tcp_close(ctrl_fd);
-                break;
-            }
-            std::vector<llama_token> tokens((size_t) req.n_tokens);
-            for (int32_t i = 0; i < req.n_tokens; ++i) {
-                tokens[i] = (llama_token) tokens_i32[i];
-            }
-            decode_rc = split_gen_decode_tokens(ctx, tokens, req.pos_start, true);
-        } else if (req.cmd == SPLIT_GEN_CMD_DECODE) {
-            if (layer_start > 0) {
-                fprintf(stderr, "gen3_a: token decode requires layer_start=0\n");
-                split_tcp_close(ctrl_fd);
-                break;
-            }
-            decode_rc = split_gen_decode_one(ctx, (llama_token) tokens_i32[0], req.pos_start);
-        } else if (req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) {
-            const int32_t n_emb = hidden_n_embd > 0 ? hidden_n_embd : n_embd;
-            decode_rc = split_gen_decode_hidden(
-                    ctx, hidden_in.data(), req.n_tokens, n_emb, req.pos_start, true,
-                    layer_start > 0);
-        } else if (req.cmd == SPLIT_GEN_CMD_DECODE_HIDDEN) {
-            const int32_t n_emb = hidden_n_embd > 0 ? hidden_n_embd : n_embd;
-            decode_rc = split_gen_decode_hidden(
-                    ctx, hidden_in.data(), 1, n_emb, req.pos_start, true, layer_start > 0);
-        } else {
-            fprintf(stderr, "gen3_a: unknown cmd %u\n", req.cmd);
-            split_tcp_close(ctrl_fd);
-            break;
-        }
-        split_gen_pipe_trace("entry", phase, "decode_exit", req.n_tokens, hidden_n_embd > 0 ? hidden_n_embd : n_embd, req.pos_start, layer_start, layer_end);
-
-        const double ms_a = (ggml_time_us() - t0) / 1000.0;
-
-        if (decode_rc != 0) {
-            fprintf(stderr, "gen3_a: decode failed cmd=%u\n", req.cmd);
-            split_tcp_close(ctrl_fd);
-            break;
-        }
-
-        const int32_t n_out = (req.cmd == SPLIT_GEN_CMD_PREFILL ||
-                               req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) ? req.n_tokens : 1;
-        const int32_t le    = req.layer_end > 0 ? req.layer_end : layer_end;
-
-        if (dbg) {
-            dist_debug_log_kv(dbg, debug_step, phase, ctx, 0);
-            dist_debug_log_hidden_out(dbg, debug_step, phase, ctx, n_out, n_embd, "entry");
-            std::vector<int32_t> pos_buf((size_t) n_out);
-            std::vector<int32_t> tok_buf((size_t) n_out);
-            for (int32_t i = 0; i < n_out; ++i) {
-                pos_buf[(size_t) i] = req.pos_start + i;
-                tok_buf[(size_t) i] = (i < (int32_t) tokens_i32.size()) ? tokens_i32[(size_t) i] : -1;
-            }
-            dist_debug_log_runtime_state(
-                    dbg, debug_step, phase, "entry", ctx, n_out,
-                    tok_buf.data(), pos_buf.data(), -1, in_tok);
-        }
-
-        split_gen3_a_resp resp{};
-        std::vector<float> logits;
-        if (!forward_to_peer(b_fd, ctx, n_out, n_embd, le, req.pos_start,
-                req.include_logits != 0, n_vocab, ms_a, next_is_final,
-                debug_step, phase, dbg, resp, logits)) {
+        if (!entry_process_work_item(st, item, false, nullptr, false, nullptr, nullptr)) {
             split_tcp_close(ctrl_fd);
             pipe_failed = true;
             break;
         }
-
-        if (!split_gen3_send_a_resp(ctrl_fd, resp, logits.empty() ? nullptr : logits.data(), n_vocab)) {
-            fprintf(stderr, "gen3_a: send resp failed\n");
-            split_tcp_close(ctrl_fd);
-            break;
-        }
-
-        if (dbg && resp.token_id >= 0) {
-            dbg->emit_token_selected(debug_step, phase, resp.token_id, req.pos_start, false);
-        }
-        if (decode_step) {
-            entry_queue_depth++;
-        }
-        debug_step++;
         }
         if (pipe_failed) {
             break;

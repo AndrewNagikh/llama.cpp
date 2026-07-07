@@ -40,9 +40,26 @@ uint64_t perf_now_us();
 int64_t  perf_trace_epoch_us();
 
 // Active generate context (shared via active_context.json in trace_dir).
-void perf_trace_set_context(const std::string & trace_id, const std::string & phase, int32_t token_idx);
+// wave_id: RFC-0013 primary correlation key. PERF_WAVE_ID_AUTO derives from phase/token_idx.
+static constexpr int32_t PERF_WAVE_ID_NONE = -1;
+static constexpr int32_t PERF_WAVE_ID_AUTO  = -2;
+
+void perf_trace_set_context(
+        const std::string & trace_id,
+        const std::string & phase,
+        int32_t token_idx,
+        int32_t wave_id = PERF_WAVE_ID_AUTO);
+void perf_trace_set_wave_id(int32_t wave_id);
+int32_t perf_trace_get_wave_id();
+int32_t perf_trace_wave_id_from_step(const char * phase, int32_t debug_step);
+int32_t perf_trace_derive_wave_id(const std::string & phase, int32_t token_idx);
 void perf_trace_refresh_context();
 bool perf_trace_get_context(std::string & trace_id, std::string & phase, int32_t & token_idx);
+bool perf_trace_get_context(
+        std::string & trace_id,
+        std::string & phase,
+        int32_t & token_idx,
+        int32_t & wave_id);
 bool perf_trace_has_active_context();
 
 void perf_trace_begin_generate(const std::string & trace_id, const std::string & subdir = "decode");

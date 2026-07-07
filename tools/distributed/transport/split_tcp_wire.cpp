@@ -593,3 +593,57 @@ bool split_gen3_recv_c_resp(int fd, split_gen3_c_resp & resp) {
     }
     return split_gen_check_magic(resp.magic, SPLIT_GEN_MAGIC);
 }
+
+bool split_gen_send_queue_ack(const int fd, const int32_t queue_depth, const int32_t wave_id, const int32_t status) {
+    split_gen_queue_ack ack{};
+    ack.magic       = SPLIT_GENQ_MAGIC;
+    ack.version     = SPLIT_GEN_VERSION;
+    ack.queue_depth = queue_depth;
+    ack.wave_id     = wave_id;
+    ack.status      = status;
+    return split_tcp_send_all(fd, &ack, sizeof(ack));
+}
+
+bool split_gen_recv_queue_ack(const int fd, split_gen_queue_ack & ack) {
+    if (!split_tcp_recv_all(fd, &ack, sizeof(ack))) {
+        return false;
+    }
+    if (!split_gen_check_magic(ack.magic, SPLIT_GENQ_MAGIC)) {
+        return false;
+    }
+    return true;
+}
+
+bool split_gen_send_token_ready(const int fd, const int32_t token_id, const int32_t pos_start, const int32_t wave_id) {
+    split_gen_token_ready ready{};
+    ready.magic     = SPLIT_GENT_MAGIC;
+    ready.version   = SPLIT_GEN_VERSION;
+    ready.token_id  = token_id;
+    ready.pos_start = pos_start;
+    ready.wave_id   = wave_id;
+    return split_tcp_send_all(fd, &ready, sizeof(ready));
+}
+
+bool split_gen_recv_token_ready(const int fd, split_gen_token_ready & ready) {
+    if (!split_tcp_recv_all(fd, &ready, sizeof(ready))) {
+        return false;
+    }
+    if (!split_gen_check_magic(ready.magic, SPLIT_GENT_MAGIC)) {
+        return false;
+    }
+    return true;
+}
+
+bool split_gen_peek_ctrl_magic(const int fd, uint32_t & magic_out) {
+    uint32_t magic = 0;
+#if defined(_WIN32)
+    const int n = recv(fd, (char *) &magic, sizeof(magic), MSG_PEEK);
+#else
+    const ssize_t n = recv(fd, &magic, sizeof(magic), MSG_PEEK);
+#endif
+    if (n != (int) sizeof(magic)) {
+        return false;
+    }
+    magic_out = magic;
+    return true;
+}

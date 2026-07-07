@@ -60,9 +60,14 @@ static void ggml_hook_end(const char * event) {
     }
 
     int32_t token_idx = -1;
+    int32_t wave_id   = PERF_WAVE_ID_NONE;
     std::string trace_id;
     std::string phase;
-    perf_trace_get_context(trace_id, phase, token_idx);
+    perf_trace_get_context(trace_id, phase, token_idx, wave_id);
+    if (wave_id < 0) {
+        wave_id = perf_trace_derive_wave_id(phase, token_idx);
+        perf_trace_set_wave_id(wave_id);
+    }
 
     perf_emit_span(key.c_str(), cat, current_stage(), token_idx, dur, nullptr);
 }

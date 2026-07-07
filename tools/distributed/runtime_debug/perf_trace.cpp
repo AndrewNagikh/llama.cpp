@@ -26,6 +26,7 @@ static int64_t           g_epoch_us = 0;
 static std::string g_trace_id;
 static std::string g_phase = "decode";
 static int32_t     g_token_idx = -1;
+static int32_t     g_wave_id   = PERF_WAVE_ID_NONE;
 static std::string g_output_dir;
 static std::string g_base_trace_dir;
 
@@ -67,6 +68,22 @@ static void apply_output_dir_from_context(const std::string & output_subdir) {
     g_output_dir = g_base_trace_dir + "/" + output_subdir;
 }
 
+static int32_t derive_wave_id(const std::string & phase, const int32_t token_idx, const int32_t wave_id_in) {
+    if (wave_id_in >= 0) {
+        return wave_id_in;
+    }
+    if (wave_id_in == PERF_WAVE_ID_NONE) {
+        return PERF_WAVE_ID_NONE;
+    }
+    if (phase == "ttft" || phase == "prefill") {
+        return 0;
+    }
+    if (token_idx >= 0) {
+        return token_idx + 1;
+    }
+    return PERF_WAVE_ID_NONE;
+}
+
 static void write_active_context_file() {
     if (!perf_trace_enabled() || g_trace_id.empty()) {
         return;
@@ -88,6 +105,7 @@ static void write_active_context_file() {
       << "\"trace_id\":" << json_escape(g_trace_id) << ","
       << "\"phase\":" << json_escape(g_phase) << ","
       << "\"token_idx\":" << g_token_idx << ","
+      << "\"WaveID\":" << g_wave_id << ","
       << "\"output_subdir\":" << json_escape(output_subdir)
       << "}";
     if (!g_output_dir.empty()) {
@@ -132,6 +150,11 @@ static void parse_active_context_file() {
     extract_string("trace_id", g_trace_id);
     extract_string("phase", g_phase);
     extract_int("token_idx", g_token_idx);
+    int32_t parsed_wave = PERF_WAVE_ID_NONE;
+    extract_int("WaveID", parsed_wave);
+    if (parsed_wave >= 0) {
+        g_wave_id = parsed_wave;
+    }
     std::string output_subdir;
     extract_string("output_subdir", output_subdir);
     apply_output_dir_from_context(output_subdir);
@@ -186,6 +209,7 @@ static void write_event(
        << "\"trace_id\":" << json_escape(g_trace_id) << ","
        << "\"phase\":" << json_escape(g_phase) << ","
        << "\"token_idx\":" << token_idx << ","
+       << "\"WaveID\":" << g_wave_id << ","
        << "\"stage\":" << json_escape(stage ? stage : "") << ","
        << "\"node_id\":" << json_escape(g_cfg.node_id) << ","
        << "\"component\":" << json_escape(g_cfg.component) << ","
@@ -273,10 +297,15 @@ int64_t perf_trace_epoch_us() {
     return g_epoch_us;
 }
 
-void perf_trace_set_context(const std::string & trace_id, const std::string & phase, const int32_t token_idx) {
+void perf_trace_set_context(
+        const std::string & trace_id,
+        const std::string & phase,
+        const int32_t token_idx,
+        const int32_t wave_id) {
     g_trace_id   = trace_id;
     g_phase      = phase.empty() ? "decode" : phase;
     g_token_idx  = token_idx;
+    g_wave_id    = derive_wave_id(g_phase, token_idx, wave_id);
     if (!trace_id.empty()) {
         g_output_dir = g_base_trace_dir + "/" + trace_id;
         if (!g_phase.empty()) {
@@ -285,6 +314,31 @@ void perf_trace_set_context(const std::string & trace_id, const std::string & ph
         ensure_trace_dir(g_output_dir);
     }
     write_active_context_file();
+}
+
+void perf_trace_set_wave_id(const int32_t wave_id) {
+    g_wave_id = wave_id;
+}
+
+int32_t perf_trace_get_wave_id() {
+    return g_wave_id;
+}
+
+int32_t perf_trace_wave_id_from_step(const char * phase, const int32_t debug_step) {
+    if (phase == nullptr) {
+        return PERF_WAVE_ID_NONE;
+    }
+    if (std::strcmp(phase, "prefill") == 0) {
+        return 0;
+    }
+    if (std::strcmp(phase, "decode") == 0 && debug_step > 0) {
+        return debug_step;
+    }
+    return PERF_WAVE_ID_NONE;
+}
+
+int32_t perf_trace_derive_wave_id(const std::string & phase, const int32_t token_idx) {
+    return derive_wave_id(phase, token_idx, PERF_WAVE_ID_AUTO);
 }
 
 void perf_trace_refresh_context() {
@@ -298,6 +352,18 @@ bool perf_trace_get_context(std::string & trace_id, std::string & phase, int32_t
     trace_id  = g_trace_id;
     phase     = g_phase;
     token_idx = g_token_idx;
+    return !g_trace_id.empty();
+}
+
+bool perf_trace_get_context(
+        std::string & trace_id,
+        std::string & phase,
+        int32_t & token_idx,
+        int32_t & wave_id) {
+    trace_id  = g_trace_id;
+    phase     = g_phase;
+    token_idx = g_token_idx;
+    wave_id   = g_wave_id;
     return !g_trace_id.empty();
 }
 
@@ -317,6 +383,7 @@ void perf_trace_begin_generate(const std::string & trace_id, const std::string &
     g_trace_id  = trace_id;
     g_phase     = subdir.empty() ? "decode" : subdir;
     g_token_idx = -1;
+    g_wave_id   = PERF_WAVE_ID_NONE;
 
     g_output_dir = g_base_trace_dir + "/" + trace_id;
     if (!subdir.empty()) {

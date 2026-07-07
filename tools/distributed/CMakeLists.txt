@@ -7,6 +7,8 @@ set(DIST_WORKERS_DIR   ${CMAKE_CURRENT_SOURCE_DIR}/workers)
 
 set(DIST_TRANSPORT_SOURCES
     ${DIST_TRANSPORT_DIR}/split_tcp_wire.cpp
+    ${DIST_TRANSPORT_DIR}/split_wave_wire.cpp
+    ${DIST_TRANSPORT_DIR}/runtime_protocol.cpp
 )
 
 set(DIST_PLATFORM_SOURCES
@@ -259,7 +261,8 @@ function(dist_add_worker name main_source)
     add_executable(${name} ${main_source}
         ${DIST_TRANSPORT_SOURCES}
         ${DIST_RUNTIME_DEBUG_SOURCES}
-        ${RUNTIME_WORKER_LOAD_SOURCES})
+        ${RUNTIME_WORKER_LOAD_SOURCES}
+        ${DIST_WORKERS_DIR}/wave_inbound_queue.cpp)
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE llama llama-common Threads::Threads)
     dist_link_platform_libs(${name})
@@ -268,6 +271,8 @@ endfunction()
 dist_add_exe_light(node_agent node_agent.cpp)
 target_sources(node_agent PRIVATE ${DIST_TRANSPORT_SOURCES} ${DIST_RUNTIME_DEBUG_SOURCES}
     ${DIST_RUNTIME_SOURCES}
+    ${DIST_WORKERS_DIR}/wave_inbound_queue.cpp
+    ${DIST_TRANSPORT_DIR}/runtime_entry_queue.cpp
     runtime/runtime_compat_materialize.cpp
     runtime/runtime_worker_gguf_resolver.cpp
     verification/worker_verify.cpp)
@@ -454,6 +459,26 @@ if (LLAMA_BUILD_TESTS)
     if (CMAKE_SYSTEM_NAME MATCHES "Linux|Darwin")
         target_link_libraries(test-perf-trace PRIVATE ${CMAKE_DL_LIBS})
     endif()
+
+    add_executable(test-wave-wire test-wave-wire.cpp ${DIST_TRANSPORT_SOURCES})
+    target_include_directories(test-wave-wire PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-wave-wire PRIVATE cxx_std_17)
+    target_link_libraries(test-wave-wire PRIVATE Threads::Threads)
+
+    add_executable(test-runtime-protocol test-runtime-protocol.cpp ${DIST_TRANSPORT_SOURCES})
+    target_include_directories(test-runtime-protocol PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-runtime-protocol PRIVATE cxx_std_17)
+    target_link_libraries(test-runtime-protocol PRIVATE Threads::Threads)
+
+    add_executable(test-wave-inbound-queue test-wave-inbound-queue.cpp workers/wave_inbound_queue.cpp)
+    target_include_directories(test-wave-inbound-queue PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-wave-inbound-queue PRIVATE cxx_std_17)
+    target_link_libraries(test-wave-inbound-queue PRIVATE Threads::Threads)
+
+    add_executable(test-hidden-inbound-queue test-hidden-inbound-queue.cpp workers/wave_inbound_queue.cpp)
+    target_include_directories(test-hidden-inbound-queue PRIVATE ${DIST_INCLUDE_DIRS})
+    target_compile_features(test-hidden-inbound-queue PRIVATE cxx_std_17)
+    target_link_libraries(test-hidden-inbound-queue PRIVATE Threads::Threads)
 
     set(RUNTIME_DESCRIPTOR_TEST_SOURCES
         runtime/runtime_descriptor.cpp

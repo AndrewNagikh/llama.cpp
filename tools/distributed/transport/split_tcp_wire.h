@@ -94,6 +94,8 @@ enum split_gen_cmd : uint32_t {
     SPLIT_GEN_CMD_SHUTDOWN      = 4,
     SPLIT_GEN_CMD_PREFILL_HIDDEN = 5,
     SPLIT_GEN_CMD_DECODE_HIDDEN  = 6,
+    SPLIT_GEN_CMD_PROTO_NEGOTIATE = 7,
+    SPLIT_GEN_CMD_DRAIN_PENDING   = 8,
 };
 
 enum split_ab_cmd : uint32_t {
@@ -190,6 +192,33 @@ struct split_gen3_a_resp {
     double   ms_c_compute;
     double   ms_c_sample;
 };
+
+struct split_proto_negotiate_resp {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t agreed_protocol;
+    uint32_t server_max_protocol;
+    uint32_t status;
+};
+
+constexpr uint32_t SPLIT_GENQ_MAGIC = 0x514E4547; // 'GENQ' queue ack
+constexpr uint32_t SPLIT_GENT_MAGIC = 0x544E4547; // 'GENT' token ready
+
+struct split_gen_queue_ack {
+    uint32_t magic;
+    uint32_t version;
+    int32_t  queue_depth;
+    int32_t  wave_id;
+    int32_t  status;
+};
+
+struct split_gen_token_ready {
+    uint32_t magic;
+    uint32_t version;
+    int32_t  token_id;
+    int32_t  pos_start;
+    int32_t  wave_id;
+};
 #pragma pack(pop)
 
 bool split_gen3_send_a_resp(int fd, const split_gen3_a_resp & resp, const float * logits, int32_t n_vocab);
@@ -200,3 +229,11 @@ bool split_gen3_recv_mid_resp(int fd, split_gen3_mid_resp & resp);
 
 bool split_gen3_send_c_resp(int fd, const split_gen3_c_resp & resp);
 bool split_gen3_recv_c_resp(int fd, split_gen3_c_resp & resp);
+
+bool split_gen_send_queue_ack(int fd, int32_t queue_depth, int32_t wave_id, int32_t status = 0);
+bool split_gen_recv_queue_ack(int fd, split_gen_queue_ack & ack);
+
+bool split_gen_send_token_ready(int fd, int32_t token_id, int32_t pos_start, int32_t wave_id);
+bool split_gen_recv_token_ready(int fd, split_gen_token_ready & ready);
+
+bool split_gen_peek_ctrl_magic(int fd, uint32_t & magic_out);
