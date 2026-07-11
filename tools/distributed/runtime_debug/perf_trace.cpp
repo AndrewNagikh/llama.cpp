@@ -341,11 +341,71 @@ int32_t perf_trace_derive_wave_id(const std::string & phase, const int32_t token
     return derive_wave_id(phase, token_idx, PERF_WAVE_ID_AUTO);
 }
 
+static void parse_decode_context_file() {
+    if (g_base_trace_dir.empty()) {
+        return;
+    }
+    const std::string path = g_base_trace_dir + "/decode_context.json";
+    std::ifstream f(path);
+    if (!f) {
+        return;
+    }
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    auto extract_string = [&](const char * key, std::string & out) {
+        const std::string needle = std::string("\"") + key + "\":\"";
+        const size_t pos = content.find(needle);
+        if (pos == std::string::npos) {
+            return;
+        }
+        const size_t start = pos + needle.size();
+        const size_t end = content.find('"', start);
+        if (end == std::string::npos) {
+            return;
+        }
+        out = content.substr(start, end - start);
+    };
+
+    std::string trace_id;
+    extract_string("trace_id", trace_id);
+    if (!trace_id.empty()) {
+        g_trace_id = trace_id;
+        g_phase    = "decode";
+    }
+}
+
+void perf_trace_write_decode_context(const std::string & trace_id) {
+    if (trace_id.empty()) {
+        return;
+    }
+    perf_trace_load_config();
+    if (g_base_trace_dir.empty() && !g_cfg.trace_dir.empty()) {
+        g_base_trace_dir = g_cfg.trace_dir;
+    }
+    if (g_base_trace_dir.empty()) {
+        return;
+    }
+    ensure_trace_dir(g_base_trace_dir);
+    const std::string path = g_base_trace_dir + "/decode_context.json";
+    std::ofstream f(path, std::ios::trunc);
+    if (!f) {
+        return;
+    }
+    f << "{"
+      << "\"trace_id\":" << json_escape(trace_id) << ","
+      << "\"phase\":\"decode\""
+      << "}";
+    g_trace_id = trace_id;
+    g_phase    = "decode";
+    write_active_context_file();
+}
+
 void perf_trace_refresh_context() {
     if (!perf_trace_enabled()) {
         return;
     }
     parse_active_context_file();
+    parse_decode_context_file();
 }
 
 void perf_trace_ensure_decode_context(const int32_t token_idx, const int32_t wave_id) {

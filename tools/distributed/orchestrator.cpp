@@ -2318,6 +2318,42 @@ static bool recover_session_pipeline(dist_session & session, std::string & err) 
     return true;
 }
 
+static bool perf_begin_decode_on_node(
+        const dist_pipeline_stage & stage,
+        const std::string & trace_id) {
+    if (stage.http_port <= 0 || stage.host.empty() || trace_id.empty()) {
+        return false;
+    }
+    httplib::Client cli(stage.host.c_str(), stage.http_port);
+    cli.set_connection_timeout(5, 0);
+    cli.set_read_timeout(15, 0);
+    const json req_body = {
+        { "trace_id", trace_id },
+        { "perf_trace", true },
+    };
+    const auto res = cli.Post("/perf/trace/begin_decode", req_body.dump(), "application/json");
+    return res && res->status == 200;
+}
+
+static void perf_fanout_decode_context(
+        const dist_session & session,
+        const std::string & trace_id) {
+    if (!perf_trace_enabled() || trace_id.empty() || session.pipeline.empty()) {
+        return;
+    }
+    std::set<std::string> seen;
+    for (const auto & stage : session.pipeline) {
+        if (stage.http_port <= 0 || stage.host.empty()) {
+            continue;
+        }
+        const std::string key = stage.node_id + "@" + stage.host + ":" + std::to_string(stage.http_port);
+        if (!seen.insert(key).second) {
+            continue;
+        }
+        perf_begin_decode_on_node(stage, trace_id);
+    }
+}
+
 static bool run_generation(
         const dist_session & session,
         const std::string & prompt,
@@ -2398,6 +2434,10 @@ static bool run_generation(
     }
 
     ttft_handed_off = true;
+
+    if (perf_on) {
+        perf_fanout_decode_context(session, trace_id);
+    }
 
     httplib::Client cli(entry.host.c_str(), entry.http_port);
     cli.set_connection_timeout(10, 0);
