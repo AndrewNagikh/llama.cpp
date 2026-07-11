@@ -54,6 +54,8 @@ int32_t perf_trace_get_wave_id();
 int32_t perf_trace_wave_id_from_step(const char * phase, int32_t debug_step);
 int32_t perf_trace_derive_wave_id(const std::string & phase, int32_t token_idx);
 void perf_trace_refresh_context();
+// Force decode phase on worker nodes (middle/final) before emitting decode spans.
+void perf_trace_ensure_decode_context(int32_t token_idx, int32_t wave_id);
 bool perf_trace_get_context(std::string & trace_id, std::string & phase, int32_t & token_idx);
 bool perf_trace_get_context(
         std::string & trace_id,

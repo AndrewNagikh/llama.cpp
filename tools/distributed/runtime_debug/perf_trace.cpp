@@ -348,6 +348,20 @@ void perf_trace_refresh_context() {
     parse_active_context_file();
 }
 
+void perf_trace_ensure_decode_context(const int32_t token_idx, const int32_t wave_id) {
+    if (!perf_trace_enabled()) {
+        return;
+    }
+    perf_trace_refresh_context();
+    std::string trace_id;
+    std::string phase;
+    int32_t     cur_tok = -1;
+    if (!perf_trace_get_context(trace_id, phase, cur_tok) || trace_id.empty()) {
+        return;
+    }
+    perf_trace_set_context(trace_id, "decode", token_idx, wave_id);
+}
+
 bool perf_trace_get_context(std::string & trace_id, std::string & phase, int32_t & token_idx) {
     trace_id  = g_trace_id;
     phase     = g_phase;

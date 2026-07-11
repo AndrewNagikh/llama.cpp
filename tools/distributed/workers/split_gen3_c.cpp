@@ -181,9 +181,8 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
     const int32_t tok_idx = (std::strcmp(phase, "decode") == 0) ? step : -1;
     const bool decode_step = (std::strcmp(phase, "decode") == 0);
 
-    perf_trace_refresh_context();
-    perf_trace_set_wave_id(wave_id);
     if (decode_step && perf_trace_enabled()) {
+        perf_trace_ensure_decode_context(tok_idx, wave_id);
         perf_trace_set_component("final");
         perf_emit_instant("FINAL_RECEIVE", perf_category::NETWORK, "final", tok_idx, nullptr);
         if (st.queue_depth) {
@@ -253,6 +252,9 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
         const int64_t t0 = ggml_time_us();
         split_gen_pipe_trace("final", phase, "decode_enter",
                 msg.header.n_tokens, msg.header.n_embd, msg.meta.pos_start, st.layer_start, st.n_layer);
+        if (perf_trace_enabled() && decode_step) {
+            perf_trace_ensure_decode_context(tok_idx, wave_id);
+        }
         perf_span compute_span("FINAL_COMPUTE_BEGIN", "FINAL_COMPUTE_END", perf_category::COMPUTE, "final");
         compute_span.set_token_idx(tok_idx);
         if (split_gen_decode_hidden(st.ctx, msg.data.data(), msg.header.n_tokens, msg.header.n_embd,
@@ -591,9 +593,8 @@ int main(int argc, char ** argv) {
         const char * phase = msg.header.n_tokens > 1 ? "prefill" : "decode";
         const int32_t tok_idx = (std::strcmp(phase, "decode") == 0) ? debug_step : -1;
         const bool decode_step = (std::strcmp(phase, "decode") == 0);
-        perf_trace_refresh_context();
-        perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
         if (decode_step && perf_trace_enabled()) {
+            perf_trace_ensure_decode_context(tok_idx, perf_trace_wave_id_from_step(phase, debug_step));
             perf_trace_set_component("final");
             perf_emit_instant("FINAL_RECEIVE", perf_category::NETWORK, "final", tok_idx, nullptr);
             perf_emit_queue_depth("final", tok_idx, final_queue_depth);
@@ -666,6 +667,10 @@ int main(int argc, char ** argv) {
             const int64_t t0 = ggml_time_us();
             split_gen_pipe_trace("final", phase, "decode_enter",
                     msg.header.n_tokens, msg.header.n_embd, msg.meta.pos_start, layer_start, n_layer);
+            if (perf_trace_enabled() && decode_step) {
+                perf_trace_ensure_decode_context(
+                        tok_idx, perf_trace_wave_id_from_step(phase, debug_step));
+            }
             perf_span compute_span("FINAL_COMPUTE_BEGIN", "FINAL_COMPUTE_END", perf_category::COMPUTE, "final");
             compute_span.set_token_idx(tok_idx);
             if (split_gen_decode_hidden(ctx, msg.data.data(), msg.header.n_tokens, msg.header.n_embd,

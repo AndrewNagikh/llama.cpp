@@ -68,8 +68,13 @@ static bool forward_to_c(
     }
 
     if (perf_trace_enabled()) {
-        perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
+        const int32_t wave_id = perf_trace_wave_id_from_step(phase, debug_step);
         const int32_t tok_idx = (phase && std::strcmp(phase, "decode") == 0) ? debug_step : -1;
+        if (phase && std::strcmp(phase, "decode") == 0) {
+            perf_trace_ensure_decode_context(tok_idx, wave_id);
+        } else {
+            perf_trace_set_wave_id(wave_id);
+        }
         const int32_t payload_bytes = n_tokens * n_embd * (int32_t) sizeof(float);
         perf_trace_set_component("middle");
         perf_emit_hidden_transfer("middle", tok_idx, "bc", payload_bytes, 0, send_us, 0, 0);
@@ -128,8 +133,13 @@ static bool send_hidden_to_c_only(
     send_ms_out = send_us / 1000.0;
 
     if (perf_trace_enabled()) {
-        perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
+        const int32_t wave_id = perf_trace_wave_id_from_step(phase, debug_step);
         const int32_t tok_idx = (phase && std::strcmp(phase, "decode") == 0) ? debug_step : -1;
+        if (phase && std::strcmp(phase, "decode") == 0) {
+            perf_trace_ensure_decode_context(tok_idx, wave_id);
+        } else {
+            perf_trace_set_wave_id(wave_id);
+        }
         const int32_t payload_bytes = n_tokens * n_embd * (int32_t) sizeof(float);
         perf_trace_set_component("middle");
         perf_emit_hidden_transfer("middle", tok_idx, "bc", payload_bytes, 0, send_us, 0, 0);
@@ -176,9 +186,8 @@ static bool middle_process_hidden_item(
     const int32_t tok_idx = (std::strcmp(phase, "decode") == 0) ? step : -1;
     const bool decode_step = (std::strcmp(phase, "decode") == 0);
 
-    perf_trace_refresh_context();
-    perf_trace_set_wave_id(wave_id);
     if (decode_step && perf_trace_enabled()) {
+        perf_trace_ensure_decode_context(tok_idx, wave_id);
         perf_trace_set_component("middle");
         perf_emit_instant("MIDDLE_RECEIVE", perf_category::NETWORK, "middle", tok_idx, nullptr);
         if (st.queue_depth) {
@@ -207,10 +216,10 @@ static bool middle_process_hidden_item(
     std::vector<float> out_hidden;
     split_gen_pipe_trace("middle", phase, "decode_enter",
             msg.header.n_tokens, st.n_embd, msg.meta.pos_start, st.layer_start, st.layer_end);
-    perf_span compute_span("MIDDLE_COMPUTE_BEGIN", "MIDDLE_COMPUTE_END", perf_category::COMPUTE, "middle");
-    if (perf_trace_enabled()) {
-        perf_trace_set_wave_id(wave_id);
+    if (perf_trace_enabled() && decode_step) {
+        perf_trace_ensure_decode_context(tok_idx, wave_id);
     }
+    perf_span compute_span("MIDDLE_COMPUTE_BEGIN", "MIDDLE_COMPUTE_END", perf_category::COMPUTE, "middle");
     compute_span.set_token_idx(tok_idx);
     if (!run_b_layers(st.ctx, msg, st.n_embd, st.layer_start, st.layer_end, ms_b, out_hidden)) {
         fprintf(stderr, "gen3_b: decode failed\n");
@@ -662,11 +671,10 @@ int main(int argc, char ** argv) {
         }
 
         const char * phase = msg.header.n_tokens > 1 ? "prefill" : "decode";
-        perf_trace_refresh_context();
-        perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
         const int32_t tok_idx = (std::strcmp(phase, "decode") == 0) ? debug_step : -1;
         const bool decode_step = (std::strcmp(phase, "decode") == 0);
         if (decode_step && perf_trace_enabled()) {
+            perf_trace_ensure_decode_context(tok_idx, perf_trace_wave_id_from_step(phase, debug_step));
             perf_trace_set_component("middle");
             perf_emit_instant("MIDDLE_RECEIVE", perf_category::NETWORK, "middle", tok_idx, nullptr);
             perf_emit_queue_depth("middle", tok_idx, queue_depth);
@@ -698,10 +706,11 @@ int main(int argc, char ** argv) {
         std::vector<float> out_hidden;
         split_gen_pipe_trace("middle", phase, "decode_enter",
                 msg.header.n_tokens, n_embd, msg.meta.pos_start, layer_start, layer_end);
-        perf_span compute_span("MIDDLE_COMPUTE_BEGIN", "MIDDLE_COMPUTE_END", perf_category::COMPUTE, "middle");
-        if (perf_trace_enabled()) {
-            perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
+        if (perf_trace_enabled() && decode_step) {
+            perf_trace_ensure_decode_context(
+                    tok_idx, perf_trace_wave_id_from_step(phase, debug_step));
         }
+        perf_span compute_span("MIDDLE_COMPUTE_BEGIN", "MIDDLE_COMPUTE_END", perf_category::COMPUTE, "middle");
         compute_span.set_token_idx(tok_idx);
         if (!run_b_layers(ctx, msg, n_embd, layer_start, layer_end, ms_b, out_hidden)) {
             fprintf(stderr, "gen3_b: decode failed\n");

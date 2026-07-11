@@ -102,6 +102,15 @@ static bool forward_to_peer(
 
     if (perf_trace_enabled()) {
         perf_trace_set_component("entry");
+        if (phase && std::strcmp(phase, "decode") == 0) {
+            perf_trace_ensure_decode_context(tok_idx, perf_trace_wave_id_from_step(phase, debug_step));
+        } else {
+            perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
+        }
+        if (serialize_us > 0) {
+            perf_emit_span(
+                    "SERIALIZE_HIDDEN_END", perf_category::SERIALIZATION, "entry", tok_idx, serialize_us, nullptr);
+        }
         perf_emit_hidden_transfer("entry", tok_idx, "ab", payload_bytes, serialize_us, send_us, 0, 0);
         perf_emit_span("ENTRY_SEND_END", perf_category::NETWORK, "entry", tok_idx, send_us, nullptr);
     }
@@ -190,6 +199,15 @@ static bool send_hidden_to_b_only(
 
     if (perf_trace_enabled()) {
         perf_trace_set_component("entry");
+        if (phase && std::strcmp(phase, "decode") == 0) {
+            perf_trace_ensure_decode_context(tok_idx, perf_trace_wave_id_from_step(phase, debug_step));
+        } else {
+            perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
+        }
+        if (serialize_us > 0) {
+            perf_emit_span(
+                    "SERIALIZE_HIDDEN_END", perf_category::SERIALIZATION, "entry", tok_idx, serialize_us, nullptr);
+        }
         perf_emit_hidden_transfer("entry", tok_idx, "ab", payload_bytes, serialize_us, send_us, 0, 0);
         perf_emit_span("ENTRY_SEND_END", perf_category::NETWORK, "entry", tok_idx, send_us, nullptr);
     }
@@ -258,8 +276,7 @@ static bool entry_process_work_item(
             ? *st.debug_step : -1;
     const bool decode_step = (phase && std::strcmp(phase, "decode") == 0);
     if (decode_step && perf_trace_enabled()) {
-        perf_trace_refresh_context();
-        perf_trace_set_wave_id(wave_id);
+        perf_trace_ensure_decode_context(tok_idx, wave_id);
         perf_trace_set_component("entry");
         perf_emit_instant("ENTRY_RECEIVE", perf_category::NETWORK, "entry", tok_idx, nullptr);
         if (st.entry_queue_depth) {
@@ -267,10 +284,10 @@ static bool entry_process_work_item(
             *st.entry_queue_depth = std::max(0, *st.entry_queue_depth - 1);
         }
     }
-    perf_span compute_span("ENTRY_COMPUTE_BEGIN", "ENTRY_COMPUTE_END", perf_category::COMPUTE, "entry");
-    if (perf_trace_enabled()) {
-        perf_trace_set_wave_id(wave_id);
+    if (perf_trace_enabled() && decode_step) {
+        perf_trace_ensure_decode_context(tok_idx, wave_id);
     }
+    perf_span compute_span("ENTRY_COMPUTE_BEGIN", "ENTRY_COMPUTE_END", perf_category::COMPUTE, "entry");
     compute_span.set_token_idx(tok_idx);
     if (req.cmd == SPLIT_GEN_CMD_PREFILL) {
         if (st.layer_start > 0) {
