@@ -15,14 +15,18 @@ set(DIST_PLATFORM_SOURCES
     dist_process.cpp
 )
 
-set(DIST_RUNTIME_DEBUG_SOURCES
-    runtime_debug/runtime_debug.cpp
-    runtime_debug/tensor_stats.cpp
-    runtime_debug/trace_recorder.cpp
+set(DIST_PERF_TRACE_SOURCES
     runtime_debug/perf_trace.cpp
     runtime_debug/perf_trace_export.cpp
     runtime_debug/perf_gpu_sampler.cpp
     runtime_debug/perf_ggml.cpp
+)
+
+set(DIST_RUNTIME_DEBUG_SOURCES
+    runtime_debug/runtime_debug.cpp
+    runtime_debug/tensor_stats.cpp
+    runtime_debug/trace_recorder.cpp
+    ${DIST_PERF_TRACE_SOURCES}
     runtime_debug/debug_hooks.cpp
     runtime_debug/layer_trace.cpp
     runtime_debug/runtime_state.cpp
@@ -210,7 +214,7 @@ function(dist_link_platform_libs target)
 endfunction()
 
 function(dist_add_verify_exe name main_source)
-    add_executable(${name} ${main_source} ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES} ${DIST_VERIFY_RUNTIME_SOURCES} dist_common.cpp memory_estimator.cpp)
+    add_executable(${name} ${main_source} ${VERIFICATION_SOURCES} ${NODE_AGENT_SOURCES} ${DIST_PERF_TRACE_SOURCES} ${DIST_VERIFY_RUNTIME_SOURCES} dist_common.cpp memory_estimator.cpp)
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
     target_compile_features(${name} PRIVATE cxx_std_17)
     target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
@@ -280,10 +284,7 @@ dist_add_exe(orchestrator orchestrator.cpp)
 target_sources(orchestrator PRIVATE
     ${DIST_PLATFORM_SOURCES}
     ${DIST_RUNTIME_SOURCES}
-    runtime_debug/perf_trace.cpp
-    runtime_debug/perf_trace_export.cpp
-    runtime_debug/perf_gpu_sampler.cpp
-    runtime_debug/perf_ggml.cpp
+    ${DIST_PERF_TRACE_SOURCES}
     dist_http_fetch.cpp
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
@@ -529,6 +530,7 @@ if (LLAMA_BUILD_TESTS)
     add_executable(test-runtime-layer-store-model-load test-runtime-layer-store-model-load.cpp
         ${VERIFICATION_SOURCES}
         ${NODE_AGENT_SOURCES}
+        ${DIST_PERF_TRACE_SOURCES}
         ${DIST_RUNTIME_SOURCES}
         dist_common.cpp
         memory_estimator.cpp)
