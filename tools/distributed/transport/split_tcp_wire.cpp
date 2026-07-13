@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(_WIN32)
@@ -18,11 +19,36 @@ static bool g_wsa_started = false;
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 #endif
+
+// The ctrl/AB/BC protocol is small-message request/response ping-pong;
+// with Nagle enabled that pattern hits the delayed-ACK timer (~40 ms per
+// round trip: Task 12 measured the v1 bubble at 40.8 ms and Task 17.1A
+// attributed the v2 period to two ~41 ms waits per token). Opt out with
+// DIST_TCP_NODELAY=0.
+static bool split_tcp_nodelay_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("DIST_TCP_NODELAY");
+        if (v == nullptr || v[0] == '\0') {
+            return true;
+        }
+        return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0;
+    }();
+    return enabled;
+}
+
+static void split_tcp_set_nodelay(const int fd) {
+    if (fd < 0 || !split_tcp_nodelay_enabled()) {
+        return;
+    }
+    int yes = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *) &yes, sizeof(yes));
+}
 
 void split_tcp_init() {
 #if defined(_WIN32)
@@ -148,7 +174,9 @@ int split_tcp_listen(int port) {
 int split_tcp_accept(int listen_fd) {
     sockaddr_in client{};
     socklen_t len = sizeof(client);
-    return accept(listen_fd, (sockaddr *) &client, &len);
+    const int fd = accept(listen_fd, (sockaddr *) &client, &len);
+    split_tcp_set_nodelay(fd);
+    return fd;
 }
 
 int split_tcp_connect(const char * host, int port) {
@@ -194,6 +222,7 @@ int split_tcp_connect(const char * host, int port) {
             }
 #endif
             split_tcp_set_timeouts(fd, 30000);
+            split_tcp_set_nodelay(fd);
             freeaddrinfo(res);
             return fd;
         }
@@ -214,6 +243,7 @@ int split_tcp_connect(const char * host, int port) {
                         fcntl(fd, F_SETFL, flags);
                     }
                     split_tcp_set_timeouts(fd, 30000);
+                    split_tcp_set_nodelay(fd);
                     freeaddrinfo(res);
                     return fd;
                 }
