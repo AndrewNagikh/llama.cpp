@@ -11,6 +11,7 @@
 #include <windows.h>
 #else
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -404,6 +405,15 @@ int dist_process_run_capture_stdout(
         err = "pipe failed";
         return -1;
     }
+    // Sync runs several concurrent download threads, each forking its own
+    // curl child via this same function. Without FD_CLOEXEC, a fork() on
+    // another thread between this pipe() and this thread's own fork() below
+    // copies these fds into an unrelated child, which then holds the write
+    // end open for its lifetime -- delaying or corrupting this thread's EOF
+    // on read(). dup2() below creates STDOUT_FILENO fresh (no CLOEXEC), so
+    // this still reaches the intended child correctly.
+    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
 
     // Build argv before fork() -- see dist_process_spawn for why (heap
     // allocation in the child of a multithreaded parent is unsafe).
