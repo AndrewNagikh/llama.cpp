@@ -324,6 +324,12 @@ bool dist_process_spawn(
         return false;
     }
 
+    // Build argv before fork(): node_agent runs multiple sync/download
+    // worker threads, and any heap allocation in the child between fork()
+    // and exec()/_exit() is undefined behavior in a multithreaded parent
+    // (the child can inherit the malloc lock held by a thread that no
+    // longer exists in it -- observed as "Heap corruption detected" on
+    // macOS). cargs must already be fully materialized before fork().
     std::vector<char *> cargs;
     cargs.reserve(argv.size() + 1);
     for (const auto & a : argv) {
@@ -337,7 +343,9 @@ bool dist_process_spawn(
         return false;
     }
     if (pid == 0) {
-        execv(argv[0].c_str(), cargs.data());
+        // execvp (not execv): argv[0] is often a bare command name (e.g.
+        // "curl") that must be resolved via $PATH, not a literal path.
+        execvp(argv[0].c_str(), cargs.data());
         _exit(127);
     }
 
@@ -397,6 +405,15 @@ int dist_process_run_capture_stdout(
         return -1;
     }
 
+    // Build argv before fork() -- see dist_process_spawn for why (heap
+    // allocation in the child of a multithreaded parent is unsafe).
+    std::vector<char *> cargs;
+    cargs.reserve(argv.size() + 1);
+    for (const auto & a : argv) {
+        cargs.push_back(const_cast<char *>(a.c_str()));
+    }
+    cargs.push_back(nullptr);
+
     const pid_t pid = fork();
     if (pid < 0) {
         close(pipefd[0]);
@@ -410,13 +427,9 @@ int dist_process_run_capture_stdout(
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
-        std::vector<char *> cargs;
-        cargs.reserve(argv.size() + 1);
-        for (const auto & a : argv) {
-            cargs.push_back(const_cast<char *>(a.c_str()));
-        }
-        cargs.push_back(nullptr);
-        execv(argv[0].c_str(), cargs.data());
+        // execvp (not execv): argv[0] is often a bare command name (e.g.
+        // "curl") that must be resolved via $PATH, not a literal path.
+        execvp(argv[0].c_str(), cargs.data());
         _exit(127);
     }
 
