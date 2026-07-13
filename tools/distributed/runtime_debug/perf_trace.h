@@ -31,6 +31,10 @@ struct perf_trace_config {
 
 bool perf_trace_enabled();
 void perf_trace_load_config();
+// Re-read DIST_PERF_TRACE* from the environment, discarding the one-shot cache.
+// Lets a long-lived process (node_agent) enable tracing at request time after
+// the handler sets DIST_PERF_TRACE=1.
+void perf_trace_reload_config();
 const perf_trace_config & perf_trace_config_get();
 
 void perf_trace_set_node_id(const std::string & node_id);

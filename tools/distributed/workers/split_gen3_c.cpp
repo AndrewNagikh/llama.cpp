@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -27,6 +28,21 @@
 #include <vector>
 
 using json = nlohmann::json;
+
+// DIST_RUNTIME_SAMPLER_SYNC_SPLIT=1: explicit llama_synchronize before the
+// sampler so the GPU wait is traced apart from the sampler chain. Default off.
+static bool final_sampler_sync_split_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("DIST_RUNTIME_SAMPLER_SYNC_SPLIT");
+        if (v == nullptr || v[0] == '\0') {
+            return false;
+        }
+        return std::strcmp(v, "0") != 0 &&
+               std::strcmp(v, "false") != 0 &&
+               std::strcmp(v, "FALSE") != 0;
+    }();
+    return enabled;
+}
 
 static void usage(const char * prog) {
     fprintf(stderr,
@@ -689,6 +705,13 @@ int main(int argc, char ** argv) {
             }
 
             const int64_t t1 = ggml_time_us();
+            if (final_sampler_sync_split_enabled()) {
+                // Isolate the GPU wait from the sampler chain: llama_get_logits*
+                // inside the sampler would otherwise pay this synchronize.
+                perf_span sync_span("FINAL_LOGITS_SYNC_BEGIN", "FINAL_LOGITS_SYNC_END", perf_category::GPU, "final");
+                sync_span.set_token_idx(tok_idx);
+                llama_synchronize(ctx);
+            }
             perf_span sample_span("SAMPLER_BEGIN", "SAMPLER_END", perf_category::SAMPLING, "final");
             sample_span.set_token_idx(tok_idx);
             bool used_argmax = false;
@@ -718,9 +741,13 @@ int main(int argc, char ** argv) {
         resp.ms_compute = ms_compute;
         resp.ms_sample  = ms_sample;
 
-        if (!split_gen3_send_c_resp(bc_fd, resp)) {
-            fprintf(stderr, "gen3_c: send resp failed\n");
-            break;
+        {
+            perf_span resp_span("FINAL_RESP_SEND_BEGIN", "FINAL_RESP_SEND_END", perf_category::NETWORK, "final");
+            resp_span.set_token_idx(tok_idx);
+            if (!split_gen3_send_c_resp(bc_fd, resp)) {
+                fprintf(stderr, "gen3_c: send resp failed\n");
+                break;
+            }
         }
         if (decode_step) {
             final_queue_depth++;

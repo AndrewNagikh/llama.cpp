@@ -1259,6 +1259,18 @@ static bool run_local_pipeline_generate(
             perf_trace_begin_generate(*trace_id, "decode");
             generate_guard.active = true;
             perf_trace_set_context(*trace_id, "decode", -1);
+            char flag_attrs[224];
+            std::snprintf(
+                    flag_attrs,
+                    sizeof(flag_attrs),
+                    "{\"protocol\":%u,\"entry_queue\":%s,\"stage_queue\":%s,"
+                    "\"client_pipeline\":%s,\"external_embedding\":%s}",
+                    g_pipeline_protocol,
+                    use_entry_queue ? "true" : "false",
+                    runtime_stage_queue_client_enabled(g_pipeline_protocol) ? "true" : "false",
+                    client_pipeline ? "true" : "false",
+                    g_external_embedding ? "true" : "false");
+            perf_emit_instant("RUNTIME_FLAGS", perf_category::UNKNOWN, "client", -1, flag_attrs);
         }
     }
 
@@ -1295,47 +1307,93 @@ static bool run_local_pipeline_generate(
             if (g_external_embedding) {
                 std::vector<float> hidden;
                 int32_t n_embd = 0;
-                if (!embedding_service_compute({ cur }, pos, hidden, n_embd, err)) {
+                bool embed_ok;
+                {
+                    perf_span embed_span("CLIENT_EMBED_BEGIN", "CLIENT_EMBED_END", perf_category::COMPUTE, "client");
+                    embed_span.set_token_idx(step - 1);
+                    embed_ok = embedding_service_compute({ cur }, pos, hidden, n_embd, err);
+                }
+                if (!embed_ok) {
                     split_tcp_close(ctrl_fd);
                     return false;
                 }
-                if (!pipeline_gen3_send_hidden_recv(
+                bool rt_ok;
+                {
+                    perf_span rt_span("CLIENT_BLOCKING_RT_BEGIN", "CLIENT_BLOCKING_RT_END", perf_category::WAIT, "client");
+                    rt_span.set_token_idx(step - 1);
+                    rt_ok = pipeline_gen3_send_hidden_recv(
                             ctrl_fd, SPLIT_GEN_CMD_DECODE_HIDDEN, 1, n_embd, pos, layer_end,
-                            hidden.data(), resp)) {
+                            hidden.data(), resp);
+                }
+                if (!rt_ok) {
                     err = "decode hidden failed at step " + std::to_string(step);
                     split_tcp_close(ctrl_fd);
                     return false;
                 }
-            } else if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur, resp)) {
-                err = "decode failed at step " + std::to_string(step);
-                split_tcp_close(ctrl_fd);
-                return false;
+            } else {
+                bool rt_ok;
+                {
+                    perf_span rt_span("CLIENT_BLOCKING_RT_BEGIN", "CLIENT_BLOCKING_RT_END", perf_category::WAIT, "client");
+                    rt_span.set_token_idx(step - 1);
+                    rt_ok = pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur, resp);
+                }
+                if (!rt_ok) {
+                    err = "decode failed at step " + std::to_string(step);
+                    split_tcp_close(ctrl_fd);
+                    return false;
+                }
             }
         } else {
             if (!pending_wave) {
                 if (g_external_embedding) {
                     std::vector<float> hidden;
                     int32_t n_embd = 0;
-                    if (!embedding_service_compute({ cur }, pos, hidden, n_embd, err)) {
+                    bool embed_ok;
+                    {
+                        perf_span embed_span("CLIENT_EMBED_BEGIN", "CLIENT_EMBED_END", perf_category::COMPUTE, "client");
+                        embed_span.set_token_idx(step - 1);
+                        embed_ok = embedding_service_compute({ cur }, pos, hidden, n_embd, err);
+                    }
+                    if (!embed_ok) {
                         split_tcp_close(ctrl_fd);
                         return false;
                     }
-                    if (!pipeline_send_gen_hidden_req(
+                    bool send_ok;
+                    {
+                        perf_span send_span("CLIENT_SEND_BEGIN", "CLIENT_SEND_END", perf_category::NETWORK, "client");
+                        send_span.set_token_idx(step - 1);
+                        send_ok = pipeline_send_gen_hidden_req(
                                 ctrl_fd, SPLIT_GEN_CMD_DECODE_HIDDEN, 1, n_embd, pos, layer_end,
-                                hidden.data())) {
+                                hidden.data());
+                    }
+                    if (!send_ok) {
                         err = "decode hidden send failed at step " + std::to_string(step);
                         split_tcp_close(ctrl_fd);
                         return false;
                     }
-                } else if (!pipeline_send_gen_req(
-                                   ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur)) {
-                    err = "decode send failed at step " + std::to_string(step);
-                    split_tcp_close(ctrl_fd);
-                    return false;
+                } else {
+                    bool send_ok;
+                    {
+                        perf_span send_span("CLIENT_SEND_BEGIN", "CLIENT_SEND_END", perf_category::NETWORK, "client");
+                        send_span.set_token_idx(step - 1);
+                        send_ok = pipeline_send_gen_req(
+                                ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, pos, layer_end, &cur);
+                    }
+                    if (!send_ok) {
+                        err = "decode send failed at step " + std::to_string(step);
+                        split_tcp_close(ctrl_fd);
+                        return false;
+                    }
                 }
                 int32_t depth = 0;
                 int32_t wave_id = -1;
-                if (!pipeline_recv_queue_ack(ctrl_fd, depth, wave_id)) {
+                bool ack_ok;
+                {
+                    perf_span ack_span("CLIENT_ACK_WAIT_BEGIN", "CLIENT_ACK_WAIT_END", perf_category::WAIT, "client");
+                    ack_span.set_token_idx(step - 1);
+                    ack_ok = pipeline_recv_queue_ack(ctrl_fd, depth, wave_id);
+                }
+                if (!ack_ok) {
                     err = "decode queue ack failed at step " + std::to_string(step);
                     split_tcp_close(ctrl_fd);
                     return false;
@@ -1344,7 +1402,13 @@ static bool run_local_pipeline_generate(
 
             int32_t token_id = -1;
             int32_t ready_wave = -1;
-            if (!pipeline_recv_token_ready(ctrl_fd, token_id, ready_wave)) {
+            bool token_ok;
+            {
+                perf_span token_span("CLIENT_TOKEN_WAIT_BEGIN", "CLIENT_TOKEN_WAIT_END", perf_category::WAIT, "client");
+                token_span.set_token_idx(step - 1);
+                token_ok = pipeline_recv_token_ready(ctrl_fd, token_id, ready_wave);
+            }
+            if (!token_ok) {
                 err = "decode token ready failed at step " + std::to_string(step);
                 split_tcp_close(ctrl_fd);
                 return false;
@@ -1358,26 +1422,52 @@ static bool run_local_pipeline_generate(
                 if (g_external_embedding) {
                     std::vector<float> next_hidden;
                     int32_t next_n_embd = 0;
-                    if (!embedding_service_compute({ cur }, next_pos, next_hidden, next_n_embd, err)) {
+                    bool embed_ok;
+                    {
+                        perf_span embed_span("CLIENT_EMBED_BEGIN", "CLIENT_EMBED_END", perf_category::COMPUTE, "client");
+                        embed_span.set_token_idx(step);
+                        embed_ok = embedding_service_compute({ cur }, next_pos, next_hidden, next_n_embd, err);
+                    }
+                    if (!embed_ok) {
                         split_tcp_close(ctrl_fd);
                         return false;
                     }
-                    if (!pipeline_send_gen_hidden_req(
+                    bool send_ok;
+                    {
+                        perf_span send_span("CLIENT_SEND_BEGIN", "CLIENT_SEND_END", perf_category::NETWORK, "client");
+                        send_span.set_token_idx(step);
+                        send_ok = pipeline_send_gen_hidden_req(
                                 ctrl_fd, SPLIT_GEN_CMD_DECODE_HIDDEN, 1, next_n_embd, next_pos,
-                                layer_end, next_hidden.data())) {
+                                layer_end, next_hidden.data());
+                    }
+                    if (!send_ok) {
                         err = "decode hidden pipeline send failed at step " + std::to_string(step);
                         split_tcp_close(ctrl_fd);
                         return false;
                     }
-                } else if (!pipeline_send_gen_req(
-                                   ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, next_pos, layer_end, &cur)) {
-                    err = "decode pipeline send failed at step " + std::to_string(step);
-                    split_tcp_close(ctrl_fd);
-                    return false;
+                } else {
+                    bool send_ok;
+                    {
+                        perf_span send_span("CLIENT_SEND_BEGIN", "CLIENT_SEND_END", perf_category::NETWORK, "client");
+                        send_span.set_token_idx(step);
+                        send_ok = pipeline_send_gen_req(
+                                ctrl_fd, SPLIT_GEN_CMD_DECODE, 1, next_pos, layer_end, &cur);
+                    }
+                    if (!send_ok) {
+                        err = "decode pipeline send failed at step " + std::to_string(step);
+                        split_tcp_close(ctrl_fd);
+                        return false;
+                    }
                 }
                 int32_t depth2 = 0;
                 int32_t wave2 = -1;
-                if (!pipeline_recv_queue_ack(ctrl_fd, depth2, wave2)) {
+                bool ack_ok;
+                {
+                    perf_span ack_span("CLIENT_ACK_WAIT_BEGIN", "CLIENT_ACK_WAIT_END", perf_category::WAIT, "client");
+                    ack_span.set_token_idx(step);
+                    ack_ok = pipeline_recv_queue_ack(ctrl_fd, depth2, wave2);
+                }
+                if (!ack_ok) {
                     err = "decode pipeline ack failed at step " + std::to_string(step);
                     split_tcp_close(ctrl_fd);
                     return false;
@@ -1393,7 +1483,13 @@ static bool run_local_pipeline_generate(
                 }
             }
 
-            if (!pipeline_recv_gen_complete(ctrl_fd, resp)) {
+            bool complete_ok;
+            {
+                perf_span complete_span("CLIENT_COMPLETE_WAIT_BEGIN", "CLIENT_COMPLETE_WAIT_END", perf_category::WAIT, "client");
+                complete_span.set_token_idx(step - 1);
+                complete_ok = pipeline_recv_gen_complete(ctrl_fd, resp);
+            }
+            if (!complete_ok) {
                 err = "decode complete failed at step " + std::to_string(step);
                 split_tcp_close(ctrl_fd);
                 return false;
@@ -1429,6 +1525,11 @@ static bool run_local_pipeline_generate(
             { "total_ms", total_ms },
             { "generated_tokens", (int) out_tokens.size() },
         };
+        (*timing_out)["protocol_version"] = (int) g_pipeline_protocol;
+        (*timing_out)["entry_queue"] = use_entry_queue;
+        (*timing_out)["stage_queue"] = runtime_stage_queue_client_enabled(g_pipeline_protocol);
+        (*timing_out)["client_pipeline"] = client_pipeline;
+        (*timing_out)["external_embedding"] = g_external_embedding;
         if (trace_id != nullptr && !trace_id->empty()) {
             (*timing_out)["trace_id"] = *trace_id;
         }
@@ -2525,6 +2626,10 @@ int main(int argc, char ** argv) {
             if (!g_models_dir.empty()) {
                 dist_set_env("DIST_PERF_TRACE_DIR", (g_models_dir + "/perf_trace").c_str());
             }
+            // node_agent is long-lived; its perf config was cached at startup
+            // (likely DIST_PERF_TRACE=0). Re-read so the client decode loop traces.
+            perf_trace_reload_config();
+            perf_trace_set_node_id(g_node_id);
         }
 
         std::vector<int32_t> prompt_tokens;

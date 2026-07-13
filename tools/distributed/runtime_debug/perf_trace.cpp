@@ -267,6 +267,11 @@ void perf_trace_load_config() {
     perf_trace_register_ggml_hooks();
 }
 
+void perf_trace_reload_config() {
+    g_cfg_loaded = false;
+    perf_trace_load_config();
+}
+
 bool perf_trace_enabled() {
     perf_trace_load_config();
     return g_cfg.enabled;

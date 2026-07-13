@@ -10,6 +10,7 @@
 #include "../runtime_debug/hidden_transport.h"
 #include "../transport/split_tcp_wire.h"
 #include "../transport/runtime_protocol.h"
+#include "../runtime_debug/hidden_transport_breakdown.h"
 #include "../runtime_debug/perf_trace.h"
 #include "../runtime_debug/perf_ggml.h"
 #include "wave_inbound_queue.h"
@@ -29,29 +30,6 @@ static void usage(const char * prog) {
             "usage: %s MODEL --ctrl-port PORT --b-port PORT [--layer-end N] "
             "[--ready-file PATH]\n",
             prog);
-}
-
-static bool gather_stage_hidden(
-        llama_context * ctx,
-        int32_t n_tokens,
-        int32_t n_embd,
-        std::vector<float> & out) {
-    if (n_tokens <= 0) {
-        out.clear();
-        return true;
-    }
-    out.resize((size_t) n_tokens * (size_t) n_embd);
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        const float * h = n_tokens > 1 ? llama_get_embeddings_ith(ctx, i) : llama_get_embeddings(ctx);
-        if (h == nullptr) {
-            return false;
-        }
-        std::memcpy(
-                out.data() + (size_t) i * (size_t) n_embd,
-                h,
-                (size_t) n_embd * sizeof(float));
-    }
-    return true;
 }
 
 static bool forward_to_peer(
@@ -75,13 +53,19 @@ static bool forward_to_peer(
     const int32_t tok_idx = (phase && std::strcmp(phase, "decode") == 0) ? debug_step : -1;
 
     std::vector<float> hidden_buf;
-    const int64_t t_ser0 = ggml_time_us();
-    if (!gather_stage_hidden(ctx, n_tokens, n_embd, hidden_buf)) {
+    hidden_pack_stats pack_stats{};
+    if (perf_trace_enabled()) {
+        if (phase && std::strcmp(phase, "decode") == 0) {
+            perf_trace_ensure_decode_context(tok_idx, perf_trace_wave_id_from_step(phase, debug_step));
+        } else {
+            perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
+        }
+    }
+    if (!hidden_pack_gather_stage_hidden(ctx, n_tokens, n_embd, hidden_buf, pack_stats.gather)) {
         fprintf(stderr, "gen3_a: missing hidden state\n");
         return false;
     }
     const float * hidden = hidden_buf.data();
-    const int64_t serialize_us = ggml_time_us() - t_ser0;
     const int32_t payload_bytes = n_tokens * n_embd * (int32_t) sizeof(float);
 
     hidden_transport_trace tr_send = dist_debug_transport_send(
@@ -90,29 +74,20 @@ static bool forward_to_peer(
         dbg->emit_transport(tr_send);
     }
 
-    const int64_t t0 = ggml_time_us();
     split_gen_pipe_trace("entry", phase, "send_hidden_enter", n_tokens, n_embd, pos_start, -1, layer_end);
-    if (!split_ab_send_hidden(peer_fd, n_tokens, n_embd, layer_end, pos_start,
-            include_logits ? 1 : 0, hidden)) {
+    if (!hidden_pack_send_ab_hidden(peer_fd, n_tokens, n_embd, layer_end, pos_start,
+            include_logits ? 1 : 0, hidden, pack_stats.send)) {
         fprintf(stderr, "gen3_a: send hidden failed\n");
         return false;
     }
-    const int64_t send_us = ggml_time_us() - t0;
     split_gen_pipe_trace("entry", phase, "send_hidden_exit", n_tokens, n_embd, pos_start, -1, layer_end);
 
     if (perf_trace_enabled()) {
-        perf_trace_set_component("entry");
-        if (phase && std::strcmp(phase, "decode") == 0) {
-            perf_trace_ensure_decode_context(tok_idx, perf_trace_wave_id_from_step(phase, debug_step));
-        } else {
-            perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
-        }
-        if (serialize_us > 0) {
-            perf_emit_span(
-                    "SERIALIZE_HIDDEN_END", perf_category::SERIALIZATION, "entry", tok_idx, serialize_us, nullptr);
-        }
-        perf_emit_hidden_transfer("entry", tok_idx, "ab", payload_bytes, serialize_us, send_us, 0, 0);
-        perf_emit_span("ENTRY_SEND_END", perf_category::NETWORK, "entry", tok_idx, send_us, nullptr);
+        pack_stats.pack_total_us = pack_stats.gather.alloc_us + pack_stats.gather.sync_us
+                + pack_stats.gather.gather_us
+                + pack_stats.gather.copy_us + pack_stats.gather.serialize_us
+                + pack_stats.send.frame_us + pack_stats.send.send_us;
+        hidden_pack_emit_breakdown_spans(pack_stats, tok_idx, payload_bytes);
     }
 
     resp.magic          = SPLIT_GEN_MAGIC;
@@ -120,7 +95,7 @@ static bool forward_to_peer(
     resp.include_logits = include_logits ? 1 : 0;
     resp.n_vocab        = n_vocab;
     resp.ms_a_compute   = ms_a;
-    resp.ms_ab_xfer     = send_us / 1000.0;
+    resp.ms_ab_xfer     = pack_stats.send.send_us / 1000.0;
     logits_out.clear();
 
     if (next_is_final) {
@@ -171,13 +146,19 @@ static bool send_hidden_to_b_only(
     const int32_t tok_idx = (phase && std::strcmp(phase, "decode") == 0) ? debug_step : -1;
 
     std::vector<float> hidden_buf;
-    const int64_t t_ser0 = ggml_time_us();
-    if (!gather_stage_hidden(ctx, n_tokens, n_embd, hidden_buf)) {
+    hidden_pack_stats pack_stats{};
+    if (perf_trace_enabled()) {
+        if (phase && std::strcmp(phase, "decode") == 0) {
+            perf_trace_ensure_decode_context(tok_idx, perf_trace_wave_id_from_step(phase, debug_step));
+        } else {
+            perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
+        }
+    }
+    if (!hidden_pack_gather_stage_hidden(ctx, n_tokens, n_embd, hidden_buf, pack_stats.gather)) {
         fprintf(stderr, "gen3_a: missing hidden state\n");
         return false;
     }
     const float * hidden = hidden_buf.data();
-    const int64_t serialize_us = ggml_time_us() - t_ser0;
     const int32_t payload_bytes = n_tokens * n_embd * (int32_t) sizeof(float);
 
     hidden_transport_trace tr_send = dist_debug_transport_send(
@@ -186,30 +167,21 @@ static bool send_hidden_to_b_only(
         dbg->emit_transport(tr_send);
     }
 
-    const int64_t t0 = ggml_time_us();
     split_gen_pipe_trace("entry", phase, "send_hidden_enter", n_tokens, n_embd, pos_start, -1, layer_end);
-    if (!split_ab_send_hidden(peer_fd, n_tokens, n_embd, layer_end, pos_start,
-            include_logits ? 1 : 0, hidden)) {
+    if (!hidden_pack_send_ab_hidden(peer_fd, n_tokens, n_embd, layer_end, pos_start,
+            include_logits ? 1 : 0, hidden, pack_stats.send)) {
         fprintf(stderr, "gen3_a: send hidden failed\n");
         return false;
     }
-    const int64_t send_us = ggml_time_us() - t0;
-    ms_ab_xfer_out = send_us / 1000.0;
+    ms_ab_xfer_out = pack_stats.send.send_us / 1000.0;
     split_gen_pipe_trace("entry", phase, "send_hidden_exit", n_tokens, n_embd, pos_start, -1, layer_end);
 
     if (perf_trace_enabled()) {
-        perf_trace_set_component("entry");
-        if (phase && std::strcmp(phase, "decode") == 0) {
-            perf_trace_ensure_decode_context(tok_idx, perf_trace_wave_id_from_step(phase, debug_step));
-        } else {
-            perf_trace_set_wave_id(perf_trace_wave_id_from_step(phase, debug_step));
-        }
-        if (serialize_us > 0) {
-            perf_emit_span(
-                    "SERIALIZE_HIDDEN_END", perf_category::SERIALIZATION, "entry", tok_idx, serialize_us, nullptr);
-        }
-        perf_emit_hidden_transfer("entry", tok_idx, "ab", payload_bytes, serialize_us, send_us, 0, 0);
-        perf_emit_span("ENTRY_SEND_END", perf_category::NETWORK, "entry", tok_idx, send_us, nullptr);
+        pack_stats.pack_total_us = pack_stats.gather.alloc_us + pack_stats.gather.sync_us
+                + pack_stats.gather.gather_us
+                + pack_stats.gather.copy_us + pack_stats.gather.serialize_us
+                + pack_stats.send.frame_us + pack_stats.send.send_us;
+        hidden_pack_emit_breakdown_spans(pack_stats, tok_idx, payload_bytes);
     }
     (void) ms_a;
     return true;

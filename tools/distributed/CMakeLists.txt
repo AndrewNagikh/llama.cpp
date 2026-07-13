@@ -31,6 +31,8 @@ set(DIST_RUNTIME_DEBUG_SOURCES
     runtime_debug/layer_trace.cpp
     runtime_debug/runtime_state.cpp
     runtime_debug/hidden_transport.cpp
+    runtime_debug/hidden_transport_breakdown.cpp
+    ${DIST_TRANSPORT_SOURCES}
     verification/verification_common.cpp
     verification/deps/sha256/sha256.c
 )
