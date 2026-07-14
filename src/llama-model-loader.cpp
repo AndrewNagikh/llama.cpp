@@ -1222,11 +1222,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
         }
-        ggml_type type = GGML_TYPE_F32;
         const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
-        if (tid != -1) {
-            type = gguf_get_tensor_type(metadata, tid);
+        if (tid == -1) {
+            // Mirror the file-backed path: a tensor absent from the source
+            // model resolves to nullptr when optional and is an error when
+            // required. Creating it anyway would leave it zero-filled by the
+            // set_tensor_data callback, which silently corrupts the forward
+            // pass (e.g. a zero .scale multiplies activations to zero).
+            if (flags & TENSOR_NOT_REQUIRED) {
+                return nullptr;
+            }
+            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
         }
+        const ggml_type type = gguf_get_tensor_type(metadata, tid);
 
         // for tensors that are not required some of the dimensions can be invalid:
         if (flags & TENSOR_NOT_REQUIRED) {

@@ -64,6 +64,12 @@ void runtime_llama_set_tensor_data(struct ggml_tensor * tensor, void * userdata)
         return;
     }
 
+    // A created tensor with no layer-store backing gets zero-filled. This is
+    // only sound for tensors the graph will not read on this worker's layer
+    // range; anything else silently corrupts the forward pass, so always
+    // leave a trail in the log.
+    fprintf(stderr, "layer_store_model_load: WARNING zero-filling tensor with no blob backing: %s (%zu bytes)\n",
+            name.c_str(), nbytes);
     std::vector<uint8_t> zeros(nbytes, 0);
     ggml_backend_tensor_set(tensor, zeros.data(), 0, nbytes);
 }
