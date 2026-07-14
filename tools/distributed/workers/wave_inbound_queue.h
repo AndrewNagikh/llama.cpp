@@ -30,11 +30,19 @@ public:
     int32_t depth() const;
     int32_t observable_depth(bool processor_active) const;
 
-    // Blocks when full (backpressure).
+    // Blocks when full (backpressure). Returns false if the queue is closed.
     bool push(wave_work_item item);
 
     bool try_pop(wave_work_item & item);
+    // Blocks until an item is available or the queue is closed. Returns
+    // false only when closed AND drained -- pending items are still
+    // delivered after close().
     bool pop(wave_work_item & item);
+
+    // Wakes every blocked pop()/push(). The producer (receiver thread) must
+    // call this when it stops, otherwise a consumer parked in pop() sleeps
+    // forever -- there is no other wakeup source.
+    void close();
 
 private:
     const int32_t          max_depth_;
@@ -42,6 +50,7 @@ private:
     std::condition_variable not_full_;
     std::condition_variable not_empty_;
     std::deque<wave_work_item> items_;
+    bool                   closed_ = false;
 };
 
 class hidden_inbound_queue {
@@ -54,7 +63,10 @@ public:
 
     bool push(hidden_wave_work_item item);
     bool try_pop(hidden_wave_work_item & item);
+    // See wave_inbound_queue::pop.
     bool pop(hidden_wave_work_item & item);
+    // See wave_inbound_queue::close.
+    void close();
 
 private:
     const int32_t          max_depth_;
@@ -62,6 +74,7 @@ private:
     std::condition_variable not_full_;
     std::condition_variable not_empty_;
     std::deque<hidden_wave_work_item> items_;
+    bool                   closed_ = false;
 };
 
 int32_t runtime_entry_queue_max_depth();

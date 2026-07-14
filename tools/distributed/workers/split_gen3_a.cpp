@@ -631,6 +631,14 @@ static bool entry_run_queued_session(
                 perf_emit_queue_depth("entry", -1, entry_queue_depth);
             }
         }
+        // The consumer below may be parked in queue.pop() with nothing left
+        // to wake it: after this thread exits, push() never fires again, so
+        // an un-closed queue leaves the consumer -- and therefore this whole
+        // session function -- blocked forever. The ctrl accept loop in
+        // main() then never runs again, every later connect sees no reply
+        // to its negotiate request, and the orchestrator burns ~30s per
+        // generate on a full pipeline recovery. Always close on exit.
+        queue.close();
     });
 
     while (!stop.load() || queue.depth() > 0) {
@@ -639,7 +647,10 @@ static bool entry_run_queued_session(
             if (stop.load()) {
                 break;
             }
-            queue.pop(item);
+            if (!queue.pop(item)) {
+                // Queue closed by the receiver and fully drained.
+                break;
+            }
         }
         processor_active.fetch_add(1);
         ctx_mu.lock();
@@ -673,6 +684,10 @@ static bool entry_run_queued_session(
     }
 
     stop.store(true);
+    // Mirror of the receiver-side close: if the receiver is parked in a
+    // blocking push() against a full queue when this consumer dies, only a
+    // close() wakes it so the join below can complete.
+    queue.close();
     if (receiver.joinable()) {
         receiver.join();
     }

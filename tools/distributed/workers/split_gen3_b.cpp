@@ -375,6 +375,9 @@ static bool middle_run_queued_session(
                 perf_emit_queue_depth("middle", -1, middle_queue_depth);
             }
         }
+        // Wake a consumer parked in queue.pop(); nothing else ever will
+        // once this producer thread has exited (see split_gen3_a.cpp).
+        queue.close();
     });
 
     std::thread bc_responder([&] {
@@ -439,7 +442,10 @@ static bool middle_run_queued_session(
             if (stop.load()) {
                 break;
             }
-            queue.pop(item);
+            if (!queue.pop(item)) {
+                // Queue closed by the receiver and fully drained.
+                break;
+            }
         }
         bool ok;
         {
@@ -454,6 +460,8 @@ static bool middle_run_queued_session(
     }
 
     stop.store(true);
+    // Wake a receiver parked in a blocking push() so the join can complete.
+    queue.close();
     if (receiver.joinable()) {
         receiver.join();
     }

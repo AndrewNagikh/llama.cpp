@@ -80,7 +80,10 @@ int32_t wave_inbound_queue::observable_depth(const bool processor_active) const 
 
 bool wave_inbound_queue::push(wave_work_item item) {
     std::unique_lock<std::mutex> lock(mu_);
-    not_full_.wait(lock, [&] { return (int32_t) items_.size() < max_depth_; });
+    not_full_.wait(lock, [&] { return (int32_t) items_.size() < max_depth_ || closed_; });
+    if (closed_) {
+        return false;
+    }
     items_.push_back(std::move(item));
     not_empty_.notify_one();
     return true;
@@ -99,11 +102,21 @@ bool wave_inbound_queue::try_pop(wave_work_item & item) {
 
 bool wave_inbound_queue::pop(wave_work_item & item) {
     std::unique_lock<std::mutex> lock(mu_);
-    not_empty_.wait(lock, [&] { return !items_.empty(); });
+    not_empty_.wait(lock, [&] { return !items_.empty() || closed_; });
+    if (items_.empty()) {
+        return false;
+    }
     item = std::move(items_.front());
     items_.pop_front();
     not_full_.notify_one();
     return true;
+}
+
+void wave_inbound_queue::close() {
+    std::lock_guard<std::mutex> lock(mu_);
+    closed_ = true;
+    not_empty_.notify_all();
+    not_full_.notify_all();
 }
 
 hidden_inbound_queue::hidden_inbound_queue(const int32_t max_depth)
@@ -124,7 +137,10 @@ int32_t hidden_inbound_queue::observable_depth(const bool processor_active) cons
 
 bool hidden_inbound_queue::push(hidden_wave_work_item item) {
     std::unique_lock<std::mutex> lock(mu_);
-    not_full_.wait(lock, [&] { return (int32_t) items_.size() < max_depth_; });
+    not_full_.wait(lock, [&] { return (int32_t) items_.size() < max_depth_ || closed_; });
+    if (closed_) {
+        return false;
+    }
     items_.push_back(std::move(item));
     not_empty_.notify_one();
     return true;
@@ -143,9 +159,19 @@ bool hidden_inbound_queue::try_pop(hidden_wave_work_item & item) {
 
 bool hidden_inbound_queue::pop(hidden_wave_work_item & item) {
     std::unique_lock<std::mutex> lock(mu_);
-    not_empty_.wait(lock, [&] { return !items_.empty(); });
+    not_empty_.wait(lock, [&] { return !items_.empty() || closed_; });
+    if (items_.empty()) {
+        return false;
+    }
     item = std::move(items_.front());
     items_.pop_front();
     not_full_.notify_one();
     return true;
+}
+
+void hidden_inbound_queue::close() {
+    std::lock_guard<std::mutex> lock(mu_);
+    closed_ = true;
+    not_empty_.notify_all();
+    not_full_.notify_all();
 }
