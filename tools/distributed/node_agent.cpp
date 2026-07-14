@@ -1882,6 +1882,23 @@ int main(int argc, char ** argv) {
         g_node_id = bind_host + ":" + std::to_string(http_port);
     }
 
+    // Layer-first is this project's default runtime mode (Task 11); GGUF
+    // materialization is a compat fallback. runtime_layer_first_enabled()
+    // reads DIST_RUNTIME_LAYER_FIRST from THIS process's own environment,
+    // but the only place that ever set it was set_worker_layer_store_env()
+    // inside the /configure handler -- which runs strictly after
+    // /runtime/prepare, the handler that actually reads the flag to decide
+    // materialize-vs-bind. On a freshly started node_agent, every worker's
+    // very first /runtime/prepare therefore always saw the flag unset and
+    // fell through to materializing a full worker GGUF via the (separately
+    // buggy) legacy assembler. Set the default here, at process start,
+    // before any request can be handled, so the decision point sees it.
+    // An operator can still force legacy materialization with
+    // DIST_RUNTIME_LAYER_FIRST=0 in the environment before launch.
+    if (std::getenv("DIST_RUNTIME_LAYER_FIRST") == nullptr) {
+        dist_set_env("DIST_RUNTIME_LAYER_FIRST", "1");
+    }
+
     dist_debug_load_config();
     dist_debug_set_worker("node_agent", g_node_id);
     split_tcp_init();
