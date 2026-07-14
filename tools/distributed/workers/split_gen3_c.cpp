@@ -342,6 +342,14 @@ static bool final_run_queued_session(
     st.debug_step = &debug_step;
     st.queue_depth = &final_queue_depth;
 
+    // RESET arrives on the receiver thread's control-channel recv loop, while
+    // the consumer loop below concurrently drives decode/sample on the same
+    // st.ctx from queued hidden-state items. Without this lock the two
+    // threads mutate the same llama_context (KV cache clear vs. active
+    // decode) at once, which corrupts ggml's allocator state -- seen as
+    // "malloc: Heap corruption detected" crashes on the final-stage worker.
+    std::mutex ctx_mu;
+
     std::thread receiver([&] {
         while (!stop.load()) {
             split_ab_cmd cmd;
@@ -360,8 +368,11 @@ static bool final_run_queued_session(
             }
 
             if (cmd == SPLIT_AB_CMD_RESET) {
-                llama_memory_clear(llama_get_memory(st.ctx), true);
-                llama_clear_hidden_state(st.ctx);
+                {
+                    std::lock_guard<std::mutex> lock(ctx_mu);
+                    llama_memory_clear(llama_get_memory(st.ctx), true);
+                    llama_clear_hidden_state(st.ctx);
+                }
                 if (st.external_output &&
                         !output_service_reset_http(st.output_http_host, st.output_http_port)) {
                     fprintf(stderr, "gen3_c: output service reset failed\n");
@@ -413,7 +424,12 @@ static bool final_run_queued_session(
             }
             queue.pop(item);
         }
-        if (!final_process_hidden_item(st, item)) {
+        bool ok;
+        {
+            std::lock_guard<std::mutex> lock(ctx_mu);
+            ok = final_process_hidden_item(st, item);
+        }
+        if (!ok) {
             pipe_failed = true;
             stop.store(true);
             break;

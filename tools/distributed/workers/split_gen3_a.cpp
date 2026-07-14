@@ -209,6 +209,10 @@ struct entry_stage_state {
     trace_recorder * dbg         = nullptr;
     int32_t *       debug_step   = nullptr;
     int32_t *       entry_queue_depth = nullptr;
+    // Non-null only in the queued-session path, where a separate receiver
+    // thread can deliver RESET concurrently with the consumer thread's
+    // decode on the same ctx. Guards both against that race.
+    std::mutex *    ctx_mu       = nullptr;
 };
 
 static bool entry_process_work_item(
@@ -408,8 +412,14 @@ static bool entry_handle_control_cmd(
         return true;
     }
     if (req.cmd == SPLIT_GEN_CMD_RESET) {
+        if (st.ctx_mu) {
+            st.ctx_mu->lock();
+        }
         llama_memory_clear(llama_get_memory(st.ctx), true);
         llama_clear_hidden_state(st.ctx);
+        if (st.ctx_mu) {
+            st.ctx_mu->unlock();
+        }
         debug_step = 0;
         if (st.dbg) {
             st.dbg->emit_step_begin(0, "reset", -1, 0, 0);
@@ -441,6 +451,10 @@ static bool entry_run_queued_session(
     int32_t entry_queue_depth = 0;
     st.debug_step = &debug_step;
     st.entry_queue_depth = &entry_queue_depth;
+    // See entry_stage_state::ctx_mu: the receiver thread's RESET handling and
+    // this function's consumer loop both touch st.ctx concurrently.
+    std::mutex ctx_mu;
+    st.ctx_mu = &ctx_mu;
     const bool pipeline_ab = runtime_stage_queue_enabled();
     const bool defer_complete = pipeline_ab && runtime_client_pipeline_enabled();
 
@@ -628,10 +642,13 @@ static bool entry_run_queued_session(
             queue.pop(item);
         }
         processor_active.fetch_add(1);
-        if (!entry_process_work_item(
+        ctx_mu.lock();
+        const bool item_ok = entry_process_work_item(
                     st, item, true, &ctrl_mu, pipeline_ab,
                     pipeline_ab ? &ab_mu : nullptr,
-                    pipeline_ab ? &ab_pending : nullptr)) {
+                    pipeline_ab ? &ab_pending : nullptr);
+        ctx_mu.unlock();
+        if (!item_ok) {
             pipe_failed = true;
             stop.store(true);
             processor_active.fetch_sub(1);

@@ -308,6 +308,13 @@ static bool middle_run_queued_session(
     st.debug_step = &debug_step;
     st.queue_depth = &middle_queue_depth;
 
+    // RESET arrives on the receiver thread's control-channel recv loop, while
+    // the consumer loop below concurrently drives decode on the same st.ctx
+    // from queued hidden-state items. Without this lock the two threads
+    // mutate the same llama_context (KV cache clear vs. active decode) at
+    // once, corrupting ggml's allocator state.
+    std::mutex ctx_mu;
+
     std::thread receiver([&] {
         while (!stop.load()) {
             split_ab_cmd cmd;
@@ -327,8 +334,11 @@ static bool middle_run_queued_session(
             }
 
             if (cmd == SPLIT_AB_CMD_RESET) {
-                llama_memory_clear(llama_get_memory(st.ctx), true);
-                llama_clear_hidden_state(st.ctx);
+                {
+                    std::lock_guard<std::mutex> lock(ctx_mu);
+                    llama_memory_clear(llama_get_memory(st.ctx), true);
+                    llama_clear_hidden_state(st.ctx);
+                }
                 debug_step = 0;
                 middle_queue_depth = 0;
                 split_ab_send_reset(st.bc_fd);
@@ -431,7 +441,12 @@ static bool middle_run_queued_session(
             }
             queue.pop(item);
         }
-        if (!middle_process_hidden_item(st, item, true, &bc_mu, &bc_pending)) {
+        bool ok;
+        {
+            std::lock_guard<std::mutex> lock(ctx_mu);
+            ok = middle_process_hidden_item(st, item, true, &bc_mu, &bc_pending);
+        }
+        if (!ok) {
             pipe_failed = true;
             stop.store(true);
             break;
