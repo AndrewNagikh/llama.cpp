@@ -1,5 +1,6 @@
 #include "perf_trace_export.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -69,4 +70,44 @@ bool perf_trace_read_file(const std::string & root, const std::string & rel, std
     ss << in.rdbuf();
     out = ss.str();
     return true;
+}
+
+perf_trace_cleanup_result perf_trace_cleanup(const std::string & root, const int max_age_days) {
+    perf_trace_cleanup_result result{};
+    if (root.empty() || max_age_days <= 0) {
+        return result;
+    }
+    std::error_code ec;
+    if (!fs::exists(root, ec) || ec) {
+        return result;
+    }
+
+    // Compare within filesystem-clock's own domain -- avoids the C++17
+    // file_time_type -> system_clock conversion dance entirely.
+    const auto now_fs = fs::file_time_type::clock::now();
+    const auto cutoff  = now_fs - std::chrono::hours(24 * (int64_t) max_age_days);
+
+    for (const auto & ent : fs::recursive_directory_iterator(root, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!ent.is_regular_file()) {
+            continue;
+        }
+        const fs::path & p = ent.path();
+        if (p.extension() != ".jsonl") {
+            continue;
+        }
+        std::error_code fec;
+        const auto mtime = fs::last_write_time(p, fec);
+        if (fec || mtime >= cutoff) {
+            continue;
+        }
+        const auto size = fs::file_size(p, fec);
+        if (fs::remove(p, fec)) {
+            result.deleted_files++;
+            result.freed_bytes += fec ? 0 : (int64_t) size;
+        }
+    }
+    return result;
 }

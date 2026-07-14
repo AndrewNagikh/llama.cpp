@@ -30,6 +30,7 @@
 #include "workers/split_gen_common.h"
 #include "runtime_debug/runtime_debug.h"
 #include "runtime_debug/perf_trace.h"
+#include "runtime_debug/node_log_export.h"
 #include "runtime_debug/perf_trace_export.h"
 #include "runtime_debug/perf_gpu_sampler.h"
 #include "runtime_debug/trace_recorder.h"
@@ -1980,6 +1981,44 @@ int main(int argc, char ** argv) {
         }
         res.set_header("Content-Type", "application/x-ndjson");
         res.set_content(content, "application/x-ndjson");
+    });
+
+    svr.Post("/perf/trace/cleanup", [](const httplib::Request & req, httplib::Response & res) {
+        int max_age_days = 7;
+        try {
+            if (!req.body.empty()) {
+                const json body = json::parse(req.body);
+                max_age_days = body.value("max_age_days", max_age_days);
+            }
+        } catch (...) {
+            // Fall through with the default.
+        }
+        const std::string root = perf_trace_resolve_root(g_models_dir);
+        const perf_trace_cleanup_result r = perf_trace_cleanup(root, max_age_days);
+        res.set_content(json({
+            { "ok", true },
+            { "node_id", g_node_id },
+            { "root", root },
+            { "max_age_days", max_age_days },
+            { "deleted_files", r.deleted_files },
+            { "freed_bytes", r.freed_bytes },
+        }).dump(), "application/json");
+    });
+
+    svr.Get("/debug/log", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string path = node_log_resolve_path(g_models_dir, "node_agent.log");
+        if (path.empty() || !std::filesystem::exists(path)) {
+            res.status = 404;
+            res.set_content(json({ { "error", "log file not found" }, { "path", path } }).dump(),
+                    "application/json");
+            return;
+        }
+        size_t lines = 300;
+        if (const std::string v = req.get_param_value("lines"); !v.empty()) {
+            lines = (size_t) std::max(0, std::atoi(v.c_str()));
+        }
+        res.set_header("Content-Type", "text/plain");
+        res.set_content(node_log_tail(path, lines, 4 * 1024 * 1024), "text/plain");
     });
 
     svr.Post("/perf/trace/begin_decode", [](const httplib::Request & req, httplib::Response & res) {

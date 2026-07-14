@@ -20,6 +20,7 @@ set(DIST_PERF_TRACE_SOURCES
     runtime_debug/perf_trace_export.cpp
     runtime_debug/perf_gpu_sampler.cpp
     runtime_debug/perf_ggml.cpp
+    runtime_debug/node_log_export.cpp
 )
 
 set(DIST_RUNTIME_DEBUG_SOURCES
