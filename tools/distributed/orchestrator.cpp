@@ -2221,6 +2221,46 @@ static bool recover_session_pipeline(dist_session & session, std::string & err) 
     usleep(300000);
 #endif
 
+    // Re-bind each worker's layer-store materialization before reconfiguring:
+    // skip_materialize=true below requires a worker_gguf handle (see
+    // configure_session_pipeline for the same two-step pattern). Recovery
+    // previously set skip_materialize without ever calling
+    // prepare_runtime_node, so every reconfigure failed with "worker_gguf
+    // required when skip_materialize=true" and recovery could never succeed.
+    const size_t n_stages = session.pipeline.size();
+    std::vector<std::string> worker_ggufs(n_stages);
+    for (size_t i = 0; i < n_stages; ++i) {
+        const auto & stage = session.pipeline[i];
+        const dist_node_info * node = find_node(node_map, stage.node_id);
+        if (node == nullptr) {
+            err = "pipeline recovery node vanished: " + stage.node_id;
+            return false;
+        }
+
+        json prep = {
+            { "session_id", session.session_id },
+            { "model_id", session.model },
+            { "layer_start", stage.layer_start },
+            { "layer_end", stage.layer_end },
+            { "peer_bind", "0.0.0.0" },
+        };
+        if (const dist_model_record * record = g_registry.find(session.model)) {
+            prep["source_url"] = resolve_model_source_url(*record);
+        }
+        if (stage.role == DIST_ROLE_FINAL) {
+            prep["role"] = "final";
+        } else if (stage.role == DIST_ROLE_MIDDLE) {
+            prep["role"] = "middle";
+        } else {
+            prep["role"] = "entry";
+        }
+
+        if (!prepare_runtime_node(*node, prep, worker_ggufs[i], err, 600000)) {
+            err = "pipeline recovery prepare " + stage.node_id + ": " + err;
+            return false;
+        }
+    }
+
     for (int ri = (int) session.pipeline.size() - 1; ri >= 0; --ri) {
         const auto & stage = session.pipeline[(size_t) ri];
         const dist_node_info * node = find_node(node_map, stage.node_id);
@@ -2236,6 +2276,7 @@ static bool recover_session_pipeline(dist_session & session, std::string & err) 
             { "layer_end", stage.layer_end },
             { "peer_bind", "0.0.0.0" },
             { "skip_materialize", true },
+            { "worker_gguf", configure_worker_artifact(worker_ggufs[(size_t) ri]) },
             { "runtime_role", "pipeline_stage" },
         };
         if (const dist_model_record * record = g_registry.find(session.model)) {
