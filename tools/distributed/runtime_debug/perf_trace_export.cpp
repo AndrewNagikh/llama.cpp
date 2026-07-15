@@ -49,9 +49,21 @@ nlohmann::json perf_trace_list_files(const std::string & root) {
         if (ec || rel.empty()) {
             continue;
         }
+        int64_t mtime_unix = 0;
+        std::error_code mec;
+        const auto mtime = fs::last_write_time(p, mec);
+        if (!mec) {
+            // file_time_type epoch differs from system_clock's pre-C++20; convert
+            // through the clocks' current instants.
+            const auto sys_now = std::chrono::system_clock::now();
+            const auto fs_now  = fs::file_time_type::clock::now();
+            const auto sys_mtime = sys_now + std::chrono::duration_cast<std::chrono::system_clock::duration>(mtime - fs_now);
+            mtime_unix = std::chrono::duration_cast<std::chrono::seconds>(sys_mtime.time_since_epoch()).count();
+        }
         files.push_back({
-            { "rel",  rel },
-            { "size", fs::file_size(p, ec) },
+            { "rel",        rel },
+            { "size",       fs::file_size(p, ec) },
+            { "mtime_unix", mtime_unix },
         });
     }
     return files;

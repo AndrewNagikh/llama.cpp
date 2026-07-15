@@ -377,6 +377,11 @@ static void parse_decode_context_file() {
         g_trace_id = trace_id;
         g_phase    = "decode";
     }
+    // Workers spawned before begin_decode may lack DIST_NODE_ID in their env;
+    // adopt the node_agent-written identity so events are attributable.
+    if (g_cfg.node_id.empty()) {
+        extract_string("node_id", g_cfg.node_id);
+    }
 }
 
 void perf_trace_write_decode_context(const std::string & trace_id) {
@@ -398,6 +403,7 @@ void perf_trace_write_decode_context(const std::string & trace_id) {
     }
     f << "{"
       << "\"trace_id\":" << json_escape(trace_id) << ","
+      << "\"node_id\":" << json_escape(g_cfg.node_id) << ","
       << "\"phase\":\"decode\""
       << "}";
     g_trace_id = trace_id;
@@ -984,8 +990,13 @@ const char * perf_trace_output_dir() {
 }
 
 std::string perf_make_trace_id(const int seq) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "trace-%06d", seq);
+    // Embed process start time so ids never collide across orchestrator
+    // restarts (a reused trace-NNNNNN appended new events into old dirs).
+    static const int64_t start_epoch =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "trace-%lld-%04d", (long long) start_epoch, seq);
     return std::string(buf);
 }
 

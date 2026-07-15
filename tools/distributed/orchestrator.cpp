@@ -21,6 +21,7 @@
 #include "runtime/runtime_graph.h"
 #include "runtime/runtime_role.h"
 #include "runtime/runtime_install_planning.h"
+#include "dist_process.h"
 #include "runtime_debug/perf_trace.h"
 #include "runtime_debug/node_log_export.h"
 #include "runtime_debug/perf_trace_export.h"
@@ -3419,6 +3420,14 @@ int main(int argc, char ** argv) {
         const std::string session_id = body.value("session_id", "");
         const std::string prompt     = body.value("prompt", DEFAULT_GENERATE_PROMPT);
         const int max_tokens         = body.value("max_tokens", DIST_MAX_NEW_TOKENS);
+
+        // Request-driven trace enablement: the benchmark harness runs on a
+        // different host, so gating fanout on this process's env alone means
+        // silent no-trace runs unless the orchestrator was started traced.
+        if (body.value("perf_trace", false) && !perf_trace_enabled()) {
+            dist_set_env("DIST_PERF_TRACE", "1");
+            perf_trace_reload_config();
+        }
 
         const auto t_request_start = std::chrono::steady_clock::now();
 

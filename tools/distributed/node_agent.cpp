@@ -1672,14 +1672,17 @@ static bool start_worker(
             dist_set_env("LLAMA_DIST_TRACE_DIR", trace_dir.c_str());
         }
     }
+    // Always give workers their perf identity: tracing may be enabled after
+    // spawn (begin_decode), and events without node_id/component are
+    // unattributable in analysis.
+    dist_set_env("DIST_NODE_ID", g_node_id.c_str());
+    dist_set_env("DIST_PERF_COMPONENT", dist_role_name(cfg.role).c_str());
+    if (!g_models_dir.empty()) {
+        const std::string perf_dir = g_models_dir + "/perf_trace";
+        dist_set_env("DIST_PERF_TRACE_DIR", perf_dir.c_str());
+    }
     if (perf_trace_enabled()) {
         dist_set_env("DIST_PERF_TRACE", "1");
-        if (!g_models_dir.empty()) {
-            const std::string perf_dir = g_models_dir + "/perf_trace";
-            dist_set_env("DIST_PERF_TRACE_DIR", perf_dir.c_str());
-        }
-        dist_set_env("DIST_NODE_ID", g_node_id.c_str());
-        dist_set_env("DIST_PERF_COMPONENT", dist_role_name(cfg.role).c_str());
     }
 
     const std::string ready_file = worker_ready_state_file(cfg.role, cfg.session_id);
@@ -2041,6 +2044,9 @@ int main(int argc, char ** argv) {
             if (!g_models_dir.empty()) {
                 dist_set_env("DIST_PERF_TRACE_DIR", (g_models_dir + "/perf_trace").c_str());
             }
+            // The config is cached at first use; without a reload this process
+            // keeps enabled=false and worker spawns skip trace env propagation.
+            perf_trace_reload_config();
         }
         perf_trace_set_node_id(g_node_id);
         perf_trace_write_decode_context(trace_id);
