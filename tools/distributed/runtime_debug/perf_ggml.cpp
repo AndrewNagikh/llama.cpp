@@ -55,8 +55,13 @@ static void ggml_hook_end(const char * event) {
     g_ggml_t0.erase(it);
 
     perf_category cat = perf_category::COMPUTE;
-    if (key.find("SYNC") != std::string::npos || key.find("SCHED_") == 0) {
+    if (key.find("SYNC") != std::string::npos ||
+        key.find("LLAMA_BACKEND") == 0 ||
+        key.find("LLAMA_GET_EMBEDDINGS") == 0 ||
+        key.find("SCHED_") == 0) {
         cat = perf_category::WAIT;
+    } else if (key.find("EMBD_D2H") != std::string::npos) {
+        cat = perf_category::NETWORK;
     }
 
     int32_t token_idx = -1;

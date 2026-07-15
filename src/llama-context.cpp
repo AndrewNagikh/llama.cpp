@@ -750,7 +750,9 @@ void llama_context::synchronize() {
         return;
     }
 
+    llama_perf_hook_ggml_begin("LLAMA_BACKEND_SYNCHRONIZE");
     ggml_backend_sched_synchronize(sched.get());
+    llama_perf_hook_ggml_end("LLAMA_BACKEND_SYNCHRONIZE");
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2071,14 +2073,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                             GGML_ASSERT(n_rows > 0);
                             GGML_ASSERT((n_outputs_prev + n_rows)*n_embd_out <= (int64_t) embd.size);
+                            llama_perf_hook_ggml_begin("EMBD_D2H_GET_ASYNC");
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_rows*n_embd_out*sizeof(float));
+                            llama_perf_hook_ggml_end("EMBD_D2H_GET_ASYNC");
                         } else {
                             float * embd_out = embd.data + n_outputs_prev*n_embd_out;
 
                             if (n_outputs) {
                                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd.size);
+                                llama_perf_hook_ggml_begin("EMBD_D2H_GET_ASYNC");
                                 ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
+                                llama_perf_hook_ggml_end("EMBD_D2H_GET_ASYNC");
                             }
                         }
                     } break;
@@ -3858,15 +3864,23 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
+    llama_perf_hook_ggml_begin("LLAMA_GET_EMBEDDINGS");
     ctx->synchronize();
-
-    return ctx->get_embeddings();
+    llama_perf_hook_ggml_begin("LLAMA_GET_EMBEDDINGS_ACCESS");
+    float * res = ctx->get_embeddings();
+    llama_perf_hook_ggml_end("LLAMA_GET_EMBEDDINGS_ACCESS");
+    llama_perf_hook_ggml_end("LLAMA_GET_EMBEDDINGS");
+    return res;
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
+    llama_perf_hook_ggml_begin("LLAMA_GET_EMBEDDINGS");
     ctx->synchronize();
-
-    return ctx->get_embeddings_ith(i);
+    llama_perf_hook_ggml_begin("LLAMA_GET_EMBEDDINGS_ACCESS");
+    float * res = ctx->get_embeddings_ith(i);
+    llama_perf_hook_ggml_end("LLAMA_GET_EMBEDDINGS_ACCESS");
+    llama_perf_hook_ggml_end("LLAMA_GET_EMBEDDINGS");
+    return res;
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
