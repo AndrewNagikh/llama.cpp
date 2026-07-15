@@ -15,7 +15,7 @@
 #include <dlfcn.h>
 #endif
 
-#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
+#if defined(__linux__) || defined(__APPLE__)
 #include <sys/time.h>
 #endif
 
@@ -55,7 +55,7 @@ struct cpu_usage_tracker {
              + static_cast<uint64_t>(info.user_time.microseconds)
              + static_cast<uint64_t>(info.system_time.seconds) * 1000000ULL
              + static_cast<uint64_t>(info.system_time.microseconds);
-#else
+#elif defined(__linux__)
         struct rusage ru {};
         if (getrusage(RUSAGE_THREAD, &ru) != 0) {
             if (getrusage(RUSAGE_SELF, &ru) != 0) {
@@ -66,6 +66,8 @@ struct cpu_usage_tracker {
              + static_cast<uint64_t>(ru.ru_utime.tv_usec)
              + static_cast<uint64_t>(ru.ru_stime.tv_sec) * 1000000ULL
              + static_cast<uint64_t>(ru.ru_stime.tv_usec);
+#else
+        return 0;
 #endif
     }
 
@@ -249,6 +251,8 @@ static gpu_sample_reading take_sample() {
 
 #if defined(__APPLE__)
     reading.backend = "metal";
+#elif defined(_WIN32)
+    reading.backend = "cuda";
 #else
     reading.backend = "cpu";
 #endif

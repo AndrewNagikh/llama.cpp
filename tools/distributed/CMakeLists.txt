@@ -271,7 +271,7 @@ function(dist_add_worker name main_source)
         ${RUNTIME_WORKER_LOAD_SOURCES}
         ${DIST_WORKERS_DIR}/wave_inbound_queue.cpp)
     target_include_directories(${name} PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(${name} PRIVATE llama llama-common Threads::Threads)
+    target_link_libraries(${name} PRIVATE llama llama-common cpp-httplib Threads::Threads)
     dist_link_platform_libs(${name})
 endfunction()
 
@@ -377,7 +377,6 @@ target_link_libraries(verify_context_params PRIVATE llama llama-common Threads::
 dist_add_worker(split_gen3_a ${DIST_WORKERS_DIR}/split_gen3_a.cpp)
 dist_add_worker(split_gen3_b ${DIST_WORKERS_DIR}/split_gen3_b.cpp)
 dist_add_worker(split_gen3_c ${DIST_WORKERS_DIR}/split_gen3_c.cpp)
-target_link_libraries(split_gen3_c PRIVATE cpp-httplib)
 
 # End-to-end cluster validation suite (Task 7.5). Defined unconditionally so a
 # single `build.sh e2e` builds them even when LLAMA_BUILD_TESTS is OFF.
