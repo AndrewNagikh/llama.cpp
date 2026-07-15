@@ -2927,6 +2927,18 @@ int main(int argc, char ** argv) {
         const std::string model_id = body.value("model", "");
         const int request_ctx = body.value("n_ctx", g_n_ctx);
 
+        // Workers are spawned during this call (setup_runtime_graph ->
+        // configure_node -> perf_attach_trace), and DIST_PERF_TRACE is only
+        // readable by a worker once, at its own process start -- a later
+        // /session/generate enabling tracing can never reach an
+        // already-spawned worker. Without this, whether a worker gets
+        // traced depends on whichever stale enabled-state this orchestrator
+        // process happened to be sitting in, not on this request.
+        if (body.value("perf_trace", false) && !perf_trace_enabled()) {
+            dist_set_env("DIST_PERF_TRACE", "1");
+            perf_trace_reload_config();
+        }
+
         if (model_id.empty()) {
             res.status = 400;
             res.set_content(json({ { "error", "model id required" } }).dump(), "application/json");
