@@ -2,6 +2,7 @@
 
 #include "dist_common.h"
 #include "dist_process.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "llama.h"
@@ -323,6 +324,77 @@ BenchmarkResult run_node_benchmark(const std::string & model_path) {
     return result;
 }
 
+// Decode is memory-bandwidth-bound: each token reads the node's weight bytes
+// once. A matvec over a large f16 matrix reads the matrix once per compute,
+// so elapsed ~= nbytes / effective_bandwidth.
+static float dist_probe_gpu_bandwidth_gbps(ggml_backend_dev_t dev) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    if (!backend) {
+        return 0.0f;
+    }
+
+    const int64_t k = 4096;
+    const int64_t m = 32768; // 4096 x 32768 f16 = 256 MiB
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        return 0.0f;
+    }
+
+    float gbps = 0.0f;
+    ggml_backend_buffer_t buf = nullptr;
+    do {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, m);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        if (!a || !x) {
+            break;
+        }
+        ggml_tensor * y = ggml_mul_mat(ctx, a, x);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        if (!y || !gf) {
+            break;
+        }
+        ggml_build_forward_expand(gf, y);
+
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!buf) {
+            break;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+
+        bool ok = true;
+        for (int i = 0; i < 2 && ok; ++i) {
+            ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        }
+        if (!ok) {
+            break;
+        }
+        ggml_backend_synchronize(backend);
+
+        const int iters = 12;
+        const int64_t t0 = ggml_time_us();
+        for (int i = 0; i < iters && ok; ++i) {
+            ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        }
+        ggml_backend_synchronize(backend);
+        const double elapsed_s = (ggml_time_us() - t0) / 1e6;
+        if (ok && elapsed_s > 0.0) {
+            gbps = (float) ((double) ggml_nbytes(a) * iters / elapsed_s / 1e9);
+        }
+    } while (false);
+
+    if (buf) {
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return gbps;
+}
+
 BenchmarkResult dist_run_hardware_benchmark() {
     BenchmarkResult result{};
 
@@ -333,19 +405,42 @@ BenchmarkResult dist_run_hardware_benchmark() {
     const dist_node_capabilities caps = dist_probe_capabilities();
 
     const int cores = cpu.logical_cores > 0 ? cpu.logical_cores : 4;
-    float base      = static_cast<float>(cores) * 12.0f;
+
+    float gpu_gbps = 0.0f;
     if (memory.has_gpu) {
-        base += static_cast<float>(std::max(1, caps.gpu_memory_mb)) / 256.0f * 40.0f;
+        ggml_backend_load_all();
+        if (ggml_backend_dev_t dev = dist_first_gpu_device()) {
+            gpu_gbps = dist_probe_gpu_bandwidth_gbps(dev);
+        }
     }
 
-    result.decode_tps  = base;
-    result.prefill_tps = base * 1.15f;
+    if (gpu_gbps > 0.0f) {
+        // Score must rank nodes by decode capability, which is bandwidth-
+        // bound. The x4 factor only keeps the magnitude near the legacy
+        // formula's range; all consumers compare scores relatively.
+        result.decode_tps = gpu_gbps * 4.0f;
+    } else {
+        // Legacy static estimate, kept as the CPU/probe-failure fallback.
+        float base = static_cast<float>(cores) * 12.0f;
+        if (memory.has_gpu) {
+            base += static_cast<float>(std::max(1, caps.gpu_memory_mb)) / 256.0f * 40.0f;
+        }
+        result.decode_tps = base;
+    }
+
+    result.prefill_tps = result.decode_tps * 1.15f;
     result.score       = dist_compute_benchmark_score(result.decode_tps, result.prefill_tps);
     result.load_ms     = 0.0f;
 
-    fprintf(stderr,
-            "node_benchmark: hardware-only score=%.1f (cores=%d gpu=%s)\n",
-            result.score, cores, memory.has_gpu ? "yes" : "no");
+    if (gpu_gbps > 0.0f) {
+        fprintf(stderr,
+                "node_benchmark: hardware-only score=%.1f (gpu bandwidth probe %.1f GB/s, cores=%d)\n",
+                result.score, gpu_gbps, cores);
+    } else {
+        fprintf(stderr,
+                "node_benchmark: hardware-only score=%.1f (cores=%d gpu=%s)\n",
+                result.score, cores, memory.has_gpu ? "yes" : "no");
+    }
     return result;
 }
 

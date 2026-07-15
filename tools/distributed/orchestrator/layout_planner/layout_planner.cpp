@@ -488,8 +488,27 @@ layout_build_result build_desired_layout(
         return result;
     }
 
+    // Pipeline role order. The node holding the first layers becomes the
+    // entry stage and the node holding the last layers becomes final. Final
+    // is the heaviest per-token stage (output norm + lm_head + sampler on
+    // top of its layers; see Research 17), entry is second (embedding), so
+    // give final to the strongest node and entry to the second-strongest
+    // instead of the previous strongest-first order, which systematically
+    // parked the heaviest stage on the weakest node.
+    std::vector<size_t> stage_order;
+    stage_order.reserve(active.size());
+    if (active.size() >= 2) {
+        stage_order.push_back(1);
+        for (size_t i = 2; i < active.size(); ++i) {
+            stage_order.push_back(i);
+        }
+        stage_order.push_back(0);
+    } else {
+        stage_order.push_back(0);
+    }
+
     int layer_cursor = 0;
-    for (size_t i = 0; i < active.size(); ++i) {
+    for (const size_t i : stage_order) {
         for (int c = 0; c < counts[i]; ++c) {
             layer_placement p{};
             p.layer_index = layer_cursor;
