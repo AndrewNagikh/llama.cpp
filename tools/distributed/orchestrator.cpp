@@ -949,12 +949,16 @@ static std::string configure_worker_artifact(const std::string & artifact) {
 
 static void perf_attach_trace(json & body) {
     if (!perf_trace_enabled()) {
+        fprintf(stderr, "SCRATCH_DEBUG: perf_attach_trace: perf_trace_enabled()=false, not attaching\n");
         return;
     }
     std::string trace_id;
     std::string phase;
     int32_t token_idx = -1;
-    if (perf_trace_get_context(trace_id, phase, token_idx) && !trace_id.empty()) {
+    const bool has_ctx = perf_trace_get_context(trace_id, phase, token_idx);
+    fprintf(stderr, "SCRATCH_DEBUG: perf_attach_trace: enabled=true has_ctx=%d trace_id='%s' phase='%s'\n",
+            has_ctx ? 1 : 0, trace_id.c_str(), phase.c_str());
+    if (has_ctx && !trace_id.empty()) {
         body["trace_id"]   = trace_id;
         body["perf_trace"] = true;
     }
