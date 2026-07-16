@@ -947,17 +947,17 @@ static std::string configure_worker_artifact(const std::string & artifact) {
     return artifact.empty() ? "layer-store" : artifact;
 }
 
-static void perf_attach_trace(json & body) {
+static void perf_attach_trace(json & body, const char * label = "?") {
     if (!perf_trace_enabled()) {
-        fprintf(stderr, "SCRATCH_DEBUG: perf_attach_trace: perf_trace_enabled()=false, not attaching\n");
+        fprintf(stderr, "SCRATCH_DEBUG: perf_attach_trace[%s]: perf_trace_enabled()=false, not attaching\n", label);
         return;
     }
     std::string trace_id;
     std::string phase;
     int32_t token_idx = -1;
     const bool has_ctx = perf_trace_get_context(trace_id, phase, token_idx);
-    fprintf(stderr, "SCRATCH_DEBUG: perf_attach_trace: enabled=true has_ctx=%d trace_id='%s' phase='%s'\n",
-            has_ctx ? 1 : 0, trace_id.c_str(), phase.c_str());
+    fprintf(stderr, "SCRATCH_DEBUG: perf_attach_trace[%s]: enabled=true has_ctx=%d trace_id='%s' phase='%s'\n",
+            label, has_ctx ? 1 : 0, trace_id.c_str(), phase.c_str());
     if (has_ctx && !trace_id.empty()) {
         body["trace_id"]   = trace_id;
         body["perf_trace"] = true;
@@ -978,7 +978,7 @@ static bool prepare_runtime_node(
     cli.set_read_timeout(timeout_ms / 1000, (timeout_ms % 1000) * 1000);
 
     json req_body = body;
-    perf_attach_trace(req_body);
+    perf_attach_trace(req_body, "runtime/prepare");
     const auto res = cli.Post("/runtime/prepare", req_body.dump(), "application/json");
     if (!res) {
         err = "no response from " + node.node_id + " prepare at " + node.host + ":" +
@@ -1045,7 +1045,7 @@ static bool configure_node(
     cli.set_read_timeout(timeout_ms / 1000, (timeout_ms % 1000) * 1000);
 
     json req_body = body;
-    perf_attach_trace(req_body);
+    perf_attach_trace(req_body, "configure_node/configure");
     const auto res = cli.Post("/configure", req_body.dump(), "application/json");
     if (!res) {
         err = "no response from " + node.node_id + " at " + node.host + ":" + std::to_string(node.http_port);
@@ -1675,7 +1675,7 @@ static bool setup_runtime_graph(
                     { "model_id", session.model },
                     { "worker_gguf", configure_worker_artifact(artifact) },
                 };
-                perf_attach_trace(cfg);
+                perf_attach_trace(cfg, "tokenizer");
                 const std::string svc_role = runtime_role_name(a.role);
                 perf_session_span svc_span(
                         "SESSION_SERVICE_CONFIGURE",
@@ -1703,7 +1703,7 @@ static bool setup_runtime_graph(
                     { "model_id", session.model },
                     { "worker_gguf", configure_worker_artifact(artifact) },
                 };
-                perf_attach_trace(cfg);
+                perf_attach_trace(cfg, "embedding");
                 const std::string svc_role = runtime_role_name(a.role);
                 perf_session_span svc_span(
                         "SESSION_SERVICE_CONFIGURE",
@@ -1731,7 +1731,7 @@ static bool setup_runtime_graph(
                     { "model_id", session.model },
                     { "worker_gguf", configure_worker_artifact(artifact) },
                 };
-                perf_attach_trace(cfg);
+                perf_attach_trace(cfg, "output_head");
                 const std::string svc_role = runtime_role_name(a.role);
                 perf_session_span svc_span(
                         "SESSION_SERVICE_CONFIGURE",
@@ -1758,7 +1758,7 @@ static bool setup_runtime_graph(
                     { "session_id", session_id },
                     { "model_id", session.model },
                 };
-                perf_attach_trace(cfg);
+                perf_attach_trace(cfg, "sampler");
                 const std::string svc_role = runtime_role_name(a.role);
                 perf_session_span svc_span(
                         "SESSION_SERVICE_CONFIGURE",
