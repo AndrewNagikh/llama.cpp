@@ -650,6 +650,13 @@ static void perf_consume_trace_from_body(const json & body, const char * compone
         if (!g_models_dir.empty()) {
             dist_set_env("DIST_PERF_TRACE_DIR", (g_models_dir + "/perf_trace").c_str());
         }
+        // g_cfg is cached at first perf_trace_enabled() call; without this,
+        // a long-lived node_agent that already cached enabled=false ignores
+        // DIST_PERF_TRACE=1 above, and every worker this /configure spawns
+        // inherits an environment with tracing off for its whole lifetime
+        // (env vars set here after fork can never reach an already-running
+        // child either way, so this must land before start_worker() runs).
+        perf_trace_reload_config();
     }
     if (!trace_id.empty()) {
         perf_trace_set_node_id(g_node_id);
@@ -2934,6 +2941,8 @@ int main(int argc, char ** argv) {
             if (!g_models_dir.empty()) {
                 dist_set_env("DIST_PERF_TRACE_DIR", (g_models_dir + "/perf_trace").c_str());
             }
+            // See perf_consume_trace_from_body: g_cfg is cached at first use.
+            perf_trace_reload_config();
             if (!trace_id.empty()) {
                 perf_trace_set_node_id(g_node_id);
                 perf_trace_set_component("sync");
