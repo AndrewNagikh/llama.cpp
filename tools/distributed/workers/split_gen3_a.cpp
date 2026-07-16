@@ -88,12 +88,6 @@ static bool forward_to_peer(
                 + pack_stats.gather.copy_us + pack_stats.gather.serialize_us
                 + pack_stats.send.frame_us + pack_stats.send.send_us;
         hidden_pack_emit_breakdown_spans(pack_stats, tok_idx, payload_bytes);
-        // Mirrors split_gen3_b.cpp's "bc" emission -- without this, the "ab"
-        // hop never appears as a HIDDEN_TRANSFER event, and metric_validation's
-        // clock-skew serial-path fallback (compute_critical_path_tokens) can
-        // never assemble a complete entry+ab+middle+bc+final+sampling chain.
-        perf_emit_hidden_transfer(
-                "entry", tok_idx, "ab", payload_bytes, 0, pack_stats.send.send_us, 0, 0);
     }
 
     resp.magic          = SPLIT_GEN_MAGIC;
@@ -188,9 +182,6 @@ static bool send_hidden_to_b_only(
                 + pack_stats.gather.copy_us + pack_stats.gather.serialize_us
                 + pack_stats.send.frame_us + pack_stats.send.send_us;
         hidden_pack_emit_breakdown_spans(pack_stats, tok_idx, payload_bytes);
-        // See forward_to_peer's identical emission above.
-        perf_emit_hidden_transfer(
-                "entry", tok_idx, "ab", payload_bytes, 0, pack_stats.send.send_us, 0, 0);
     }
     (void) ms_a;
     return true;
