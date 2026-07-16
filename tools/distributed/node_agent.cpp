@@ -1950,8 +1950,29 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!register_with_orchestrator(orchestrator, g_node_id, register_host, http_port)) {
-        return 1;
+    // The orchestrator and this node are commonly restarted together (e.g.
+    // after a rebuild); a bare orchestrator start lag or brief network blip
+    // at boot must not be fatal here -- only the ongoing heartbeat below
+    // retries on its own, and it never runs if this first call gives up.
+    {
+        const int max_attempts = 15;
+        const int retry_delay_s = 2;
+        bool registered = false;
+        for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+            if (register_with_orchestrator(orchestrator, g_node_id, register_host, http_port)) {
+                registered = true;
+                break;
+            }
+            if (attempt < max_attempts) {
+                fprintf(stderr, "node_agent: register attempt %d/%d failed, retrying in %ds\n",
+                        attempt, max_attempts, retry_delay_s);
+                std::this_thread::sleep_for(std::chrono::seconds(retry_delay_s));
+            }
+        }
+        if (!registered) {
+            fprintf(stderr, "node_agent: giving up after %d register attempts\n", max_attempts);
+            return 1;
+        }
     }
 
     // Heartbeat: periodically re-register so the orchestrator recovers this node
