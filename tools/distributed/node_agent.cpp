@@ -642,8 +642,6 @@ static layer_store get_layer_store(const std::string & model_id) {
 static void perf_consume_trace_from_body(const json & body, const char * component) {
     const std::string trace_id = body.value("trace_id", "");
     const bool perf_trace = body.value("perf_trace", false);
-    fprintf(stderr, "SCRATCH_DEBUG: perf_consume_trace_from_body(%s): perf_trace=%d trace_id='%s' pre_enabled=%d\n",
-            component, perf_trace ? 1 : 0, trace_id.c_str(), perf_trace_enabled() ? 1 : 0);
     if (!perf_trace && !perf_trace_enabled()) {
         return;
     }

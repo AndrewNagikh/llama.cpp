@@ -164,17 +164,27 @@ static void ensure_open() {
     if (!perf_trace_enabled()) {
         return;
     }
-    if (g_out.is_open()) {
-        return;
-    }
     if (g_output_dir.empty()) {
         return;
     }
-    ensure_trace_dir(g_output_dir);
     const std::string comp = g_cfg.component.empty() ? "component" : g_cfg.component;
     const std::string nid  = g_cfg.node_id.empty() ? "node" : g_cfg.node_id;
     const std::string tid  = g_trace_id.empty() ? "notrace" : g_trace_id;
-    g_out_path = g_output_dir + "/" + tid + "_" + nid + "_" + comp + ".jsonl";
+    const std::string want = g_output_dir + "/" + tid + "_" + nid + "_" + comp + ".jsonl";
+    // The stream must follow context changes. A long-lived worker's first
+    // write often lands during prefill (ttft subdir of whatever trace is
+    // current at that moment); keeping that first handle forever silently
+    // funnels every later decode event of every later trace into it, which
+    // is exactly how entry-worker events (incl. the ab-hop HIDDEN_TRANSFER)
+    // vanished from all decode analysis while physically existing on disk.
+    if (g_out.is_open() && g_out_path == want) {
+        return;
+    }
+    if (g_out.is_open()) {
+        g_out.close();
+    }
+    ensure_trace_dir(g_output_dir);
+    g_out_path = want;
     g_out.open(g_out_path, std::ios::app);
 }
 
