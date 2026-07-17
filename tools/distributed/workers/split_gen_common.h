@@ -159,6 +159,17 @@ static int split_gen_decode_hidden_seq(
     return 0;
 }
 
+// Task 19 verify waves can leave a speculative KV tail on stages that
+// processed tokens the verifier later rejected. Every stage tracks its next
+// expected position; a wave arriving below it truncates the stale tail first.
+static void split_gen_rollback_kv(llama_context * ctx, const int32_t next_pos,
+        const int32_t pos_start, const char * tag) {
+    if (pos_start < next_pos) {
+        llama_memory_seq_rm(llama_get_memory(ctx), 0, pos_start, -1);
+        fprintf(stderr, "%s: kv rollback [%d, %d) -> %d\n", tag, pos_start, next_pos, pos_start);
+    }
+}
+
 static std::vector<llama_token> split_gen_tokenize(const llama_vocab * vocab, const std::string & prompt) {
     const int n = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), nullptr, 0, true, true);
     std::vector<llama_token> tokens(n);

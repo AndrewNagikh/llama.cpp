@@ -96,12 +96,19 @@ enum split_gen_cmd : uint32_t {
     SPLIT_GEN_CMD_DECODE_HIDDEN  = 6,
     SPLIT_GEN_CMD_PROTO_NEGOTIATE = 7,
     SPLIT_GEN_CMD_DRAIN_PENDING   = 8,
+    // Speculative verify wave (Task 19): tokens carry [anchor, draft_1..draft_k];
+    // entry decodes the batch and forwards hidden + the draft ids downstream,
+    // final verifies per position and returns accepted_count + corrected token.
+    SPLIT_GEN_CMD_VERIFY          = 9,
 };
 
 enum split_ab_cmd : uint32_t {
     SPLIT_AB_CMD_RESET   = 1,
     SPLIT_AB_CMD_HIDDEN  = 2,
     SPLIT_AB_CMD_SHUTDOWN = 3,
+    // Draft token ids for the verify wave that follows as the next HIDDEN
+    // on this connection. Middle stages forward it unchanged.
+    SPLIT_AB_CMD_VERIFY_IDS = 4,
 };
 
 #pragma pack(push, 1)
@@ -151,6 +158,11 @@ bool split_ab_send_hidden(int fd, int32_t n_tokens, int32_t n_embd, int32_t laye
 bool split_ab_send_reset(int fd);
 bool split_ab_send_shutdown(int fd);
 
+// Verify-wave draft ids (Task 19). Sent immediately before the wave's HIDDEN
+// message on the same connection; the receiver associates them by pos_start.
+bool split_ab_send_verify_ids(int fd, int32_t pos_start, const int32_t * ids, int32_t n);
+bool split_ab_recv_verify_ids(int fd, int32_t & pos_start, std::vector<int32_t> & ids);
+
 bool split_ab_recv_cmd(int fd, split_ab_cmd & cmd);
 bool split_ab_recv_hidden(int fd, split_tcp_hidden_msg & msg);
 bool split_ab_send_b_resp(int fd, const split_gen_b_resp & resp, const float * logits, int32_t n_vocab);
@@ -167,6 +179,10 @@ struct split_gen3_c_resp {
     int32_t  n_vocab;
     double   ms_compute;
     double   ms_sample;
+    // Verify waves only (SPLIT_GEN_CMD_VERIFY): number of draft tokens whose
+    // target argmax matched; token_id is then the corrected token sampled at
+    // the first rejected position. -1 for ordinary decode waves.
+    int32_t  accepted_count;
 };
 
 struct split_gen3_mid_resp {
@@ -177,6 +193,7 @@ struct split_gen3_mid_resp {
     double   ms_bc_xfer;
     double   ms_c_compute;
     double   ms_c_sample;
+    int32_t  accepted_count;
 };
 
 struct split_gen3_a_resp {
@@ -191,6 +208,7 @@ struct split_gen3_a_resp {
     double   ms_bc_xfer;
     double   ms_c_compute;
     double   ms_c_sample;
+    int32_t  accepted_count;
 };
 
 struct split_proto_negotiate_resp {

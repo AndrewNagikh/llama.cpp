@@ -90,6 +90,7 @@ static bool forward_to_c(
     resp.ms_bc_xfer   = send_us / 1000.0;
     resp.ms_c_compute = cresp.ms_compute;
     resp.ms_c_sample  = cresp.ms_sample;
+    resp.accepted_count = cresp.accepted_count;
     return true;
 }
 
@@ -160,6 +161,7 @@ struct middle_stage_state {
     trace_recorder * dbg        = nullptr;
     int32_t *       debug_step  = nullptr;
     int32_t *       queue_depth = nullptr;
+    int32_t         next_pos    = 0;
 };
 
 struct middle_bc_pending {
@@ -172,7 +174,7 @@ struct middle_bc_pending {
 };
 
 static bool middle_process_hidden_item(
-        const middle_stage_state & st,
+        middle_stage_state & st,
         hidden_wave_work_item & item,
         const bool pipeline_bc,
         std::mutex * bc_mu,
@@ -211,6 +213,7 @@ static bool middle_process_hidden_item(
     }
 
     llama_set_layer_range(st.ctx, st.layer_start, st.layer_end);
+    split_gen_rollback_kv(st.ctx, st.next_pos, msg.meta.pos_start, "gen3_b");
 
     double ms_b = 0.0;
     std::vector<float> out_hidden;
@@ -225,6 +228,7 @@ static bool middle_process_hidden_item(
         fprintf(stderr, "gen3_b: decode failed\n");
         return false;
     }
+    st.next_pos = msg.meta.pos_start + msg.header.n_tokens;
     split_gen_pipe_trace("middle", phase, "decode_exit",
             msg.header.n_tokens, st.n_embd, msg.meta.pos_start, st.layer_start, st.layer_end);
 
@@ -235,6 +239,14 @@ static bool middle_process_hidden_item(
 
     split_gen_pipe_trace("middle", phase, "forward_to_final_enter",
             msg.header.n_tokens, st.n_embd, msg.meta.pos_start, st.layer_start, st.layer_end);
+
+    if (!item.verify_ids.empty()) {
+        if (!split_ab_send_verify_ids(st.bc_fd, msg.meta.pos_start,
+                    item.verify_ids.data(), (int32_t) item.verify_ids.size())) {
+            fprintf(stderr, "gen3_b: forward verify ids failed\n");
+            return false;
+        }
+    }
 
     if (pipeline_bc && bc_mu != nullptr && bc_pending != nullptr) {
         middle_bc_pending pending;
@@ -316,6 +328,8 @@ static bool middle_run_queued_session(
     std::mutex ctx_mu;
 
     std::thread receiver([&] {
+        int32_t              pending_verify_pos = -1;
+        std::vector<int32_t> pending_verify_ids;
         while (!stop.load()) {
             split_ab_cmd cmd;
             perf_trace_sched_queue_wait_begin();
@@ -341,7 +355,17 @@ static bool middle_run_queued_session(
                 }
                 debug_step = 0;
                 middle_queue_depth = 0;
+                pending_verify_pos = -1;
+                pending_verify_ids.clear();
                 split_ab_send_reset(st.bc_fd);
+                continue;
+            }
+
+            if (cmd == SPLIT_AB_CMD_VERIFY_IDS) {
+                if (!split_ab_recv_verify_ids(st.ab_fd, pending_verify_pos, pending_verify_ids)) {
+                    stop.store(true);
+                    break;
+                }
                 continue;
             }
 
@@ -366,6 +390,11 @@ static bool middle_run_queued_session(
             item.msg        = std::move(msg);
             item.debug_step = debug_step;
             item.wave_id    = queued_wave_id;
+            if (pending_verify_pos >= 0 && pending_verify_pos == item.msg.meta.pos_start) {
+                item.verify_ids = std::move(pending_verify_ids);
+            }
+            pending_verify_pos = -1;
+            pending_verify_ids.clear();
 
             queue.push(std::move(item));
             middle_queue_depth = queue.observable_depth(true);
@@ -407,13 +436,14 @@ static bool middle_run_queued_session(
             }
 
             split_gen3_mid_resp resp{};
-            resp.magic        = SPLIT_GEN_MAGIC;
-            resp.token_id     = cresp.token_id;
-            resp.n_vocab      = cresp.n_vocab;
-            resp.ms_b_compute = pending.ms_b;
-            resp.ms_bc_xfer   = pending.ms_bc_xfer;
-            resp.ms_c_compute = cresp.ms_compute;
-            resp.ms_c_sample  = cresp.ms_sample;
+            resp.magic          = SPLIT_GEN_MAGIC;
+            resp.token_id       = cresp.token_id;
+            resp.n_vocab        = cresp.n_vocab;
+            resp.ms_b_compute   = pending.ms_b;
+            resp.ms_bc_xfer     = pending.ms_bc_xfer;
+            resp.ms_c_compute   = cresp.ms_compute;
+            resp.ms_c_sample    = cresp.ms_sample;
+            resp.accepted_count = cresp.accepted_count;
 
             const char * phase = pending.decode_step ? "decode" : "prefill";
             if (st.dbg) {
@@ -677,6 +707,12 @@ int main(int argc, char ** argv) {
             debug_step = 0;
             split_ab_send_reset(bc_fd);
             continue;
+        }
+
+        if (cmd == SPLIT_AB_CMD_VERIFY_IDS) {
+            // Verify waves are only routed through the queued-session path.
+            fprintf(stderr, "gen3_b: verify wave requires the stage queue path\n");
+            break;
         }
 
         if (cmd != SPLIT_AB_CMD_HIDDEN) {

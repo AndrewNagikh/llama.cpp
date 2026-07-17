@@ -20,6 +20,9 @@ struct hidden_wave_work_item {
     split_tcp_hidden_msg msg;
     int32_t              wave_id    = -1;
     int32_t              debug_step = 0;
+    // Verify wave (Task 19): [anchor, draft_1..draft_k], matched to this
+    // wave by pos_start. Empty for ordinary waves.
+    std::vector<int32_t> verify_ids;
 };
 
 class wave_inbound_queue {

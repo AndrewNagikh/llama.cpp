@@ -104,11 +104,12 @@ static bool forward_to_peer(
             fprintf(stderr, "gen3_a: recv final resp failed\n");
             return false;
         }
-        resp.token_id     = cresp.token_id;
-        resp.ms_b_compute = 0.0;
-        resp.ms_bc_xfer   = 0.0;
-        resp.ms_c_compute = cresp.ms_compute;
-        resp.ms_c_sample  = cresp.ms_sample;
+        resp.token_id       = cresp.token_id;
+        resp.ms_b_compute   = 0.0;
+        resp.ms_bc_xfer     = 0.0;
+        resp.ms_c_compute   = cresp.ms_compute;
+        resp.ms_c_sample    = cresp.ms_sample;
+        resp.accepted_count = cresp.accepted_count;
         return true;
     }
 
@@ -120,11 +121,12 @@ static bool forward_to_peer(
     }
     split_gen_pipe_trace("entry", phase, "recv_mid_exit", n_tokens, n_embd, pos_start, -1, layer_end);
 
-    resp.token_id     = mid.token_id;
-    resp.ms_b_compute = mid.ms_b_compute;
-    resp.ms_bc_xfer   = mid.ms_bc_xfer;
-    resp.ms_c_compute = mid.ms_c_compute;
-    resp.ms_c_sample  = mid.ms_c_sample;
+    resp.token_id       = mid.token_id;
+    resp.ms_b_compute   = mid.ms_b_compute;
+    resp.ms_bc_xfer     = mid.ms_bc_xfer;
+    resp.ms_c_compute   = mid.ms_c_compute;
+    resp.ms_c_sample    = mid.ms_c_sample;
+    resp.accepted_count = mid.accepted_count;
     return true;
 }
 
@@ -213,10 +215,11 @@ struct entry_stage_state {
     // thread can deliver RESET concurrently with the consumer thread's
     // decode on the same ctx. Guards both against that race.
     std::mutex *    ctx_mu       = nullptr;
+    int32_t         next_pos     = 0;
 };
 
 static bool entry_process_work_item(
-        const entry_stage_state & st,
+        entry_stage_state & st,
         wave_work_item & item,
         const bool send_early_token,
         std::mutex * ctrl_mu,
@@ -232,7 +235,8 @@ static bool entry_process_work_item(
     const int64_t t0 = ggml_time_us();
     int decode_rc = 0;
     const char * phase = (req.cmd == SPLIT_GEN_CMD_PREFILL ||
-                          req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) ? "prefill" : "decode";
+                          req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN ||
+                          req.cmd == SPLIT_GEN_CMD_VERIFY) ? "prefill" : "decode";
     const int32_t in_tok = tokens_i32.empty() ? -1 : tokens_i32[0];
     const int32_t wave_id = item.wave_id >= 0
             ? item.wave_id
@@ -265,7 +269,8 @@ static bool entry_process_work_item(
     }
     perf_span compute_span("ENTRY_COMPUTE_BEGIN", "ENTRY_COMPUTE_END", perf_category::COMPUTE, "entry");
     compute_span.set_token_idx(tok_idx);
-    if (req.cmd == SPLIT_GEN_CMD_PREFILL) {
+    split_gen_rollback_kv(st.ctx, st.next_pos, req.pos_start, "gen3_a");
+    if (req.cmd == SPLIT_GEN_CMD_PREFILL || req.cmd == SPLIT_GEN_CMD_VERIFY) {
         if (st.layer_start > 0) {
             fprintf(stderr, "gen3_a: token prefill requires layer_start=0\n");
             return false;
@@ -303,8 +308,22 @@ static bool entry_process_work_item(
     }
 
     const int32_t n_out = (req.cmd == SPLIT_GEN_CMD_PREFILL ||
-                           req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) ? req.n_tokens : 1;
+                           req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN ||
+                           req.cmd == SPLIT_GEN_CMD_VERIFY) ? req.n_tokens : 1;
     const int32_t le = req.layer_end > 0 ? req.layer_end : st.layer_end;
+    st.next_pos = req.pos_start + n_out;
+
+    if (req.cmd == SPLIT_GEN_CMD_VERIFY) {
+        if (pipeline_ab) {
+            fprintf(stderr, "gen3_a: verify wave requires DIST_RUNTIME_ENTRY_QUEUE=0\n");
+            return false;
+        }
+        if (!split_ab_send_verify_ids(st.b_fd, req.pos_start,
+                    tokens_i32.data(), (int32_t) tokens_i32.size())) {
+            fprintf(stderr, "gen3_a: send verify ids failed\n");
+            return false;
+        }
+    }
 
     if (st.dbg) {
         dist_debug_log_kv(st.dbg, st.debug_step ? *st.debug_step : 0, phase, st.ctx, 0);
@@ -887,7 +906,8 @@ int main(int argc, char ** argv) {
         item.hidden        = std::move(hidden_in);
         item.hidden_n_embd = hidden_n_embd;
         const char * phase = (req.cmd == SPLIT_GEN_CMD_PREFILL ||
-                              req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN) ? "prefill" : "decode";
+                              req.cmd == SPLIT_GEN_CMD_PREFILL_HIDDEN ||
+                              req.cmd == SPLIT_GEN_CMD_VERIFY) ? "prefill" : "decode";
         item.wave_id = perf_trace_wave_id_from_step(phase, debug_step);
 
         if (!entry_process_work_item(st, item, false, nullptr, false, nullptr, nullptr)) {

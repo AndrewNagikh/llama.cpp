@@ -185,7 +185,78 @@ struct final_stage_state {
     trace_recorder * dbg                = nullptr;
     int32_t *       debug_step          = nullptr;
     int32_t *       queue_depth         = nullptr;
+    // Next expected KV position; a wave arriving below it means an earlier
+    // speculative tail (or a retried wave) must be truncated first.
+    int32_t         next_pos            = 0;
 };
+
+static int32_t logits_argmax(const float * logits, const int32_t n_vocab) {
+    int32_t best = 0;
+    for (int32_t v = 1; v < n_vocab; ++v) {
+        if (logits[v] > logits[best]) {
+            best = v;
+        }
+    }
+    return best;
+}
+
+// Verify wave: inputs are [anchor, d_1..d_k] at positions pos_start..pos_start+k.
+// Decoding position pos_start+i predicts the token at pos_start+i+1; accept the
+// longest prefix where the prediction matches d_{i+1}, stop at the first
+// mismatch (the rejected tail is then never written to KV), and return the
+// target's own prediction at the split point as the corrected/bonus token.
+static bool final_verify_wave(
+        final_stage_state & st,
+        const split_tcp_hidden_msg & msg,
+        const std::vector<int32_t> & ids,
+        int32_t & accepted_out,
+        int32_t & corrected_out,
+        double & ms_compute_out) {
+    const int32_t n_tokens = msg.header.n_tokens;
+    const int32_t n_embd   = msg.header.n_embd;
+    const int32_t pos_start = msg.meta.pos_start;
+    if ((int32_t) ids.size() != n_tokens || n_tokens < 1) {
+        fprintf(stderr, "gen3_c: verify ids/token count mismatch %zu vs %d\n", ids.size(), n_tokens);
+        return false;
+    }
+
+    llama_set_layer_range(st.ctx, st.layer_start, st.n_layer);
+    const int64_t t0 = ggml_time_us();
+
+    int32_t accepted  = 0;
+    int32_t corrected = -1;
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const float * in = msg.data.data() + (size_t) i * n_embd;
+        llama_set_hidden_state(st.ctx, in, 1);
+        if (split_gen_decode_hidden(st.ctx, in, 1, n_embd, pos_start + i, true) != 0) {
+            fprintf(stderr, "gen3_c: verify decode failed i=%d/%d\n", i, n_tokens);
+            return false;
+        }
+        const float * logits = llama_get_logits_ith(st.ctx, -1);
+        if (logits == nullptr) {
+            fprintf(stderr, "gen3_c: verify logits missing i=%d\n", i);
+            return false;
+        }
+        const int32_t pred = logits_argmax(logits, st.n_vocab);
+        if (i < n_tokens - 1) {
+            if (pred == ids[i + 1]) {
+                accepted++;
+                continue;
+            }
+            corrected = pred;
+            break;
+        }
+        corrected = pred;
+    }
+
+    ms_compute_out = (ggml_time_us() - t0) / 1000.0;
+    accepted_out   = accepted;
+    corrected_out  = corrected;
+    // KV now holds positions [.., pos_start + accepted]; the corrected token
+    // occupies pos_start + accepted + 1 and arrives as the next wave's anchor.
+    st.next_pos = pos_start + accepted + 1;
+    return true;
+}
 
 static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_item & item) {
     split_tcp_hidden_msg & msg = item.msg;
@@ -230,6 +301,37 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
     int32_t token_id = -1;
     int32_t resp_vocab = st.n_vocab;
     double ms_sample = 0.0;
+
+    split_gen_rollback_kv(st.ctx, st.next_pos, msg.meta.pos_start, "gen3_c");
+
+    if (!item.verify_ids.empty()) {
+        if (st.external_output) {
+            fprintf(stderr, "gen3_c: verify waves unsupported with external output\n");
+            return false;
+        }
+        int32_t accepted = 0;
+        if (!final_verify_wave(st, msg, item.verify_ids, accepted, token_id, ms_compute)) {
+            return false;
+        }
+        if (st.dbg) {
+            st.dbg->emit_token_selected(step, phase, token_id, msg.meta.pos_start, true);
+        }
+        split_gen3_c_resp resp{};
+        resp.magic          = SPLIT_GEN_MAGIC;
+        resp.token_id       = token_id;
+        resp.n_vocab        = resp_vocab;
+        resp.ms_compute     = ms_compute;
+        resp.ms_sample      = 0.0;
+        resp.accepted_count = accepted;
+        if (!split_gen3_send_c_resp(st.bc_fd, resp)) {
+            fprintf(stderr, "gen3_c: send verify resp failed\n");
+            return false;
+        }
+        if (st.debug_step) {
+            (*st.debug_step)++;
+        }
+        return true;
+    }
 
     if (st.external_output) {
         std::vector<float> out_hidden;
@@ -311,12 +413,15 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
                 nullptr, nullptr, -1, token_id);
     }
 
+    st.next_pos = msg.meta.pos_start + n_tok;
+
     split_gen3_c_resp resp{};
-    resp.magic      = SPLIT_GEN_MAGIC;
-    resp.token_id   = token_id;
-    resp.n_vocab    = resp_vocab;
-    resp.ms_compute = ms_compute;
-    resp.ms_sample  = ms_sample;
+    resp.magic          = SPLIT_GEN_MAGIC;
+    resp.token_id       = token_id;
+    resp.n_vocab        = resp_vocab;
+    resp.ms_compute     = ms_compute;
+    resp.ms_sample      = ms_sample;
+    resp.accepted_count = -1;
 
     if (!split_gen3_send_c_resp(st.bc_fd, resp)) {
         fprintf(stderr, "gen3_c: send resp failed\n");
@@ -351,6 +456,8 @@ static bool final_run_queued_session(
     std::mutex ctx_mu;
 
     std::thread receiver([&] {
+        int32_t              pending_verify_pos = -1;
+        std::vector<int32_t> pending_verify_ids;
         while (!stop.load()) {
             split_ab_cmd cmd;
             perf_trace_sched_queue_wait_begin();
@@ -381,6 +488,16 @@ static bool final_run_queued_session(
                 }
                 debug_step = 0;
                 final_queue_depth = 0;
+                pending_verify_pos = -1;
+                pending_verify_ids.clear();
+                continue;
+            }
+
+            if (cmd == SPLIT_AB_CMD_VERIFY_IDS) {
+                if (!split_ab_recv_verify_ids(st.bc_fd, pending_verify_pos, pending_verify_ids)) {
+                    stop.store(true);
+                    break;
+                }
                 continue;
             }
 
@@ -405,6 +522,11 @@ static bool final_run_queued_session(
             item.msg        = std::move(msg);
             item.debug_step = debug_step;
             item.wave_id    = queued_wave_id;
+            if (pending_verify_pos >= 0 && pending_verify_pos == item.msg.meta.pos_start) {
+                item.verify_ids = std::move(pending_verify_ids);
+            }
+            pending_verify_pos = -1;
+            pending_verify_ids.clear();
 
             queue.push(std::move(item));
             final_queue_depth = queue.observable_depth(true);
@@ -616,6 +738,12 @@ int main(int argc, char ** argv) {
             continue;
         }
 
+        if (cmd == SPLIT_AB_CMD_VERIFY_IDS) {
+            // Verify waves are only routed through the queued-session path.
+            fprintf(stderr, "gen3_c: verify wave requires the stage queue path\n");
+            break;
+        }
+
         if (cmd != SPLIT_AB_CMD_HIDDEN) {
             fprintf(stderr, "gen3_c: unexpected cmd %u\n", cmd);
             break;
@@ -759,11 +887,12 @@ int main(int argc, char ** argv) {
         }
 
         split_gen3_c_resp resp{};
-        resp.magic      = SPLIT_GEN_MAGIC;
-        resp.token_id   = token_id;
-        resp.n_vocab    = resp_vocab;
-        resp.ms_compute = ms_compute;
-        resp.ms_sample  = ms_sample;
+        resp.magic          = SPLIT_GEN_MAGIC;
+        resp.token_id       = token_id;
+        resp.n_vocab        = resp_vocab;
+        resp.ms_compute     = ms_compute;
+        resp.ms_sample      = ms_sample;
+        resp.accepted_count = -1;
 
         {
             perf_span resp_span("FINAL_RESP_SEND_BEGIN", "FINAL_RESP_SEND_END", perf_category::NETWORK, "final");

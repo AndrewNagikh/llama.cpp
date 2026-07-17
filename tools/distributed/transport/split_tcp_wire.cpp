@@ -419,7 +419,8 @@ bool split_gen_recv_req(int fd, split_gen_a_req & req, std::vector<int32_t> & to
     }
 
     if (req.n_tokens > 0 &&
-            (req.cmd == SPLIT_GEN_CMD_PREFILL || req.cmd == SPLIT_GEN_CMD_DECODE)) {
+            (req.cmd == SPLIT_GEN_CMD_PREFILL || req.cmd == SPLIT_GEN_CMD_DECODE ||
+             req.cmd == SPLIT_GEN_CMD_VERIFY)) {
         tokens.resize((size_t) req.n_tokens);
         if (!split_tcp_recv_all(fd, tokens.data(), tokens.size() * sizeof(int32_t))) {
             return false;
@@ -513,6 +514,40 @@ bool split_ab_send_reset(int fd) {
 
 bool split_ab_send_shutdown(int fd) {
     return split_ab_send_cmd(fd, SPLIT_AB_CMD_SHUTDOWN);
+}
+
+bool split_ab_send_verify_ids(int fd, int32_t pos_start, const int32_t * ids, int32_t n) {
+    if (!split_ab_send_cmd(fd, SPLIT_AB_CMD_VERIFY_IDS)) {
+        return false;
+    }
+    const int32_t hdr[2] = { pos_start, n };
+    if (!split_tcp_send_all(fd, hdr, sizeof(hdr))) {
+        return false;
+    }
+    if (n > 0) {
+        return split_tcp_send_all(fd, ids, (size_t) n * sizeof(int32_t));
+    }
+    return true;
+}
+
+bool split_ab_recv_verify_ids(int fd, int32_t & pos_start, std::vector<int32_t> & ids) {
+    int32_t hdr[2];
+    if (!split_tcp_recv_all(fd, hdr, sizeof(hdr))) {
+        return false;
+    }
+    pos_start = hdr[0];
+    const int32_t n = hdr[1];
+    ids.clear();
+    if (n < 0 || n > 1024) {
+        return false;
+    }
+    if (n > 0) {
+        ids.resize((size_t) n);
+        if (!split_tcp_recv_all(fd, ids.data(), ids.size() * sizeof(int32_t))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool split_ab_recv_cmd(int fd, split_ab_cmd & cmd) {
