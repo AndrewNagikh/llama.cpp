@@ -841,6 +841,10 @@ static dist_configure_req parse_configure(const json & body) {
         req.output_service_host = os.value("host", "");
         req.output_service_port = os.value("port", 0);
     }
+    req.fa_port     = body.value("fa_port", 0);
+    req.fa_host     = body.value("fa_host", "127.0.0.1");
+    req.draft_model = body.value("draft_model", "");
+    req.draft_k     = body.value("draft_k", 4);
     return req;
 }
 
@@ -1692,6 +1696,10 @@ static bool start_worker(
         if (cfg.next_is_final) {
             args.push_back("--next-final");
         }
+        if (cfg.fa_port > 0) {
+            args.push_back("--fa-port");
+            args.push_back(std::to_string(cfg.fa_port));
+        }
     } else if (cfg.role == DIST_ROLE_MIDDLE) {
         bin = dist_join_path(dir, "split_gen3_b" + suffix);
         args = {
@@ -1729,6 +1737,16 @@ static bool start_worker(
                 args.push_back("--output-http-port");
                 args.push_back(std::to_string(output_port));
             }
+        }
+        if (!cfg.draft_model.empty() && cfg.fa_port > 0) {
+            args.push_back("--draft-model");
+            args.push_back(cfg.draft_model);
+            args.push_back("--fa-host");
+            args.push_back(cfg.fa_host);
+            args.push_back("--fa-port");
+            args.push_back(std::to_string(cfg.fa_port));
+            args.push_back("--draft-k");
+            args.push_back(std::to_string(cfg.draft_k));
         }
     } else {
         err = "invalid role";

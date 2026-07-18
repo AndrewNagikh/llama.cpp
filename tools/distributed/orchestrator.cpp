@@ -68,6 +68,13 @@ struct dist_session {
     int generate_count  = 0;
     int configure_count = 0;
     int64_t created_at_ms = 0;
+    // Task 19 Phase 3: draft placed on the `final` role (see
+    // TASK_19_SPECULATIVE_PIPELINE_STUDY.md SA). A raw path, not a
+    // registered model id -- the draft isn't run through the model
+    // install/materialize pipeline yet (RFC-0014 F.2 gap), so it must
+    // already exist at this path on whichever node lands the final role.
+    std::string speculative_draft_model_path;
+    int         speculative_draft_k = 4;
 };
 
 static json session_debug_json(const dist_session & session) {
@@ -1770,6 +1777,11 @@ static bool setup_runtime_graph(
     }
 
     const int pipe_base = 9100 + (int) (getpid() % 500) + 10;
+    // Task 19 Phase 3: direct entry<->final link for draft-token delivery
+    // (see TASK_19_SPECULATIVE_PIPELINE_STUDY.md SC). Reuses the same port
+    // space as ctrl/peer, one slot past the last stage's peer_port.
+    const bool speculative = !session.speculative_draft_model_path.empty();
+    const int fa_port = pipe_base + (int) stage_ptrs.size() + 2;
     const runtime_role_assignment * emb_assign = session.runtime.find_role(runtime_role::embedding);
     const runtime_role_assignment * out_assign = session.runtime.find_role(runtime_role::output_head);
     const bool external_embedding =
@@ -1883,6 +1895,12 @@ static bool setup_runtime_graph(
         if (stage.role == DIST_ROLE_FINAL) {
             cfg["role"] = "final";
             cfg["peer_port"] = stage.peer_port;
+            if (speculative) {
+                cfg["draft_model"] = session.speculative_draft_model_path;
+                cfg["draft_k"]     = session.speculative_draft_k;
+                cfg["fa_host"]     = stages[0].host;
+                cfg["fa_port"]     = fa_port;
+            }
             if (external_output && out_assign != nullptr) {
                 const std::string out_host =
                         !out_assign->endpoint.host.empty() ? out_assign->endpoint.host : out_assign->host;
@@ -1909,6 +1927,9 @@ static bool setup_runtime_graph(
             cfg["next_host"] = next.host;
             cfg["next_port"] = next.peer_port;
             cfg["next_is_final"] = (next.role == DIST_ROLE_FINAL);
+            if (speculative) {
+                cfg["fa_port"] = fa_port;
+            }
             if (external_embedding && emb_assign != nullptr) {
                 const std::string emb_host =
                         !emb_assign->endpoint.host.empty() ? emb_assign->endpoint.host : emb_assign->host;
@@ -3096,6 +3117,8 @@ int main(int argc, char ** argv) {
         dist_session session{};
         session.session_id = session_id;
         session.model      = record->model_id;
+        session.speculative_draft_model_path = body.value("speculative_draft_model_path", "");
+        session.speculative_draft_k          = body.value("speculative_draft_k", 4);
 
         std::string err;
         if (!setup_runtime_graph(session.session_id, n_layers, assignments, node_map, mem, session, err)) {

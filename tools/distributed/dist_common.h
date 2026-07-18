@@ -121,6 +121,14 @@ struct dist_configure_req {
     std::string    source_url;
     std::string    output_service_host;
     int            output_service_port = 0;
+    // Task 19 Phase 3 (speculative pipeline): direct entry<->final link.
+    // fa_port is set on both the entry (listens) and final (connects out
+    // to fa_host:fa_port) configure requests. draft_model/draft_k are
+    // final-only.
+    int            fa_port     = 0;
+    std::string    fa_host;
+    std::string    draft_model;
+    int            draft_k     = 4;
 };
 
 struct dist_gen_resp {
