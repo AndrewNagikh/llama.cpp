@@ -188,6 +188,16 @@ struct final_stage_state {
     // Next expected KV position; a wave arriving below it means an earlier
     // speculative tail (or a retried wave) must be truncated first.
     int32_t         next_pos            = 0;
+    // Task 19 Phase 3 draft placement (TASK_19_SPECULATIVE_PIPELINE_STUDY.md
+    // SA): the draft model lives on the node holding `final`, so it can
+    // guess the next wave locally while the current wave's result is still
+    // in flight back to entry. Null draft_ctx = speculation disabled.
+    llama_context * draft_ctx    = nullptr;
+    int32_t         draft_n_vocab = 0;
+    int32_t         draft_k       = 4;
+    int32_t         draft_next_pos = 0;
+    int             fa_fd         = -1;
+    std::mutex *    draft_mu      = nullptr;
 };
 
 static int32_t logits_argmax(const float * logits, const int32_t n_vocab) {
@@ -256,6 +266,66 @@ static bool final_verify_wave(
     // occupies pos_start + accepted + 1 and arrives as the next wave's anchor.
     st.next_pos = pos_start + accepted + 1;
     return true;
+}
+
+// Draft k tokens from (anchor_tok, anchor_pos) and ship them to entry over
+// the fa-link. Runs synchronously right after final's response for the
+// current wave has already been sent, so this compute overlaps with the
+// token's return trip through middle/entry back to the client -- the
+// "hidden under R" window from SA. Best-effort: any failure just leaves
+// entry's next wave without a draft (falls back to plain decode there).
+static void final_draft_and_ship(final_stage_state & st, int32_t anchor_tok, int32_t anchor_pos) {
+    if (st.draft_ctx == nullptr || st.fa_fd < 0 || st.draft_mu == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(*st.draft_mu);
+    split_gen_rollback_kv(st.draft_ctx, st.draft_next_pos, anchor_pos, "gen3_c_draft");
+
+    std::vector<int32_t> ids;
+    ids.reserve((size_t) st.draft_k);
+    int32_t cur = anchor_tok;
+    int32_t pos = anchor_pos;
+    for (int32_t i = 0; i < st.draft_k; ++i) {
+        if (split_gen_decode_one(st.draft_ctx, (llama_token) cur, pos) != 0) {
+            fprintf(stderr, "gen3_c: draft decode failed\n");
+            return;
+        }
+        const float * logits = llama_get_logits_ith(st.draft_ctx, -1);
+        if (logits == nullptr) {
+            fprintf(stderr, "gen3_c: draft logits missing\n");
+            return;
+        }
+        cur = logits_argmax(logits, st.draft_n_vocab);
+        pos++;
+        ids.push_back(cur);
+    }
+    st.draft_next_pos = pos;
+    if (!split_ab_send_verify_ids(st.fa_fd, anchor_pos, ids.data(), (int32_t) ids.size())) {
+        fprintf(stderr, "gen3_c: ship draft ids failed\n");
+    }
+}
+
+// Prime the draft context with the same prompt tokens the target pipeline
+// just prefilled, so its continuations are grounded in the real context
+// instead of just the bare anchor token. Entry ships these once per
+// prefill over the fa-link (see split_gen3_a.cpp's PREFILL handling).
+static bool final_draft_prefill(llama_context * draft_ctx, const std::vector<int32_t> & ids) {
+    if (ids.empty()) {
+        return true;
+    }
+    llama_memory_clear(llama_get_memory(draft_ctx), true);
+    llama_batch batch = llama_batch_init((int32_t) ids.size(), 0, 1);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        batch.token[i]     = (llama_token) ids[i];
+        batch.pos[i]       = (llama_pos) i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = (i + 1 == ids.size());
+    }
+    batch.n_tokens = (int32_t) ids.size();
+    const int rc = llama_decode(draft_ctx, batch);
+    llama_batch_free(batch);
+    return rc == 0;
 }
 
 static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_item & item) {
@@ -327,6 +397,7 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
             fprintf(stderr, "gen3_c: send verify resp failed\n");
             return false;
         }
+        final_draft_and_ship(st, token_id, st.next_pos);
         if (st.debug_step) {
             (*st.debug_step)++;
         }
@@ -427,6 +498,7 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
         fprintf(stderr, "gen3_c: send resp failed\n");
         return false;
     }
+    final_draft_and_ship(st, token_id, st.next_pos);
     if (decode_step && st.queue_depth) {
         (*st.queue_depth)++;
     }
@@ -455,6 +527,30 @@ static bool final_run_queued_session(
     // "malloc: Heap corruption detected" crashes on the final-stage worker.
     std::mutex ctx_mu;
 
+    std::atomic<bool> fa_stop{ false };
+    std::thread fa_prime;
+    if (st.draft_ctx != nullptr && st.fa_fd >= 0) {
+        fa_prime = std::thread([&] {
+            while (!fa_stop.load()) {
+                split_ab_cmd cmd;
+                if (!split_ab_recv_cmd(st.fa_fd, cmd) || cmd != SPLIT_AB_CMD_VERIFY_IDS) {
+                    break;
+                }
+                int32_t pos = -1;
+                std::vector<int32_t> ids;
+                if (!split_ab_recv_verify_ids(st.fa_fd, pos, ids)) {
+                    break;
+                }
+                std::lock_guard<std::mutex> lock(*st.draft_mu);
+                if (!final_draft_prefill(st.draft_ctx, ids)) {
+                    fprintf(stderr, "gen3_c: draft prefill failed\n");
+                    continue;
+                }
+                st.draft_next_pos = (int32_t) ids.size();
+            }
+        });
+    }
+
     std::thread receiver([&] {
         int32_t              pending_verify_pos = -1;
         std::vector<int32_t> pending_verify_ids;
@@ -479,6 +575,11 @@ static bool final_run_queued_session(
                     std::lock_guard<std::mutex> lock(ctx_mu);
                     llama_memory_clear(llama_get_memory(st.ctx), true);
                     llama_clear_hidden_state(st.ctx);
+                }
+                if (st.draft_ctx != nullptr && st.draft_mu != nullptr) {
+                    std::lock_guard<std::mutex> lock(*st.draft_mu);
+                    llama_memory_clear(llama_get_memory(st.draft_ctx), true);
+                    st.draft_next_pos = 0;
                 }
                 if (st.external_output &&
                         !output_service_reset_http(st.output_http_host, st.output_http_port)) {
@@ -570,6 +671,11 @@ static bool final_run_queued_session(
     if (receiver.joinable()) {
         receiver.join();
     }
+    if (fa_prime.joinable()) {
+        fa_stop.store(true);
+        split_tcp_close(st.fa_fd);
+        fa_prime.join();
+    }
     return !pipe_failed;
 }
 
@@ -589,6 +695,10 @@ int main(int argc, char ** argv) {
     bool external_output = false;
     const char * bind_host = "0.0.0.0";
     std::string ready_file;
+    const char * draft_model_path = nullptr;
+    const char * fa_host = "127.0.0.1";
+    int fa_port = -1;
+    int draft_k = 4;
 
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--bc-port") == 0 && i + 1 < argc) {
@@ -607,6 +717,14 @@ int main(int argc, char ** argv) {
             output_http_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ready-file") == 0 && i + 1 < argc) {
             ready_file = argv[++i];
+        } else if (strcmp(argv[i], "--draft-model") == 0 && i + 1 < argc) {
+            draft_model_path = argv[++i];
+        } else if (strcmp(argv[i], "--fa-host") == 0 && i + 1 < argc) {
+            fa_host = argv[++i];
+        } else if (strcmp(argv[i], "--fa-port") == 0 && i + 1 < argc) {
+            fa_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--draft-k") == 0 && i + 1 < argc) {
+            draft_k = atoi(argv[++i]);
         } else {
             usage(argv[0]);
             return 1;
@@ -674,9 +792,46 @@ int main(int argc, char ** argv) {
     trace_recorder * dbg = dist_debug_recorder();
     int32_t debug_step   = 0;
 
+    // Task 19 Phase 3: draft model colocated with `final` (placement per
+    // TASK_19_SPECULATIVE_PIPELINE_STUDY.md SA). Optional: only set up when
+    // the orchestrator gave us a draft model to load.
+    llama_model *   draft_model = nullptr;
+    llama_context * draft_ctx   = nullptr;
+    int             fa_fd       = -1;
+    std::mutex      draft_mu;
+    if (draft_model_path != nullptr) {
+        std::string draft_load_err;
+        draft_model = split_gen_load_model(draft_model_path, draft_load_err);
+        if (!draft_model) {
+            fprintf(stderr, "gen3_c: draft model load failed: %s (speculation disabled)\n",
+                    draft_load_err.c_str());
+        } else {
+            llama_context_params dcparams = llama_context_default_params();
+            dcparams.n_ctx    = 2048;
+            dcparams.n_batch  = 512;
+            dcparams.no_perf  = true;
+            draft_ctx = llama_init_from_model(draft_model, dcparams);
+            if (!draft_ctx) {
+                fprintf(stderr, "gen3_c: draft context create failed (speculation disabled)\n");
+                llama_model_free(draft_model);
+                draft_model = nullptr;
+            } else if (fa_port > 0) {
+                fa_fd = split_tcp_connect_retry(fa_host, fa_port, 300, 100);
+                if (fa_fd < 0) {
+                    fprintf(stderr, "gen3_c: fa connect failed %s:%d (speculation disabled)\n",
+                            fa_host, fa_port);
+                    llama_free(draft_ctx);
+                    llama_model_free(draft_model);
+                    draft_ctx = nullptr;
+                    draft_model = nullptr;
+                }
+            }
+        }
+    }
+
     fprintf(stderr,
-            "gen3_c: waiting bc_port=%d layer_start=%d layer_end=%d external_output=%d\n",
-            bc_port, layer_start, effective_layer_end, external_output ? 1 : 0);
+            "gen3_c: waiting bc_port=%d layer_start=%d layer_end=%d external_output=%d draft=%d\n",
+            bc_port, layer_start, effective_layer_end, external_output ? 1 : 0, draft_ctx != nullptr ? 1 : 0);
     split_gen_write_ready_state(ready_file, "PIPE_READY");
     split_gen_write_ready_state(ready_file, "READY");
 
@@ -698,6 +853,13 @@ int main(int argc, char ** argv) {
             ctx, model, smpl, bc_fd, layer_start, effective_layer_end, n_layer, n_vocab,
             external_output, output_http_host, output_http_port, dbg, &debug_step, &final_queue_depth
         };
+        if (draft_ctx != nullptr) {
+            st.draft_ctx     = draft_ctx;
+            st.draft_n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(draft_model));
+            st.draft_k       = draft_k;
+            st.fa_fd         = fa_fd;
+            st.draft_mu      = &draft_mu;
+        }
         if (!final_run_queued_session(st, queue, debug_step, normal_shutdown, pipe_failed)) {
             split_gen_write_ready_state(ready_file, "FAILED");
         } else {
@@ -706,6 +868,10 @@ int main(int argc, char ** argv) {
         split_tcp_close(bc_fd);
         if (smpl) {
             llama_sampler_free(smpl);
+        }
+        if (draft_ctx) {
+            llama_free(draft_ctx);
+            llama_model_free(draft_model);
         }
         llama_free(ctx);
         llama_model_free(model);

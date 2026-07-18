@@ -199,6 +199,22 @@ struct entry_ab_pending {
     double          ms_ab_xfer    = 0.0;
 };
 
+// Draft token ids delivered directly from the node holding `final` over the
+// fa-link (Task 19 Phase 3, placement per TASK_19_SPECULATIVE_PIPELINE_STUDY
+// §A). Single-slot: final only ever has one outstanding draft (for the
+// position right after the token it just produced).
+struct fa_draft_buffer {
+    std::mutex           mu;
+    int32_t              pos = -1;
+    std::vector<int32_t> ids;
+    // Set once final has connected in; used to ship the prompt tokens at
+    // PREFILL time so the draft model can prime its own KV cache (see
+    // split_gen3_c.cpp's fa_prime receiver thread). Same fd the receiver
+    // thread above reads from -- TCP is full duplex, and each direction
+    // only ever carries one message shape, so this is unambiguous.
+    int                  fd  = -1;
+};
+
 struct entry_stage_state {
     llama_context * ctx          = nullptr;
     int             b_fd         = -1;
@@ -216,6 +232,8 @@ struct entry_stage_state {
     // decode on the same ctx. Guards both against that race.
     std::mutex *    ctx_mu       = nullptr;
     int32_t         next_pos     = 0;
+    // Non-null only when --fa-port was given (speculative mode enabled).
+    fa_draft_buffer * fa_buf     = nullptr;
 };
 
 static bool entry_process_work_item(
@@ -231,6 +249,37 @@ static bool entry_process_work_item(
     std::vector<float> & hidden_in = item.hidden;
     const int32_t hidden_n_embd = item.hidden_n_embd;
     const int ctrl_fd = st.ctrl_fd;
+
+    // Speculative mode: the client sends only the anchor token; extend the
+    // wave here with whatever final has already drafted for this position
+    // (delivered ahead of time over the fa-link). No buffered draft (not
+    // ready yet, or speculation disabled) just leaves a 1-token wave, which
+    // final_verify_wave treats as plain decode.
+    if (req.cmd == SPLIT_GEN_CMD_VERIFY && st.fa_buf != nullptr && tokens_i32.size() == 1) {
+        std::lock_guard<std::mutex> lock(st.fa_buf->mu);
+        if (st.fa_buf->pos == req.pos_start && !st.fa_buf->ids.empty()) {
+            tokens_i32.insert(tokens_i32.end(), st.fa_buf->ids.begin(), st.fa_buf->ids.end());
+            req.n_tokens = (int32_t) tokens_i32.size();
+        }
+        st.fa_buf->pos = -1;
+        st.fa_buf->ids.clear();
+    }
+    const int32_t drafted_n = req.cmd == SPLIT_GEN_CMD_VERIFY && !tokens_i32.empty()
+            ? (int32_t) tokens_i32.size() - 1 : 0;
+
+    // Prime final's draft model with the real prompt (best-effort: if final
+    // hasn't connected its fa-link yet, this session just runs without
+    // speculation -- see F.1/F.2 in TASK_19_SPECULATIVE_PIPELINE_STUDY.md).
+    if (req.cmd == SPLIT_GEN_CMD_PREFILL && st.fa_buf != nullptr) {
+        int prime_fd = -1;
+        {
+            std::lock_guard<std::mutex> lock(st.fa_buf->mu);
+            prime_fd = st.fa_buf->fd;
+        }
+        if (prime_fd >= 0) {
+            split_ab_send_verify_ids(prime_fd, 0, tokens_i32.data(), (int32_t) tokens_i32.size());
+        }
+    }
 
     const int64_t t0 = ggml_time_us();
     int decode_rc = 0;
@@ -376,6 +425,13 @@ static bool entry_process_work_item(
                 req.include_logits != 0, st.n_vocab, ms_a, st.next_is_final,
                 st.debug_step ? *st.debug_step : 0, phase, st.dbg, resp, logits)) {
             return false;
+        }
+
+        if (req.cmd == SPLIT_GEN_CMD_VERIFY && resp.accepted_count > 0) {
+            const int32_t n_ids = std::min({ resp.accepted_count, drafted_n, SPLIT_GEN_SPEC_MAX_K });
+            for (int32_t i = 0; i < n_ids; ++i) {
+                resp.accepted_ids[i] = tokens_i32[(size_t) i + 1];
+            }
         }
 
         if (send_early_token && ctrl_mu != nullptr) {
@@ -726,6 +782,7 @@ int main(int argc, char ** argv) {
     const char * model_path = argv[1];
     int ctrl_port = -1;
     int b_port    = -1;
+    int fa_port   = -1;
     int layer_start = 0;
     int layer_end = 5;
     bool next_is_final = false;
@@ -740,6 +797,8 @@ int main(int argc, char ** argv) {
             b_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--b-host") == 0 && i + 1 < argc) {
             b_host = argv[++i];
+        } else if (strcmp(argv[i], "--fa-port") == 0 && i + 1 < argc) {
+            fa_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
             bind_host = argv[++i];
         } else if (strcmp(argv[i], "--layer-start") == 0 && i + 1 < argc) {
@@ -769,6 +828,47 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "gen3_a: ctrl listen failed port=%d\n", ctrl_port);
         return 1;
     }
+
+    // Task 19 Phase 3: direct link from whichever node holds `final`, used
+    // to deliver drafted token ids ahead of the client's next request (see
+    // TASK_19_SPECULATIVE_PIPELINE_STUDY.md SA). Optional: only set up when
+    // the orchestrator allocated a port for this session.
+    fa_draft_buffer fa_buf;
+    std::thread     fa_thread;
+    if (fa_port > 0) {
+        const int fa_listen_fd = split_tcp_listen_host(bind_host, fa_port);
+        if (fa_listen_fd < 0) {
+            fprintf(stderr, "gen3_a: fa listen failed port=%d (speculative mode disabled)\n", fa_port);
+        } else {
+            fa_thread = std::thread([fa_listen_fd, &fa_buf]() {
+                const int fa_fd = split_tcp_accept(fa_listen_fd);
+                if (fa_fd < 0) {
+                    fprintf(stderr, "gen3_a: fa accept failed\n");
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(fa_buf.mu);
+                    fa_buf.fd = fa_fd;
+                }
+                while (true) {
+                    split_ab_cmd cmd;
+                    if (!split_ab_recv_cmd(fa_fd, cmd) || cmd != SPLIT_AB_CMD_VERIFY_IDS) {
+                        break;
+                    }
+                    int32_t pos = -1;
+                    std::vector<int32_t> ids;
+                    if (!split_ab_recv_verify_ids(fa_fd, pos, ids)) {
+                        break;
+                    }
+                    std::lock_guard<std::mutex> lock(fa_buf.mu);
+                    fa_buf.pos = pos;
+                    fa_buf.ids = std::move(ids);
+                }
+            });
+            fa_thread.detach();
+        }
+    }
+
     split_gen_write_ready_state(ready_file, "LISTENER_READY");
 
     ggml_backend_load_all();
@@ -835,6 +935,7 @@ int main(int argc, char ** argv) {
             ctx, b_fd, ctrl_fd, layer_start, layer_end, n_embd, n_vocab,
             next_is_final, dbg, &debug_step, &entry_queue_depth_sync
         };
+        st.fa_buf = fa_port > 0 ? &fa_buf : nullptr;
 
         if (runtime_entry_queue_enabled()) {
             wave_inbound_queue queue(runtime_entry_queue_max_depth());

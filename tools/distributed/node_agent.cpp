@@ -1109,6 +1109,16 @@ static bool pipeline_connect_and_negotiate(int & ctrl_fd, std::string & err) {
     return true;
 }
 
+// Task 19 Phase 3: draft model lives on the node holding `final` and ships
+// guesses to entry ahead of time (see split_gen3_a/c.cpp fa-link). The
+// client just keeps asking for "the next token" via SPLIT_GEN_CMD_VERIFY
+// with a 1-token anchor; entry silently extends the wave from its draft
+// buffer when one is ready, so a single request can yield multiple tokens.
+static bool speculative_client_enabled() {
+    const char * v = std::getenv("DIST_RUNTIME_SPECULATIVE");
+    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
+
 static bool pipeline_gen3_send_recv(
         int ctrl_fd,
         split_gen_cmd cmd,
@@ -1301,6 +1311,64 @@ static bool run_local_pipeline_generate(
     int32_t cur = resp.token_id;
 
     const int n_prompt = (int) prompt_tokens.size();
+    const bool speculative = speculative_client_enabled() && !use_entry_queue && !g_external_embedding;
+    if (speculative) {
+        while ((int) out_tokens.size() < max_new) {
+            const int32_t pos = n_prompt + (int32_t) out_tokens.size() - 1;
+            bool rt_ok;
+            {
+                perf_span rt_span("CLIENT_BLOCKING_RT_BEGIN", "CLIENT_BLOCKING_RT_END", perf_category::WAIT, "client");
+                rt_span.set_token_idx((int32_t) out_tokens.size() - 1);
+                rt_ok = pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_VERIFY, 1, pos, layer_end, &cur, resp);
+            }
+            if (!rt_ok || resp.token_id < 0) {
+                err = "verify failed at token " + std::to_string(out_tokens.size());
+                split_tcp_close(ctrl_fd);
+                return false;
+            }
+            const int32_t accepted = std::max(0, std::min(resp.accepted_count, SPLIT_GEN_SPEC_MAX_K));
+            for (int32_t i = 0; i < accepted && (int) out_tokens.size() < max_new; ++i) {
+                cur = resp.accepted_ids[i];
+                out_tokens.push_back(cur);
+                if (dbg) {
+                    dbg->emit_token_selected(debug_step, "decode", cur, n_prompt + (int32_t) out_tokens.size() - 2, false);
+                }
+                debug_step++;
+            }
+            cur = resp.token_id;
+            if ((int) out_tokens.size() < max_new) {
+                out_tokens.push_back(cur);
+                if (dbg) {
+                    dbg->emit_token_selected(debug_step, "decode", cur, n_prompt + (int32_t) out_tokens.size() - 2, false);
+                }
+                debug_step++;
+            }
+        }
+        split_tcp_close(ctrl_fd);
+        const auto t_total1_spec = std::chrono::steady_clock::now();
+        if (timing_out) {
+            const double prefill_ms = std::chrono::duration<double, std::milli>(t_first_token - t_prefill0).count();
+            const double total_ms = std::chrono::duration<double, std::milli>(t_total1_spec - t_total0).count();
+            const double decode_ms = std::max(0.0, total_ms - prefill_ms);
+            *timing_out = {
+                { "prefill_ms", prefill_ms },
+                { "ttft_ms", prefill_ms },
+                { "decode_ms", decode_ms },
+                { "total_ms", total_ms },
+                { "generated_tokens", (int) out_tokens.size() },
+            };
+            (*timing_out)["protocol_version"] = (int) g_pipeline_protocol;
+            (*timing_out)["speculative"] = true;
+            if (trace_id != nullptr && !trace_id->empty()) {
+                (*timing_out)["trace_id"] = *trace_id;
+            }
+        }
+        if (perf_on && generate_guard.active) {
+            perf_emit_instant("CLIENT_RESPONSE", perf_category::UNKNOWN, "entry", -1, nullptr);
+        }
+        return true;
+    }
+
     bool pending_wave = false;
     for (int step = 1; step < max_new; ++step) {
         const int32_t pos = n_prompt + step - 1;

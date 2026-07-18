@@ -327,6 +327,14 @@ target_compile_features(speculative_pipeline_test PRIVATE cxx_std_17)
 target_link_libraries(speculative_pipeline_test PRIVATE llama llama-common cpp-httplib Threads::Threads)
 dist_link_platform_libs(speculative_pipeline_test)
 
+add_executable(speculative_fa_test speculative_fa_test.cpp
+    ${DIST_TRANSPORT_SOURCES} ${DIST_PERF_TRACE_SOURCES}
+    verification/verification_common.cpp verification/deps/sha256/sha256.c)
+target_include_directories(speculative_fa_test PRIVATE ${DIST_INCLUDE_DIRS})
+target_compile_features(speculative_fa_test PRIVATE cxx_std_17)
+target_link_libraries(speculative_fa_test PRIVATE llama llama-common cpp-httplib Threads::Threads)
+dist_link_platform_libs(speculative_fa_test)
+
 add_executable(verify_decode_loop_parity verify_decode_loop_parity.cpp ${DIST_RUNTIME_VERIFY_SOURCES})
 target_include_directories(verify_decode_loop_parity PRIVATE ${DIST_INCLUDE_DIRS})
 target_compile_features(verify_decode_loop_parity PRIVATE cxx_std_17)

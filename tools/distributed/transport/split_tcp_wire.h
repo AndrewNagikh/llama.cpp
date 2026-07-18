@@ -85,6 +85,10 @@ bool split_tcp_read_result(const char * path, split_tcp_result_file & meta, std:
 constexpr uint32_t SPLIT_GEN_MAGIC   = 0x47454E53; // 'SNEG'
 constexpr uint32_t SPLIT_GEN_VERSION = 1;
 
+// Max drafted tokens per speculative verify wave (Task 19). Fixed-size cap
+// so the client-facing accepted-ids response stays a plain POD blit.
+constexpr int32_t SPLIT_GEN_SPEC_MAX_K = 8;
+
 constexpr uint32_t SPLIT_AB_MAGIC = 0x42415350; // 'PSAB'
 
 enum split_gen_cmd : uint32_t {
@@ -209,6 +213,11 @@ struct split_gen3_a_resp {
     double   ms_c_compute;
     double   ms_c_sample;
     int32_t  accepted_count;
+    // Ids of the accepted_count draft tokens entry sent in the wave (entry
+    // built the wave itself from the fa-link buffer, so it fills this from
+    // its own request rather than final relaying it back). Unused entries
+    // are undefined; only [0, accepted_count) is meaningful.
+    int32_t  accepted_ids[SPLIT_GEN_SPEC_MAX_K];
 };
 
 struct split_proto_negotiate_resp {
