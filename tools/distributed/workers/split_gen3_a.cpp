@@ -15,6 +15,7 @@
 #include "../runtime_debug/perf_ggml.h"
 #include "wave_inbound_queue.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
