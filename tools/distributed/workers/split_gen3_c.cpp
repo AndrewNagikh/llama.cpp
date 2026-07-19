@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -205,6 +206,13 @@ struct final_stage_state {
     // on the consumer thread, which would delay the next wave's decode by
     // the full draft compute time.
     std::function<void(int32_t, int32_t)> draft_submit;
+    // Confirmed token ids by position (guarded by draft_mu). The draft's KV
+    // must stay consecutive, but it can fall behind the target whenever a
+    // ship is skipped or a wave fully accepts (the bonus token was never a
+    // draft input); this journal lets final_draft_and_ship replay exactly
+    // the confirmed tokens spanning any gap instead of dying on the first
+    // non-consecutive decode.
+    std::map<int32_t, int32_t> * spec_confirmed = nullptr;
 };
 
 static int32_t logits_argmax(const float * logits, const int32_t n_vocab) {
@@ -286,7 +294,30 @@ static void final_draft_and_ship(final_stage_state & st, int32_t anchor_tok, int
         return;
     }
     std::lock_guard<std::mutex> lock(*st.draft_mu);
+    // Replay any confirmed tokens the draft never ingested (skipped ships,
+    // fully-accepted bonus tokens, late prime) so its KV stays consecutive
+    // up to the anchor. Without this the first gap permanently killed the
+    // draft: every later decode failed on non-consecutive positions.
+    while (st.draft_next_pos < anchor_pos && st.spec_confirmed != nullptr) {
+        const auto it = st.spec_confirmed->find(st.draft_next_pos);
+        if (it == st.spec_confirmed->end()) {
+            break;
+        }
+        if (split_gen_decode_one(st.draft_ctx, (llama_token) it->second, st.draft_next_pos) != 0) {
+            fprintf(stderr, "gen3_c: draft catch-up decode failed\n");
+            return;
+        }
+        st.draft_next_pos++;
+    }
     split_gen_rollback_kv(st.draft_ctx, st.draft_next_pos, anchor_pos, "gen3_c_draft");
+    if (st.draft_next_pos < anchor_pos) {
+        fprintf(stderr, "gen3_c: draft skipped, kv gap [%d, %d)\n", st.draft_next_pos, anchor_pos);
+        return;
+    }
+    if (st.spec_confirmed != nullptr) {
+        st.spec_confirmed->erase(
+                st.spec_confirmed->begin(), st.spec_confirmed->lower_bound(st.draft_next_pos));
+    }
 
     std::vector<int32_t> ids;
     ids.reserve((size_t) st.draft_k);
@@ -404,6 +435,13 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
             fprintf(stderr, "gen3_c: send verify resp failed\n");
             return false;
         }
+        if (st.spec_confirmed != nullptr && st.draft_mu != nullptr) {
+            std::lock_guard<std::mutex> lock(*st.draft_mu);
+            for (int32_t i = 0; i <= accepted && i < (int32_t) item.verify_ids.size(); ++i) {
+                (*st.spec_confirmed)[msg.meta.pos_start + i] = item.verify_ids[(size_t) i];
+            }
+            (*st.spec_confirmed)[st.next_pos] = token_id;
+        }
         if (st.draft_submit) {
             st.draft_submit(token_id, st.next_pos);
         } else {
@@ -509,6 +547,10 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
         fprintf(stderr, "gen3_c: send resp failed\n");
         return false;
     }
+    if (st.spec_confirmed != nullptr && st.draft_mu != nullptr) {
+        std::lock_guard<std::mutex> lock(*st.draft_mu);
+        (*st.spec_confirmed)[st.next_pos] = token_id;
+    }
     if (st.draft_submit) {
         st.draft_submit(token_id, st.next_pos);
     } else {
@@ -553,7 +595,9 @@ static bool final_run_queued_session(
     int32_t                 draft_q_pos  = -1;
     bool                    draft_q_stop = false;
     std::thread             draft_thread;
+    std::map<int32_t, int32_t> spec_confirmed;
     if (st.draft_ctx != nullptr && st.fa_fd >= 0) {
+        st.spec_confirmed = &spec_confirmed;
         st.draft_submit = [&](int32_t tok, int32_t pos) {
             {
                 std::lock_guard<std::mutex> lk(draft_q_mu);
@@ -588,19 +632,26 @@ static bool final_run_queued_session(
             while (!fa_stop.load()) {
                 split_ab_cmd cmd;
                 if (!split_ab_recv_cmd(st.fa_fd, cmd) || cmd != SPLIT_AB_CMD_VERIFY_IDS) {
+                    fprintf(stderr, "SCRATCH_DEBUG final: fa_prime recv_cmd fail or wrong cmd\n");
                     break;
                 }
                 int32_t pos = -1;
                 std::vector<int32_t> ids;
                 if (!split_ab_recv_verify_ids(st.fa_fd, pos, ids)) {
+                    fprintf(stderr, "SCRATCH_DEBUG final: fa_prime recv_ids fail\n");
                     break;
                 }
+                fprintf(stderr, "SCRATCH_DEBUG final: fa_prime got pos=%d n=%zu\n", pos, ids.size());
                 std::lock_guard<std::mutex> lock(*st.draft_mu);
                 if (!final_draft_prefill(st.draft_ctx, ids)) {
                     fprintf(stderr, "gen3_c: draft prefill failed\n");
                     continue;
                 }
                 st.draft_next_pos = (int32_t) ids.size();
+                if (st.spec_confirmed != nullptr) {
+                    st.spec_confirmed->clear();
+                }
+                fprintf(stderr, "SCRATCH_DEBUG final: primed D=%d\n", st.draft_next_pos);
             }
         });
     }
@@ -630,11 +681,12 @@ static bool final_run_queued_session(
                     llama_memory_clear(llama_get_memory(st.ctx), true);
                     llama_clear_hidden_state(st.ctx);
                 }
-                if (st.draft_ctx != nullptr && st.draft_mu != nullptr) {
-                    std::lock_guard<std::mutex> lock(*st.draft_mu);
-                    llama_memory_clear(llama_get_memory(st.draft_ctx), true);
-                    st.draft_next_pos = 0;
-                }
+                // Deliberately no draft-state reset here: the prime for the
+                // next session arrives over the direct fa-link and often
+                // beats this RESET (which crawls the bc chain) -- clearing
+                // draft_next_pos now would wipe an already-applied prime.
+                // final_draft_prefill does its own memory_clear + reprime,
+                // so the prime alone fully re-initializes the draft.
                 if (st.external_output &&
                         !output_service_reset_http(st.output_http_host, st.output_http_port)) {
                     fprintf(stderr, "gen3_c: output service reset failed\n");
