@@ -501,6 +501,10 @@ static bool middle_run_queued_session(
     return !pipe_failed;
 }
 
+// Must match cparams.n_ubatch in main(): waves up to this size decode as a
+// single graph with all positions' outputs available.
+static constexpr int32_t MIDDLE_N_UBATCH = 32;
+
 static bool run_b_layers(
         llama_context * ctx,
         const split_tcp_hidden_msg & msg,
@@ -516,7 +520,13 @@ static bool run_b_layers(
 
     const int64_t t0 = ggml_time_us();
 
-    if (n_tokens <= 1) {
+    // Waves that fit one ubatch (single decode tokens and k+1-token verify
+    // waves) run as ONE graph compute with outputs at every position --
+    // this was the middle stage's (k+1)x cost on verify waves. Larger
+    // waves (prefill) keep the per-token path: llama_get_embeddings only
+    // exposes outputs the last graph produced, so a multi-ubatch batch
+    // would lose all but the final chunk's hidden states.
+    if (n_tokens <= MIDDLE_N_UBATCH) {
         llama_set_hidden_state(ctx, msg.data.data(), n_tokens);
         {
             const hidden_state_api_check api = verify_hidden_state_roundtrip(
@@ -626,7 +636,7 @@ int main(int argc, char ** argv) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx   = 512;
     cparams.n_batch = 512;
-    cparams.n_ubatch = 1;
+    cparams.n_ubatch = MIDDLE_N_UBATCH;
     cparams.no_perf = true;
     cparams.layer_start = layer_start;
     cparams.layer_end   = layer_end;
