@@ -248,16 +248,21 @@ static bool final_verify_wave(
     llama_set_layer_range(st.ctx, st.layer_start, st.n_layer);
     const int64_t t0 = ggml_time_us();
 
+    // One batched decode with logits at every position: memory-bound, so
+    // the whole wave costs about one token's compute instead of (k+1)x.
+    // The rejected tail does get written to KV, but the standard rollback
+    // rule already handles that -- the next wave arrives with pos_start
+    // below next_pos and truncates it before decoding.
+    llama_set_hidden_state(st.ctx, msg.data.data(), n_tokens);
+    if (split_gen_decode_hidden(st.ctx, msg.data.data(), n_tokens, n_embd, pos_start, true) != 0) {
+        fprintf(stderr, "gen3_c: verify batch decode failed n=%d\n", n_tokens);
+        return false;
+    }
+
     int32_t accepted  = 0;
     int32_t corrected = -1;
     for (int32_t i = 0; i < n_tokens; ++i) {
-        const float * in = msg.data.data() + (size_t) i * n_embd;
-        llama_set_hidden_state(st.ctx, in, 1);
-        if (split_gen_decode_hidden(st.ctx, in, 1, n_embd, pos_start + i, true) != 0) {
-            fprintf(stderr, "gen3_c: verify decode failed i=%d/%d\n", i, n_tokens);
-            return false;
-        }
-        const float * logits = llama_get_logits_ith(st.ctx, -1);
+        const float * logits = llama_get_logits_ith(st.ctx, i);
         if (logits == nullptr) {
             fprintf(stderr, "gen3_c: verify logits missing i=%d\n", i);
             return false;
@@ -277,9 +282,11 @@ static bool final_verify_wave(
     ms_compute_out = (ggml_time_us() - t0) / 1000.0;
     accepted_out   = accepted;
     corrected_out  = corrected;
-    // KV now holds positions [.., pos_start + accepted]; the corrected token
-    // occupies pos_start + accepted + 1 and arrives as the next wave's anchor.
-    st.next_pos = pos_start + accepted + 1;
+    // KV holds the whole decoded batch [pos_start, pos_start + n_tokens);
+    // the accepted prefix ends at pos_start + accepted and the corrected
+    // token arrives as the next wave's anchor at pos_start + accepted + 1,
+    // so that wave's rollback truncates the rejected tail.
+    st.next_pos = pos_start + n_tokens;
     return true;
 }
 
@@ -435,17 +442,20 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
             fprintf(stderr, "gen3_c: send verify resp failed\n");
             return false;
         }
+        // st.next_pos now covers the whole decoded batch (rollback anchor);
+        // the corrected token itself lives right after the accepted prefix.
+        const int32_t corrected_pos = msg.meta.pos_start + accepted + 1;
         if (st.spec_confirmed != nullptr && st.draft_mu != nullptr) {
             std::lock_guard<std::mutex> lock(*st.draft_mu);
             for (int32_t i = 0; i <= accepted && i < (int32_t) item.verify_ids.size(); ++i) {
                 (*st.spec_confirmed)[msg.meta.pos_start + i] = item.verify_ids[(size_t) i];
             }
-            (*st.spec_confirmed)[st.next_pos] = token_id;
+            (*st.spec_confirmed)[corrected_pos] = token_id;
         }
         if (st.draft_submit) {
-            st.draft_submit(token_id, st.next_pos);
+            st.draft_submit(token_id, corrected_pos);
         } else {
-            final_draft_and_ship(st, token_id, st.next_pos);
+            final_draft_and_ship(st, token_id, corrected_pos);
         }
         if (st.debug_step) {
             (*st.debug_step)++;
@@ -880,7 +890,12 @@ int main(int argc, char ** argv) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx   = 512;
     cparams.n_batch = 512;
-    cparams.n_ubatch = 1;
+    // n_ubatch > 1 so a k+1-token verify wave runs as ONE graph compute
+    // (memory-bound, ~one token's cost) instead of k+1 sequential
+    // single-token graphs. Hidden injection is ubatch-agnostic: the whole
+    // wave's hidden becomes batch.embd and the normal ubatch split applies
+    // (see llama-context.cpp layer_start handling).
+    cparams.n_ubatch = 32;
     cparams.no_perf = true;
     cparams.layer_start = layer_start;
     cparams.layer_end   = effective_layer_end;
