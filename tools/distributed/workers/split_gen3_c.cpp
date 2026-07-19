@@ -19,9 +19,11 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -198,6 +200,11 @@ struct final_stage_state {
     int32_t         draft_next_pos = 0;
     int             fa_fd         = -1;
     std::mutex *    draft_mu      = nullptr;
+    // Set in the queued-session path: hands (anchor_tok, anchor_pos) to a
+    // dedicated draft thread instead of running the k draft decodes inline
+    // on the consumer thread, which would delay the next wave's decode by
+    // the full draft compute time.
+    std::function<void(int32_t, int32_t)> draft_submit;
 };
 
 static int32_t logits_argmax(const float * logits, const int32_t n_vocab) {
@@ -397,7 +404,11 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
             fprintf(stderr, "gen3_c: send verify resp failed\n");
             return false;
         }
-        final_draft_and_ship(st, token_id, st.next_pos);
+        if (st.draft_submit) {
+            st.draft_submit(token_id, st.next_pos);
+        } else {
+            final_draft_and_ship(st, token_id, st.next_pos);
+        }
         if (st.debug_step) {
             (*st.debug_step)++;
         }
@@ -498,7 +509,11 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
         fprintf(stderr, "gen3_c: send resp failed\n");
         return false;
     }
-    final_draft_and_ship(st, token_id, st.next_pos);
+    if (st.draft_submit) {
+        st.draft_submit(token_id, st.next_pos);
+    } else {
+        final_draft_and_ship(st, token_id, st.next_pos);
+    }
     if (decode_step && st.queue_depth) {
         (*st.queue_depth)++;
     }
@@ -526,6 +541,45 @@ static bool final_run_queued_session(
     // decode) at once, which corrupts ggml's allocator state -- seen as
     // "malloc: Heap corruption detected" crashes on the final-stage worker.
     std::mutex ctx_mu;
+
+    // Draft compute runs on its own thread so the consumer loop can start
+    // decoding the next wave immediately after sending a response instead
+    // of stalling for the k draft decode steps. Single-slot mailbox: only
+    // the latest (anchor, pos) matters -- a newer wave's result obsoletes
+    // any draft not yet started.
+    std::mutex              draft_q_mu;
+    std::condition_variable draft_q_cv;
+    int32_t                 draft_q_tok  = -1;
+    int32_t                 draft_q_pos  = -1;
+    bool                    draft_q_stop = false;
+    std::thread             draft_thread;
+    if (st.draft_ctx != nullptr && st.fa_fd >= 0) {
+        st.draft_submit = [&](int32_t tok, int32_t pos) {
+            {
+                std::lock_guard<std::mutex> lk(draft_q_mu);
+                draft_q_tok = tok;
+                draft_q_pos = pos;
+            }
+            draft_q_cv.notify_one();
+        };
+        draft_thread = std::thread([&] {
+            while (true) {
+                int32_t tok, pos;
+                {
+                    std::unique_lock<std::mutex> lk(draft_q_mu);
+                    draft_q_cv.wait(lk, [&] { return draft_q_stop || draft_q_pos >= 0; });
+                    if (draft_q_stop) {
+                        break;
+                    }
+                    tok = draft_q_tok;
+                    pos = draft_q_pos;
+                    draft_q_tok = -1;
+                    draft_q_pos = -1;
+                }
+                final_draft_and_ship(st, tok, pos);
+            }
+        });
+    }
 
     std::atomic<bool> fa_stop{ false };
     std::thread fa_prime;
@@ -670,6 +724,14 @@ static bool final_run_queued_session(
     queue.close();
     if (receiver.joinable()) {
         receiver.join();
+    }
+    if (draft_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(draft_q_mu);
+            draft_q_stop = true;
+        }
+        draft_q_cv.notify_all();
+        draft_thread.join();
     }
     if (fa_prime.joinable()) {
         fa_stop.store(true);

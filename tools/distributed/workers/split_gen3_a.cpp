@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -205,7 +206,8 @@ struct entry_ab_pending {
 // §A). Single-slot: final only ever has one outstanding draft (for the
 // position right after the token it just produced).
 struct fa_draft_buffer {
-    std::mutex           mu;
+    std::mutex              mu;
+    std::condition_variable cv;
     int32_t              pos = -1;
     std::vector<int32_t> ids;
     // Set once final has connected in; used to ship the prompt tokens at
@@ -257,8 +259,20 @@ static bool entry_process_work_item(
     // ready yet, or speculation disabled) just leaves a 1-token wave, which
     // final_verify_wave treats as plain decode.
     if (req.cmd == SPLIT_GEN_CMD_VERIFY && st.fa_buf != nullptr && tokens_i32.size() == 1) {
-        std::lock_guard<std::mutex> lock(st.fa_buf->mu);
-        if (st.fa_buf->pos == req.pos_start && !st.fa_buf->ids.empty()) {
+        std::unique_lock<std::mutex> lock(st.fa_buf->mu);
+        // The draft ships from final only after its k decode steps, racing
+        // the token's own longer return trip (final->middle->entry->client
+        // ->entry); it loses that race by a hair more often than not. A
+        // short bounded wait flips most of those photo finishes: one
+        // accepted token repays a few ms of waiting many times over.
+        if (st.fa_buf->pos != req.pos_start || st.fa_buf->ids.empty()) {
+            st.fa_buf->cv.wait_for(lock, std::chrono::milliseconds(8), [&] {
+                return st.fa_buf->pos == req.pos_start && !st.fa_buf->ids.empty();
+            });
+        }
+        const bool hit = st.fa_buf->pos == req.pos_start && !st.fa_buf->ids.empty();
+        fprintf(stderr, "SPEC_DEBUG entry: pos=%d draft_%s\n", req.pos_start, hit ? "hit" : "miss");
+        if (hit) {
             tokens_i32.insert(tokens_i32.end(), st.fa_buf->ids.begin(), st.fa_buf->ids.end());
             req.n_tokens = (int32_t) tokens_i32.size();
         }
@@ -861,9 +875,12 @@ int main(int argc, char ** argv) {
                     if (!split_ab_recv_verify_ids(fa_fd, pos, ids)) {
                         break;
                     }
-                    std::lock_guard<std::mutex> lock(fa_buf.mu);
-                    fa_buf.pos = pos;
-                    fa_buf.ids = std::move(ids);
+                    {
+                        std::lock_guard<std::mutex> lock(fa_buf.mu);
+                        fa_buf.pos = pos;
+                        fa_buf.ids = std::move(ids);
+                    }
+                    fa_buf.cv.notify_all();
                 }
             });
             fa_thread.detach();
