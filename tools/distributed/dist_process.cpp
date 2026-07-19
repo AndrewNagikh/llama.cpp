@@ -168,7 +168,8 @@ static std::vector<std::string> dist_resolve_win_argv(const std::vector<std::str
 bool dist_process_spawn(
         const std::vector<std::string> & argv,
         dist_child_process & out,
-        std::string & err) {
+        std::string & err,
+        const std::string & log_path) {
     out = {};
     if (argv.empty()) {
         err = "empty argv";
@@ -184,17 +185,42 @@ bool dist_process_spawn(
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
 
-    if (!CreateProcessA(
+    HANDLE log_handle = INVALID_HANDLE_VALUE;
+    BOOL inherit_handles = FALSE;
+    if (!log_path.empty()) {
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        log_handle = CreateFileA(
+                log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (log_handle != INVALID_HANDLE_VALUE) {
+            SetFilePointer(log_handle, 0, nullptr, FILE_END);
+            si.dwFlags    = STARTF_USESTDHANDLES;
+            si.hStdOutput = log_handle;
+            si.hStdError  = log_handle;
+            si.hStdInput  = nullptr;
+            inherit_handles = TRUE;
+        }
+    }
+
+    const BOOL created = CreateProcessA(
             win_argv[0].c_str(),
             cmdline_buf.data(),
             nullptr,
             nullptr,
-            FALSE,
+            inherit_handles,
             CREATE_NO_WINDOW,
             nullptr,
             nullptr,
             &si,
-            &pi)) {
+            &pi);
+
+    if (log_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(log_handle);
+    }
+
+    if (!created) {
         err = "CreateProcess failed: " + std::to_string(GetLastError());
         return false;
     }
@@ -318,7 +344,8 @@ int dist_process_run_capture_stdout(
 bool dist_process_spawn(
         const std::vector<std::string> & argv,
         dist_child_process & out,
-        std::string & err) {
+        std::string & err,
+        const std::string & log_path) {
     out = {};
     if (argv.empty()) {
         err = "empty argv";
@@ -338,12 +365,27 @@ bool dist_process_spawn(
     }
     cargs.push_back(nullptr);
 
+    // Open before fork() (see comment above); dup2() after fork() is a
+    // plain syscall, safe in the child of a multithreaded parent.
+    int log_fd = -1;
+    if (!log_path.empty()) {
+        log_fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    }
+
     const pid_t pid = fork();
     if (pid < 0) {
         err = "fork failed";
+        if (log_fd >= 0) {
+            close(log_fd);
+        }
         return false;
     }
     if (pid == 0) {
+        if (log_fd >= 0) {
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
+            close(log_fd);
+        }
         // execvp (not execv): argv[0] is often a bare command name (e.g.
         // "curl") that must be resolved via $PATH, not a literal path.
         execvp(argv[0].c_str(), cargs.data());

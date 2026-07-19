@@ -21,10 +21,16 @@ std::string dist_join_path(const std::string & dir, const std::string & name);
 
 void dist_sleep_ms(int ms);
 
+// log_path: if non-empty, the child's stdout/stderr are redirected there
+// (append mode). On POSIX the child already inherits the parent's
+// stdout/stderr when log_path is empty; on Windows CreateProcess neither
+// inherits nor opens a console for the child, so without a log_path its
+// output -- including crash diagnostics -- is silently lost.
 bool dist_process_spawn(
         const std::vector<std::string> & argv,
         dist_child_process & out,
-        std::string & err);
+        std::string & err,
+        const std::string & log_path = std::string());
 
 bool dist_process_kill(dist_child_process & proc);
 bool dist_process_reap(dist_child_process & proc);

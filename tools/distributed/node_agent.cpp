@@ -36,6 +36,7 @@
 #include "runtime_debug/perf_gpu_sampler.h"
 #include "runtime_debug/trace_recorder.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cstdio>
@@ -1784,8 +1785,15 @@ static bool start_worker(
     args.push_back("--ready-file");
     args.push_back(ready_file);
 
+    std::string worker_log_path;
+    if (!g_models_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(g_models_dir + "/logs", ec);
+        worker_log_path = g_models_dir + "/logs/worker_" + dist_role_name(cfg.role) + ".log";
+    }
+
     dist_child_process child{};
-    if (!dist_process_spawn(args, child, err)) {
+    if (!dist_process_spawn(args, child, err, worker_log_path)) {
         return false;
     }
 
@@ -2124,7 +2132,16 @@ int main(int argc, char ** argv) {
     });
 
     svr.Get("/debug/log", [](const httplib::Request & req, httplib::Response & res) {
-        const std::string path = node_log_resolve_path(g_models_dir, "node_agent.log");
+        std::string log_file = "node_agent.log";
+        if (const std::string w = req.get_param_value("worker"); !w.empty()) {
+            static const std::vector<std::string> valid_roles = { "entry", "middle", "final" };
+            if (std::find(valid_roles.begin(), valid_roles.end(), w) != valid_roles.end()) {
+                log_file = "worker_" + w + ".log";
+            }
+        }
+        const std::string path = log_file == "node_agent.log"
+                ? node_log_resolve_path(g_models_dir, log_file)
+                : g_models_dir + "/logs/" + log_file;
         if (path.empty() || !std::filesystem::exists(path)) {
             res.status = 404;
             res.set_content(json({ { "error", "log file not found" }, { "path", path } }).dump(),
