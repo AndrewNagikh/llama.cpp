@@ -1319,6 +1319,7 @@ static bool run_local_pipeline_generate(
     const int n_prompt = (int) prompt_tokens.size();
     const bool speculative = speculative_client_enabled() && !use_entry_queue && !g_external_embedding;
     if (speculative) {
+        int64_t spec_waves = 0, spec_accepted_total = 0;
         while ((int) out_tokens.size() < max_new) {
             const int32_t pos = n_prompt + (int32_t) out_tokens.size() - 1;
             bool rt_ok;
@@ -1333,6 +1334,10 @@ static bool run_local_pipeline_generate(
                 return false;
             }
             const int32_t accepted = std::max(0, std::min(resp.accepted_count, SPLIT_GEN_SPEC_MAX_K));
+            spec_waves++;
+            spec_accepted_total += accepted;
+            fprintf(stderr, "SPEC_DEBUG wave=%lld pos=%d accepted=%d\n",
+                    (long long) spec_waves, pos, accepted);
             for (int32_t i = 0; i < accepted && (int) out_tokens.size() < max_new; ++i) {
                 cur = resp.accepted_ids[i];
                 out_tokens.push_back(cur);
@@ -1351,6 +1356,9 @@ static bool run_local_pipeline_generate(
             }
         }
         split_tcp_close(ctrl_fd);
+        fprintf(stderr, "SPEC_DEBUG summary waves=%lld accepted_total=%lld avg_accepted=%.2f\n",
+                (long long) spec_waves, (long long) spec_accepted_total,
+                spec_waves > 0 ? (double) spec_accepted_total / (double) spec_waves : 0.0);
         const auto t_total1_spec = std::chrono::steady_clock::now();
         if (timing_out) {
             const double prefill_ms = std::chrono::duration<double, std::milli>(t_first_token - t_prefill0).count();
