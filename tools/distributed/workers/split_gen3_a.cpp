@@ -906,7 +906,12 @@ int main(int argc, char ** argv) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx   = 512;
     cparams.n_batch = 512;
-    cparams.n_ubatch = 1;
+    // n_ubatch > 1 so a k+1-token verify wave decodes as ONE graph instead
+    // of k+1 sequential single-token graphs -- same fix as final/middle
+    // (split_gen3_c.cpp, split_gen3_b.cpp). Hidden-state gather already
+    // reads by index (llama_get_embeddings_ith), which is ubatch-agnostic,
+    // so no other change is needed here.
+    cparams.n_ubatch = 32;
     cparams.no_perf = true;
     cparams.layer_start = layer_start;
     cparams.layer_end   = layer_end;
