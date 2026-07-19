@@ -45,6 +45,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <future>
 #include <thread>
 #include <vector>
 
@@ -69,10 +70,15 @@ struct dist_session {
     int configure_count = 0;
     int64_t created_at_ms = 0;
     // Task 19 Phase 3: draft placed on the `final` role (see
-    // TASK_19_SPECULATIVE_PIPELINE_STUDY.md SA). A raw path, not a
-    // registered model id -- the draft isn't run through the model
-    // install/materialize pipeline yet (RFC-0014 F.2 gap), so it must
-    // already exist at this path on whichever node lands the final role.
+    // TASK_19_SPECULATIVE_PIPELINE_STUDY.md SA). speculative_draft_model_id
+    // is the input -- a registered model, materialized through the same
+    // prepare_runtime_node path as the primary model, in parallel with its
+    // per-stage downloads. speculative_draft_model_path is the resolved
+    // local path on the final node, filled in by setup_runtime_graph once
+    // that materialize completes (session-create blocks on it, even if the
+    // primary model's layers were already cached and its own loop was
+    // instant -- the draft is not optional once requested).
+    std::string speculative_draft_model_id;
     std::string speculative_draft_model_path;
     int         speculative_draft_k = 4;
 };
@@ -1780,7 +1786,8 @@ static bool setup_runtime_graph(
     // Task 19 Phase 3: direct entry<->final link for draft-token delivery
     // (see TASK_19_SPECULATIVE_PIPELINE_STUDY.md SC). Reuses the same port
     // space as ctrl/peer, one slot past the last stage's peer_port.
-    const bool speculative = !session.speculative_draft_model_path.empty();
+    const bool draft_requested = !session.speculative_draft_model_id.empty();
+    bool speculative = false;
     const int fa_port = pipe_base + (int) stage_ptrs.size() + 2;
     const runtime_role_assignment * emb_assign = session.runtime.find_role(runtime_role::embedding);
     const runtime_role_assignment * out_assign = session.runtime.find_role(runtime_role::output_head);
@@ -1818,6 +1825,41 @@ static bool setup_runtime_graph(
             stage.peer_port = pipe_base + (int) i + 1;
         }
         stages.push_back(stage);
+    }
+
+    // Task 19 Phase 3: draft placement follows `final` (SA). Kick this off
+    // now so it downloads in parallel with the primary model's per-stage
+    // prepare loop below -- and join it after that loop regardless of how
+    // fast it ran (a cache hit on the primary model must not silently skip
+    // speculation for this session; the draft is not optional once
+    // requested, see F.2).
+    std::future<std::pair<bool, std::string>> draft_future;
+    if (draft_requested) {
+        const dist_model_record * draft_record = g_registry.find(session.speculative_draft_model_id);
+        const dist_node_info * draft_node = find_node(node_map, stages.back().node_id);
+        if (draft_record == nullptr || !draft_record->manifest.has_value()) {
+            fprintf(stderr, "orchestrator: draft model %s not registered/discovered, speculation disabled\n",
+                    session.speculative_draft_model_id.c_str());
+        } else if (draft_node == nullptr) {
+            fprintf(stderr, "orchestrator: draft node vanished, speculation disabled\n");
+        } else {
+            json draft_prep = {
+                { "session_id", session_id },
+                { "model_id", session.speculative_draft_model_id },
+                { "layer_start", 0 },
+                { "layer_end", (int32_t) draft_record->manifest->n_layer },
+                { "peer_bind", "0.0.0.0" },
+                { "runtime_role", "pipeline_stage" },
+                { "role", "draft" },
+                { "source_url", resolve_model_source_url(*draft_record) },
+            };
+            const dist_node_info draft_node_copy = *draft_node;
+            draft_future = std::async(std::launch::async, [draft_node_copy, draft_prep]() {
+                std::string worker_gguf, derr;
+                const bool ok = prepare_runtime_node(draft_node_copy, draft_prep, worker_gguf, derr, 600000);
+                return std::make_pair(ok, ok ? worker_gguf : derr);
+            });
+        }
     }
 
     const size_t n_stages = stages.size();
@@ -1862,6 +1904,17 @@ static bool setup_runtime_graph(
         dist_rss_log_stage("prepare_runtime", stage.node_id.c_str());
         if (!prepare_runtime_node(*node, prep, worker_ggufs[i], err, 600000)) {
             return false;
+        }
+    }
+
+    if (draft_future.valid()) {
+        const auto [ok, result] = draft_future.get();
+        if (ok) {
+            session.speculative_draft_model_path = result;
+            speculative = true;
+        } else {
+            fprintf(stderr, "orchestrator: draft model prepare failed: %s (speculation disabled for session %s)\n",
+                    result.c_str(), session_id.c_str());
         }
     }
 
@@ -3117,8 +3170,8 @@ int main(int argc, char ** argv) {
         dist_session session{};
         session.session_id = session_id;
         session.model      = record->model_id;
-        session.speculative_draft_model_path = body.value("speculative_draft_model_path", "");
-        session.speculative_draft_k          = body.value("speculative_draft_k", 4);
+        session.speculative_draft_model_id = body.value("speculative_draft_model_id", "");
+        session.speculative_draft_k        = body.value("speculative_draft_k", 4);
 
         std::string err;
         if (!setup_runtime_graph(session.session_id, n_layers, assignments, node_map, mem, session, err)) {
