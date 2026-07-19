@@ -1,4 +1,5 @@
 #include "dist_common.h"
+#include "dist_http_fetch.h"
 #include "dist_process.h"
 #include "model_catalog.h"
 #include "node_benchmark.h"
@@ -2517,6 +2518,44 @@ int main(int argc, char ** argv) {
         perf_session_span svc_span("SESSION_SERVICE_CONFIGURE", g_node_id.c_str(), "sampler");
         g_sampler_service_ready = true;
         res.set_content(json({ { "ok", true }, { "sampler_ready", true } }).dump(), "application/json");
+    });
+
+    // Task 19 Phase 3: fetch the speculative-decoding draft model. Unlike
+    // /runtime/prepare (registry + manifest + layer-store, built for
+    // splitting one model's layers across nodes), the draft is a single
+    // small whole model with a URL the caller already knows -- no
+    // registration or slicing needed, just get the file onto this node.
+    svr.Post("/draft/fetch", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        const std::string url      = body.value("source_url", "");
+        const std::string filename = body.value("filename", "");
+        if (url.empty() || filename.empty()) {
+            res.status = 400;
+            res.set_content(R"({"error":"source_url and filename required"})", "application/json");
+            return;
+        }
+
+        const std::string dest_dir = g_models_dir.empty() ? "/tmp" : g_models_dir + "/draft";
+        std::error_code ec;
+        std::filesystem::create_directories(dest_dir, ec);
+        const std::string dest_path = dest_dir + "/" + filename;
+
+        if (!std::filesystem::exists(dest_path, ec) || std::filesystem::file_size(dest_path, ec) == 0) {
+            std::string derr;
+            if (!dist_http_download_file(url, dest_path, derr)) {
+                res.status = 500;
+                res.set_content(json({ { "ok", false }, { "error", derr } }).dump(), "application/json");
+                return;
+            }
+        }
+        res.set_content(json({ { "ok", true }, { "path", dest_path } }).dump(), "application/json");
     });
 
     svr.Post("/runtime/prepare", [](const httplib::Request & req, httplib::Response & res) {

@@ -307,3 +307,36 @@ bool dist_http_get_range(
     fprintf(stderr, "node_agent: HTTPS via curl fallback (%s)\n", parsed.host.c_str());
     return curl_range_get(url, offset, length, out);
 }
+
+bool dist_http_download_file(
+        const std::string & url,
+        const std::string & dest_path,
+        std::string & err) {
+    const std::string token = dist_hf_token();
+    std::vector<std::string> argv = {
+#if defined(_WIN32)
+        "curl.exe",
+#else
+        "curl",
+#endif
+        "-sfL", "--max-time", "1800",
+        "-H", "User-Agent: distributed-llama-node-agent/0.1",
+    };
+    if (!token.empty()) {
+        argv.push_back("-H");
+        argv.push_back("Authorization: Bearer " + token);
+    }
+    argv.push_back("-o");
+    argv.push_back(dest_path);
+    argv.push_back(url);
+
+    std::vector<uint8_t> discard;
+    const int rc = dist_process_run_capture_stdout(argv, discard, err);
+    if (rc != 0) {
+        if (err.empty()) {
+            err = "curl exited " + std::to_string(rc);
+        }
+        return false;
+    }
+    return true;
+}
