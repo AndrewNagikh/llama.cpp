@@ -800,9 +800,17 @@ int main(int argc, char ** argv) {
     int             fa_fd       = -1;
     std::mutex      draft_mu;
     if (draft_model_path != nullptr) {
+        // Not split_gen_load_model(): in layer-store mode (DIST_RUNTIME_LAYER_FIRST
+        // + DIST_MODEL_ID set process-wide for this pipeline-stage worker) that
+        // function ignores its model_path argument entirely and reloads whatever
+        // DIST_MODEL_ID/DIST_WORKER_LAYER_START/_END point to -- i.e. it would
+        // silently reload the *primary* target model a second time instead of the
+        // draft, using the primary's layer range. The draft is always a whole,
+        // unsliced file on disk; load it directly.
         std::string draft_load_err;
-        draft_model = split_gen_load_model(draft_model_path, draft_load_err);
+        draft_model = llama_model_load_from_file(draft_model_path, llama_model_default_params());
         if (!draft_model) {
+            draft_load_err = "llama_model_load_from_file failed";
             fprintf(stderr, "gen3_c: draft model load failed: %s (speculation disabled)\n",
                     draft_load_err.c_str());
         } else {
