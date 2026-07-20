@@ -2693,6 +2693,18 @@ int main(int argc, char ** argv) {
 
     httplib::Server svr;
 
+    // CORS: the dashboard app (Electron renderer) fetches the orchestrator
+    // directly from the browser, a different origin -- without these
+    // headers the browser blocks the response.
+    svr.set_post_routing_handler([](const httplib::Request &, httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type");
+    });
+    svr.Options(R"(.*)", [](const httplib::Request &, httplib::Response & res) {
+        res.status = 204;
+    });
+
     svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
         res.set_content(R"({"status":"ok"})", "application/json");
     });
