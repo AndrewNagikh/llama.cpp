@@ -20,11 +20,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 static void usage(const char * prog) {
@@ -204,17 +206,25 @@ struct entry_ab_pending {
 // Sizes the entry-side bounded wait for a draft off recent arrival latency
 // instead of a fixed constant, since a Wi-Fi link's RTT/jitter can swing
 // from ~5ms to 100ms+ over seconds. Tracks the last HISTORY (pos_start,
-// latency) samples and recomputes wait_window_ms as clamp(P95 + margin,
-// min, max) every RECOMPUTE_EVERY samples (not on every one, to avoid the
-// window itself oscillating). wait_window_ms is the only thing callers
-// read; the source of that value can later be swapped for an
+// latency) samples and recomputes wait_window_ms as clamp(percentile +
+// margin, min, max) every RECOMPUTE_EVERY samples (not on every one, to
+// avoid the window itself oscillating). wait_window_ms is the only thing
+// callers read; the source of that value can later be swapped for an
 // orchestrator-supplied estimate without touching the caller.
+//
+// Which percentile (or a fixed window) is used is set once at startup from
+// SPEC_WAIT_POLICY, so the policy can be A/B'd against a live cluster
+// without a rebuild between runs -- see split_gen3_a's entry point for the
+// env var parsing. Default (unset) is p95, matching the original behavior.
 struct draft_wait_estimator {
     static constexpr size_t HISTORY         = 128;
     static constexpr size_t RECOMPUTE_EVERY = 32;
     static constexpr double MIN_WAIT_MS     = 4.0;
     static constexpr double MAX_WAIT_MS     = 30.0;
     static constexpr double SAFETY_MARGIN_MS = 2.0;
+
+    bool                  fixed_policy = false;
+    double                percentile   = 0.95; // used when !fixed_policy
 
     std::mutex           mu;
     std::vector<double>  samples;
@@ -244,16 +254,51 @@ struct draft_wait_estimator {
         std::sort(sorted.begin(), sorted.end());
         const double p50 = sorted[(size_t) (0.50 * (sorted.size() - 1))];
         const double p95 = sorted[(size_t) (0.95 * (sorted.size() - 1))];
-        const double window = std::clamp(p95 + SAFETY_MARGIN_MS, MIN_WAIT_MS, MAX_WAIT_MS);
-        wait_window_ms.store(window);
+        // Always measured off p95 regardless of policy, so every policy's
+        // log is directly comparable in the A/B bench even when the
+        // window itself isn't derived from p95.
+        if (!fixed_policy) {
+            const double target = sorted[(size_t) (percentile * (sorted.size() - 1))];
+            const double window = std::clamp(target + SAFETY_MARGIN_MS, MIN_WAIT_MS, MAX_WAIT_MS);
+            wait_window_ms.store(window);
+        }
         const double hit_rate = (hits + misses) > 0
                 ? 100.0 * (double) hits / (double) (hits + misses) : 0.0;
         fprintf(stderr, "SPEC_DEBUG entry: wait_window=%.1fms arrival_p50=%.1fms arrival_p95=%.1fms hit_rate=%.0f%%\n",
-                window, p50, p95, hit_rate);
+                wait_window_ms.load(), p50, p95, hit_rate);
         hits = 0;
         misses = 0;
     }
 };
+
+// Parses SPEC_WAIT_POLICY: "fixed:<ms>", "p50"/"p80"/"p90"/"p95"/"p99", or
+// unset (defaults to p95, the original fixed-percentile behavior).
+static void configure_wait_policy_from_env(draft_wait_estimator & est) {
+    const char * raw = getenv("SPEC_WAIT_POLICY");
+    if (!raw || !*raw) {
+        return; // keep defaults: !fixed_policy, percentile=0.95
+    }
+    const std::string policy(raw);
+    if (policy.rfind("fixed:", 0) == 0) {
+        const double ms = std::atof(policy.c_str() + 6);
+        est.fixed_policy = true;
+        est.wait_window_ms.store(ms);
+        fprintf(stderr, "gen3_a: SPEC_WAIT_POLICY=fixed:%.1fms\n", ms);
+        return;
+    }
+    static const std::vector<std::pair<std::string, double>> named = {
+        {"p50", 0.50}, {"p80", 0.80}, {"p90", 0.90}, {"p95", 0.95}, {"p99", 0.99},
+    };
+    for (const auto & kv : named) {
+        if (policy == kv.first) {
+            est.fixed_policy = false;
+            est.percentile = kv.second;
+            fprintf(stderr, "gen3_a: SPEC_WAIT_POLICY=%s\n", kv.first.c_str());
+            return;
+        }
+    }
+    fprintf(stderr, "gen3_a: unrecognized SPEC_WAIT_POLICY=%s, falling back to p95\n", raw);
+}
 
 // Draft token ids delivered directly from the node holding `final` over the
 // fa-link (Task 19 Phase 3, placement per TASK_19_SPECULATIVE_PIPELINE_STUDY
@@ -916,6 +961,7 @@ int main(int argc, char ** argv) {
     // TASK_19_SPECULATIVE_PIPELINE_STUDY.md SA). Optional: only set up when
     // the orchestrator allocated a port for this session.
     fa_draft_buffer fa_buf;
+    configure_wait_policy_from_env(fa_buf.wait_est);
     std::thread     fa_thread;
     if (fa_port > 0) {
         const int fa_listen_fd = split_tcp_listen_host(bind_host, fa_port);
