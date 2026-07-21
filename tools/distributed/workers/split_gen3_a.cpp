@@ -24,6 +24,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -221,12 +222,37 @@ struct entry_ab_pending {
 // measured network -- the one comparison in that dataset that survived
 // the network confound. fixed:8 (the original hardcoded window) was
 // confirmed suboptimal.
+// NORMAL <-> THROTTLED hysteresis (Task 19 level 3): gated on arrival
+// latency, NOT hit_rate. hit_rate conflates two unrelated causes -- a slow
+// network and a poorly-matched draft model both depress it, but only the
+// first means waiting has stopped paying off. arrival_p95 vs. the window
+// we're already paying for isolates the network cause specifically:
+// arrival_p95=4ms/hit_rate=35% is a bad model on a fine network (waiting
+// is still cheap, don't throttle); arrival_p95=25ms/hit_rate=35% is an
+// actually slow network (throttle). hit_rate stays in the log purely as a
+// diagnostic to tell those two cases apart by eye.
 struct draft_wait_estimator {
     static constexpr size_t HISTORY         = 128;
     static constexpr size_t RECOMPUTE_EVERY = 32;
     static constexpr double MIN_WAIT_MS     = 4.0;
     static constexpr double MAX_WAIT_MS     = 30.0;
     static constexpr double SAFETY_MARGIN_MS = 2.0;
+    // Enter THROTTLED once arrival_p95 exceeds this multiple of the window
+    // (i.e. the tail latency has grown well past what we're already
+    // budgeting for), or this absolute floor -- whichever is higher, so a
+    // tiny window near MIN_WAIT_MS doesn't trip throttle on ordinary
+    // jitter. Exit at a lower multiple than entry: the gap is the
+    // hysteresis band that keeps a borderline link from flapping.
+    static constexpr double THROTTLE_ENTER_MULT = 2.0;
+    static constexpr double THROTTLE_EXIT_MULT  = 1.2;
+    static constexpr double THROTTLE_MIN_ABS_MS = 20.0;
+    // While THROTTLED, only this fraction of positions still pay for a
+    // real wait_for (chosen at random, not every Nth, to avoid
+    // synchronizing with some other periodic process); the rest skip
+    // waiting outright. Named and centralized here specifically so it's
+    // one line to retune later (e.g. lower on Wi-Fi, higher on Ethernet)
+    // without hunting through the call site.
+    static constexpr double THROTTLE_PROBE_RATE = 0.125; // 1/8
 
     bool                  fixed_policy = false;
     double                percentile   = 0.80; // used when !fixed_policy
@@ -238,10 +264,23 @@ struct draft_wait_estimator {
     size_t               hits            = 0;
     size_t               misses          = 0;
     std::atomic<double>  wait_window_ms{8.0}; // seed = old fixed value
+    std::atomic<bool>    throttled{false};
+
+    // True roughly THROTTLE_PROBE_RATE of the time; used by the caller to
+    // decide whether a THROTTLED position still pays for a real wait.
+    static bool roll_probe() {
+        thread_local std::mt19937 rng{std::random_device{}()};
+        thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
+        return dist(rng) < THROTTLE_PROBE_RATE;
+    }
 
     // ms is the observed wait needed for a hit, or the window used for a
     // miss (a censored lower bound -- we don't know how much longer the
-    // draft would have taken, only that it was more than we waited).
+    // draft would have taken, only that it was more than we waited). Only
+    // call this with a genuine sample (a hit, or a miss that actually
+    // waited) -- a THROTTLED position that skipped waiting entirely
+    // carries no timing information and must not be fed in here, or the
+    // stats would be biased toward looking healthier than they are.
     void add_sample_ms(double ms, bool hit) {
         std::lock_guard<std::mutex> lock(mu);
         if (hit) { ++hits; } else { ++misses; }
@@ -267,10 +306,22 @@ struct draft_wait_estimator {
             const double window = std::clamp(target + SAFETY_MARGIN_MS, MIN_WAIT_MS, MAX_WAIT_MS);
             wait_window_ms.store(window);
         }
+        const double window_now = wait_window_ms.load();
+        if (!throttled.load()) {
+            const double enter_threshold = std::max(THROTTLE_ENTER_MULT * window_now, THROTTLE_MIN_ABS_MS);
+            if (p95 > enter_threshold) {
+                throttled.store(true);
+            }
+        } else {
+            const double exit_threshold = THROTTLE_EXIT_MULT * window_now;
+            if (p95 < exit_threshold) {
+                throttled.store(false);
+            }
+        }
         const double hit_rate = (hits + misses) > 0
                 ? 100.0 * (double) hits / (double) (hits + misses) : 0.0;
-        fprintf(stderr, "SPEC_DEBUG entry: wait_window=%.1fms arrival_p50=%.1fms arrival_p95=%.1fms hit_rate=%.0f%%\n",
-                wait_window_ms.load(), p50, p95, hit_rate);
+        fprintf(stderr, "SPEC_DEBUG entry: wait_window=%.1fms arrival_p50=%.1fms arrival_p95=%.1fms hit_rate=%.0f%% throttled=%s\n",
+                window_now, p50, p95, hit_rate, throttled.load() ? "yes" : "no");
         hits = 0;
         misses = 0;
     }
@@ -281,7 +332,7 @@ struct draft_wait_estimator {
 static void configure_wait_policy_from_env(draft_wait_estimator & est) {
     const char * raw = getenv("SPEC_WAIT_POLICY");
     if (!raw || !*raw) {
-        return; // keep defaults: !fixed_policy, percentile=0.95
+        return; // keep defaults: !fixed_policy, percentile=0.80
     }
     const std::string policy(raw);
     if (policy.rfind("fixed:", 0) == 0) {
@@ -378,17 +429,34 @@ static bool entry_process_work_item(
         // Wi-Fi link's RTT can swing an order of magnitude within seconds.
         const int64_t t_need_us = ggml_time_us();
         const double  window_ms = st.fa_buf->wait_est.wait_window_ms.load();
-        if (st.fa_buf->pos != req.pos_start || st.fa_buf->ids.empty()) {
-            st.fa_buf->cv.wait_for(lock, std::chrono::duration<double, std::milli>(window_ms), [&] {
-                return st.fa_buf->pos == req.pos_start && !st.fa_buf->ids.empty();
-            });
+        const bool already_present = st.fa_buf->pos == req.pos_start && !st.fa_buf->ids.empty();
+        // THROTTLED (level 3): once arrival latency has grown well past
+        // the window we're already paying for, waiting has stopped
+        // earning its keep -- so most positions skip the wait outright.
+        // A random fraction still pays for a real wait_for so the
+        // estimator keeps getting honest samples and can detect recovery;
+        // without that, a fully-skipped window would starve add_sample_ms
+        // and the link could never un-throttle.
+        bool waited = false;
+        if (!already_present) {
+            const bool should_wait = !st.fa_buf->wait_est.throttled.load() || draft_wait_estimator::roll_probe();
+            if (should_wait) {
+                waited = true;
+                st.fa_buf->cv.wait_for(lock, std::chrono::duration<double, std::milli>(window_ms), [&] {
+                    return st.fa_buf->pos == req.pos_start && !st.fa_buf->ids.empty();
+                });
+            }
         }
         const bool hit = st.fa_buf->pos == req.pos_start && !st.fa_buf->ids.empty();
-        const double latency_ms = hit
-                ? std::max(0.0, (double) (st.fa_buf->arrival_us - t_need_us) / 1000.0)
-                : window_ms; // censored: draft took at least this long (or never came)
-        st.fa_buf->wait_est.add_sample_ms(latency_ms, hit);
-        fprintf(stderr, "SPEC_DEBUG entry: pos=%d draft_%s window=%.1fms\n", req.pos_start, hit ? "hit" : "miss", window_ms);
+        const bool have_sample = already_present || waited;
+        if (have_sample) {
+            const double latency_ms = hit
+                    ? std::max(0.0, (double) (st.fa_buf->arrival_us - t_need_us) / 1000.0)
+                    : window_ms; // censored: draft took at least this long (or never came)
+            st.fa_buf->wait_est.add_sample_ms(latency_ms, hit);
+        }
+        const char * outcome = hit ? "hit" : (have_sample ? "miss" : "skip");
+        fprintf(stderr, "SPEC_DEBUG entry: pos=%d draft_%s window=%.1fms\n", req.pos_start, outcome, window_ms);
         if (hit) {
             tokens_i32.insert(tokens_i32.end(), st.fa_buf->ids.begin(), st.fa_buf->ids.end());
             req.n_tokens = (int32_t) tokens_i32.size();
