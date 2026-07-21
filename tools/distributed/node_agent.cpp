@@ -39,12 +39,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -53,6 +55,66 @@
 #include <vector>
 
 using json = nlohmann::json;
+
+// Task 19 level 2: lightweight network observability. Reuses the existing
+// /health endpoint as a ping target (no new wire protocol) so a bench run
+// can log RTT/jitter/loss to a peer alongside its tok/s and hit_rate,
+// instead of guessing whether a throughput swing came from the wait
+// policy or from the network drifting mid-run. Deliberately not a full
+// heartbeat subsystem: one background thread, one endpoint.
+struct peer_rtt_tracker {
+    static constexpr size_t HISTORY = 128;
+    std::mutex           mu;
+    std::vector<double>  samples;
+    size_t               next_slot = 0;
+    size_t               attempts  = 0;
+    size_t               successes = 0;
+
+    void add_success(double rtt_ms) {
+        std::lock_guard<std::mutex> lock(mu);
+        ++attempts;
+        ++successes;
+        if (samples.size() < HISTORY) {
+            samples.push_back(rtt_ms);
+        } else {
+            samples[next_slot] = rtt_ms;
+            next_slot = (next_slot + 1) % HISTORY;
+        }
+    }
+
+    void add_failure() {
+        std::lock_guard<std::mutex> lock(mu);
+        ++attempts;
+    }
+
+    json stats() {
+        std::lock_guard<std::mutex> lock(mu);
+        const double loss_pct = attempts > 0
+                ? 100.0 * (double) (attempts - successes) / (double) attempts : 0.0;
+        if (samples.empty()) {
+            return {
+                { "rtt_p50_ms", nullptr }, { "rtt_p95_ms", nullptr }, { "rtt_p99_ms", nullptr },
+                { "jitter_ms", nullptr }, { "loss_pct", loss_pct }, { "samples", 0 },
+            };
+        }
+        std::vector<double> sorted = samples;
+        std::sort(sorted.begin(), sorted.end());
+        const auto pct = [&](double p) { return sorted[(size_t) (p * (sorted.size() - 1))]; };
+        double mean = 0.0;
+        for (double v : sorted) { mean += v; }
+        mean /= (double) sorted.size();
+        double var = 0.0;
+        for (double v : sorted) { var += (v - mean) * (v - mean); }
+        var /= (double) sorted.size();
+        return {
+            { "rtt_p50_ms", pct(0.50) }, { "rtt_p95_ms", pct(0.95) }, { "rtt_p99_ms", pct(0.99) },
+            { "jitter_ms", std::sqrt(var) }, { "loss_pct", loss_pct }, { "samples", sorted.size() },
+        };
+    }
+};
+
+static std::mutex g_peer_rtt_mu;
+static std::map<std::string, std::unique_ptr<peer_rtt_tracker>> g_peer_rtt;
 
 static std::string g_model_path;
 static std::string g_node_id;
@@ -2087,6 +2149,68 @@ int main(int argc, char ** argv) {
         }
     }).detach();
 
+    // Network observability (Task 19 level 2): ping peers' /health once a
+    // second and track RTT/loss per peer, refreshing the peer list from
+    // the orchestrator every ~5s. See peer_rtt_tracker above.
+    std::thread([orchestrator]() {
+        std::map<std::string, std::pair<std::string, int>> peers;
+        int refresh_in = 0;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (refresh_in <= 0) {
+                httplib::Client cli(orchestrator.c_str());
+                cli.set_connection_timeout(3, 0);
+                cli.set_read_timeout(3, 0);
+                if (auto res = cli.Get("/nodes")) {
+                    if (res->status == 200) {
+                        try {
+                            const json d = json::parse(res->body);
+                            std::map<std::string, std::pair<std::string, int>> next_peers;
+                            for (const auto & n : d.value("nodes", json::array())) {
+                                const std::string nid = n.value("node_id", "");
+                                if (nid.empty() || nid == g_node_id) {
+                                    continue;
+                                }
+                                next_peers[nid] = { n.value("host", ""), n.value("port", 0) };
+                            }
+                            peers = std::move(next_peers);
+                        } catch (...) {
+                            // keep the previous peer list on a parse error
+                        }
+                    }
+                }
+                refresh_in = 5;
+            }
+            --refresh_in;
+
+            for (const auto & kv : peers) {
+                const std::string & nid  = kv.first;
+                const std::string & host = kv.second.first;
+                const int           port = kv.second.second;
+                if (host.empty() || port <= 0) {
+                    continue;
+                }
+                httplib::Client cli(host.c_str(), port);
+                cli.set_connection_timeout(0, 500000);
+                cli.set_read_timeout(0, 500000);
+                const auto t0 = std::chrono::steady_clock::now();
+                auto res = cli.Get("/health");
+                std::lock_guard<std::mutex> lock(g_peer_rtt_mu);
+                auto & tracker = g_peer_rtt[nid];
+                if (!tracker) {
+                    tracker = std::make_unique<peer_rtt_tracker>();
+                }
+                if (res && res->status == 200) {
+                    const double rtt_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+                    tracker->add_success(rtt_ms);
+                } else {
+                    tracker->add_failure();
+                }
+            }
+        }
+    }).detach();
+
     const std::string agent_bin = exe_dir(argv[0]);
 
     httplib::Server svr;
@@ -2105,6 +2229,15 @@ int main(int argc, char ** argv) {
 
     svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
         res.set_content(json({ { "status", "ok" }, { "node_id", g_node_id } }).dump(), "application/json");
+    });
+
+    svr.Get("/network/stats", [](const httplib::Request &, httplib::Response & res) {
+        json peers = json::object();
+        std::lock_guard<std::mutex> lock(g_peer_rtt_mu);
+        for (auto & kv : g_peer_rtt) {
+            peers[kv.first] = kv.second->stats();
+        }
+        res.set_content(json({ { "node_id", g_node_id }, { "peers", peers } }).dump(), "application/json");
     });
 
     svr.Get("/perf/trace/list", [](const httplib::Request &, httplib::Response & res) {
