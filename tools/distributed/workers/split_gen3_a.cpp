@@ -201,6 +201,60 @@ struct entry_ab_pending {
     double          ms_ab_xfer    = 0.0;
 };
 
+// Sizes the entry-side bounded wait for a draft off recent arrival latency
+// instead of a fixed constant, since a Wi-Fi link's RTT/jitter can swing
+// from ~5ms to 100ms+ over seconds. Tracks the last HISTORY (pos_start,
+// latency) samples and recomputes wait_window_ms as clamp(P95 + margin,
+// min, max) every RECOMPUTE_EVERY samples (not on every one, to avoid the
+// window itself oscillating). wait_window_ms is the only thing callers
+// read; the source of that value can later be swapped for an
+// orchestrator-supplied estimate without touching the caller.
+struct draft_wait_estimator {
+    static constexpr size_t HISTORY         = 128;
+    static constexpr size_t RECOMPUTE_EVERY = 32;
+    static constexpr double MIN_WAIT_MS     = 4.0;
+    static constexpr double MAX_WAIT_MS     = 30.0;
+    static constexpr double SAFETY_MARGIN_MS = 2.0;
+
+    std::mutex           mu;
+    std::vector<double>  samples;
+    size_t               next_slot       = 0;
+    size_t               since_recompute = 0;
+    size_t               hits            = 0;
+    size_t               misses          = 0;
+    std::atomic<double>  wait_window_ms{8.0}; // seed = old fixed value
+
+    // ms is the observed wait needed for a hit, or the window used for a
+    // miss (a censored lower bound -- we don't know how much longer the
+    // draft would have taken, only that it was more than we waited).
+    void add_sample_ms(double ms, bool hit) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (hit) { ++hits; } else { ++misses; }
+        if (samples.size() < HISTORY) {
+            samples.push_back(ms);
+        } else {
+            samples[next_slot] = ms;
+            next_slot = (next_slot + 1) % HISTORY;
+        }
+        if (++since_recompute < RECOMPUTE_EVERY || samples.size() < 8) {
+            return;
+        }
+        since_recompute = 0;
+        std::vector<double> sorted = samples;
+        std::sort(sorted.begin(), sorted.end());
+        const double p50 = sorted[(size_t) (0.50 * (sorted.size() - 1))];
+        const double p95 = sorted[(size_t) (0.95 * (sorted.size() - 1))];
+        const double window = std::clamp(p95 + SAFETY_MARGIN_MS, MIN_WAIT_MS, MAX_WAIT_MS);
+        wait_window_ms.store(window);
+        const double hit_rate = (hits + misses) > 0
+                ? 100.0 * (double) hits / (double) (hits + misses) : 0.0;
+        fprintf(stderr, "SPEC_DEBUG entry: wait_window=%.1fms arrival_p50=%.1fms arrival_p95=%.1fms hit_rate=%.0f%%\n",
+                window, p50, p95, hit_rate);
+        hits = 0;
+        misses = 0;
+    }
+};
+
 // Draft token ids delivered directly from the node holding `final` over the
 // fa-link (Task 19 Phase 3, placement per TASK_19_SPECULATIVE_PIPELINE_STUDY
 // §A). Single-slot: final only ever has one outstanding draft (for the
@@ -210,12 +264,17 @@ struct fa_draft_buffer {
     std::condition_variable cv;
     int32_t              pos = -1;
     std::vector<int32_t> ids;
+    // Timestamp (ggml_time_us) of the last pos/ids write, set under mu by
+    // the fa-link receiver thread. Read by the consumer to measure how
+    // long it actually waited for a given draft (see draft_wait_estimator).
+    int64_t              arrival_us = 0;
     // Set once final has connected in; used to ship the prompt tokens at
     // PREFILL time so the draft model can prime its own KV cache (see
     // split_gen3_c.cpp's fa_prime receiver thread). Same fd the receiver
     // thread above reads from -- TCP is full duplex, and each direction
     // only ever carries one message shape, so this is unambiguous.
     int                  fd  = -1;
+    draft_wait_estimator wait_est;
 };
 
 struct entry_stage_state {
@@ -264,14 +323,22 @@ static bool entry_process_work_item(
         // the token's own longer return trip (final->middle->entry->client
         // ->entry); it loses that race by a hair more often than not. A
         // short bounded wait flips most of those photo finishes: one
-        // accepted token repays a few ms of waiting many times over.
+        // accepted token repays a few ms of waiting many times over. The
+        // window itself is adaptive (see draft_wait_estimator) since a
+        // Wi-Fi link's RTT can swing an order of magnitude within seconds.
+        const int64_t t_need_us = ggml_time_us();
+        const double  window_ms = st.fa_buf->wait_est.wait_window_ms.load();
         if (st.fa_buf->pos != req.pos_start || st.fa_buf->ids.empty()) {
-            st.fa_buf->cv.wait_for(lock, std::chrono::milliseconds(8), [&] {
+            st.fa_buf->cv.wait_for(lock, std::chrono::duration<double, std::milli>(window_ms), [&] {
                 return st.fa_buf->pos == req.pos_start && !st.fa_buf->ids.empty();
             });
         }
         const bool hit = st.fa_buf->pos == req.pos_start && !st.fa_buf->ids.empty();
-        fprintf(stderr, "SPEC_DEBUG entry: pos=%d draft_%s\n", req.pos_start, hit ? "hit" : "miss");
+        const double latency_ms = hit
+                ? std::max(0.0, (double) (st.fa_buf->arrival_us - t_need_us) / 1000.0)
+                : window_ms; // censored: draft took at least this long (or never came)
+        st.fa_buf->wait_est.add_sample_ms(latency_ms, hit);
+        fprintf(stderr, "SPEC_DEBUG entry: pos=%d draft_%s window=%.1fms\n", req.pos_start, hit ? "hit" : "miss", window_ms);
         if (hit) {
             tokens_i32.insert(tokens_i32.end(), st.fa_buf->ids.begin(), st.fa_buf->ids.end());
             req.n_tokens = (int32_t) tokens_i32.size();
@@ -879,6 +946,7 @@ int main(int argc, char ** argv) {
                         std::lock_guard<std::mutex> lock(fa_buf.mu);
                         fa_buf.pos = pos;
                         fa_buf.ids = std::move(ids);
+                        fa_buf.arrival_us = ggml_time_us();
                     }
                     fa_buf.cv.notify_all();
                 }
