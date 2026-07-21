@@ -215,7 +215,12 @@ struct entry_ab_pending {
 // Which percentile (or a fixed window) is used is set once at startup from
 // SPEC_WAIT_POLICY, so the policy can be A/B'd against a live cluster
 // without a rebuild between runs -- see split_gen3_a's entry point for the
-// env var parsing. Default (unset) is p95, matching the original behavior.
+// env var parsing. Default (unset) is p80: the 2026-07-21 baseline bench
+// (docs/TASK_19_SPECULATIVE_PIPELINE_STUDY.md section H) found p80 beat
+// p95 on throughput in both rounds, including once under a *worse*
+// measured network -- the one comparison in that dataset that survived
+// the network confound. fixed:8 (the original hardcoded window) was
+// confirmed suboptimal.
 struct draft_wait_estimator {
     static constexpr size_t HISTORY         = 128;
     static constexpr size_t RECOMPUTE_EVERY = 32;
@@ -224,7 +229,7 @@ struct draft_wait_estimator {
     static constexpr double SAFETY_MARGIN_MS = 2.0;
 
     bool                  fixed_policy = false;
-    double                percentile   = 0.95; // used when !fixed_policy
+    double                percentile   = 0.80; // used when !fixed_policy
 
     std::mutex           mu;
     std::vector<double>  samples;
@@ -272,7 +277,7 @@ struct draft_wait_estimator {
 };
 
 // Parses SPEC_WAIT_POLICY: "fixed:<ms>", "p50"/"p80"/"p90"/"p95"/"p99", or
-// unset (defaults to p95, the original fixed-percentile behavior).
+// unset (defaults to p80, the current best-known policy).
 static void configure_wait_policy_from_env(draft_wait_estimator & est) {
     const char * raw = getenv("SPEC_WAIT_POLICY");
     if (!raw || !*raw) {
@@ -297,7 +302,7 @@ static void configure_wait_policy_from_env(draft_wait_estimator & est) {
             return;
         }
     }
-    fprintf(stderr, "gen3_a: unrecognized SPEC_WAIT_POLICY=%s, falling back to p95\n", raw);
+    fprintf(stderr, "gen3_a: unrecognized SPEC_WAIT_POLICY=%s, falling back to p80\n", raw);
 }
 
 // Draft token ids delivered directly from the node holding `final` over the
@@ -1074,7 +1079,13 @@ int main(int argc, char ** argv) {
         };
         st.fa_buf = fa_port > 0 ? &fa_buf : nullptr;
 
-        if (runtime_entry_queue_enabled()) {
+        // A session with a draft wired up always takes the verify-wave
+        // speculative path (see node_agent.cpp's matching
+        // g_pipeline_fa_port > 0 check), which requires entry_queue off --
+        // decided per session here instead of only via the process-wide
+        // DIST_RUNTIME_ENTRY_QUEUE env var, since a session's fa_port is
+        // known regardless of which node ended up holding entry.
+        if (fa_port <= 0 && runtime_entry_queue_enabled()) {
             wave_inbound_queue queue(runtime_entry_queue_max_depth());
             if (!entry_run_queued_session(st, queue, debug_step, normal_shutdown, pipe_failed)) {
                 split_tcp_close(ctrl_fd);

@@ -131,6 +131,11 @@ static int g_pipeline_ctrl_port = 0;
 static int g_pipeline_layer_end = 0;
 static std::string g_pipeline_session_id;
 static uint32_t g_pipeline_protocol = DIST_RUNTIME_PROTOCOL_V1;
+// fa_port for the currently configured session, mirroring cfg.fa_port from
+// /configure. Lets the client decide entry_queue/speculative per session
+// (this session actually has a draft wired up) instead of a process-wide
+// env var that can't know which node will hold entry ahead of time.
+static int g_pipeline_fa_port = 0;
 
 struct node_runtime_stats {
     int configure_count        = 0;
@@ -1126,6 +1131,7 @@ static void stop_worker_for_role(const dist_node_role role) {
     if (role == DIST_ROLE_ENTRY) {
         g_pipeline_ctrl_port = 0;
         g_pipeline_layer_end = 0;
+        g_pipeline_fa_port = 0;
     }
 }
 
@@ -1182,9 +1188,17 @@ static bool pipeline_connect_and_negotiate(int & ctrl_fd, std::string & err) {
 // client just keeps asking for "the next token" via SPLIT_GEN_CMD_VERIFY
 // with a 1-token anchor; entry silently extends the wave from its draft
 // buffer when one is ready, so a single request can yield multiple tokens.
+// On by default: a session only actually goes down the speculative path
+// when the orchestrator wired up a draft for it (g_pipeline_fa_port > 0,
+// checked at the use_entry_queue/speculative call site below), so this
+// flag being on doesn't change anything for a plain non-speculative
+// session. Set DIST_RUNTIME_SPECULATIVE=0 to force it off regardless.
 static bool speculative_client_enabled() {
     const char * v = std::getenv("DIST_RUNTIME_SPECULATIVE");
-    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    if (v == nullptr || v[0] == '\0') {
+        return true;
+    }
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 && std::strcmp(v, "FALSE") != 0;
 }
 
 static bool pipeline_gen3_send_recv(
@@ -1285,7 +1299,15 @@ static bool run_local_pipeline_generate(
         return false;
     }
 
-    const bool use_entry_queue = runtime_entry_queue_client_enabled(g_pipeline_protocol);
+    // A session with a draft wired up (g_pipeline_fa_port > 0) always takes
+    // the verify-wave speculative path, which is incompatible with the
+    // queued/pipelined entry_queue mode (see split_gen3_a.cpp's matching
+    // fa_port > 0 check) -- decided per session instead of a process-wide
+    // env var, since which node ends up holding entry (and thus needing
+    // this decision) isn't known ahead of time on a growing cluster.
+    const bool session_has_draft = g_pipeline_fa_port > 0;
+    const bool use_entry_queue = !session_has_draft
+            && runtime_entry_queue_client_enabled(g_pipeline_protocol);
     const bool client_pipeline = runtime_client_pipeline_client_enabled(g_pipeline_protocol);
 
     const auto t_prefill0 = std::chrono::steady_clock::now();
@@ -2974,6 +2996,7 @@ int main(int argc, char ** argv) {
             g_pipeline_layer_end   = cfg.layer_end;
             g_pipeline_session_id  = cfg.session_id;
             g_pipeline_protocol    = DIST_RUNTIME_PROTOCOL_V1;
+            g_pipeline_fa_port     = cfg.fa_port;
             if (worker_model == LAYER_STORE_MODEL_SENTINEL) {
                 g_entry_worker_gguf.clear();
                 g_entry_model_id = cfg.model_id;
