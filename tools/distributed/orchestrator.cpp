@@ -1830,6 +1830,10 @@ static bool setup_runtime_graph(
     const bool draft_requested = !session.speculative_draft_model_url.empty();
     bool speculative = false;
     const int fa_port = pipe_base + (int) stage_ptrs.size() + 2;
+    // Task 21.2: direct final->client token-return link (tc-link), one slot
+    // past fa_port. Entry's node_agent listens (observability only for now
+    // -- see TASK_21_PROVEN_PRACTICES_PLAN.md Item 2), final connects.
+    const int tc_port = pipe_base + (int) stage_ptrs.size() + 3;
     const runtime_role_assignment * emb_assign = session.runtime.find_role(runtime_role::embedding);
     const runtime_role_assignment * out_assign = session.runtime.find_role(runtime_role::output_head);
     const bool external_embedding =
@@ -2004,6 +2008,8 @@ static bool setup_runtime_graph(
                 cfg["draft_k"]     = session.speculative_draft_k;
                 cfg["fa_host"]     = stages[0].host;
                 cfg["fa_port"]     = fa_port;
+                cfg["tc_host"]     = stages[0].host;
+                cfg["tc_port"]     = tc_port;
             }
             if (external_output && out_assign != nullptr) {
                 const std::string out_host =
@@ -2033,6 +2039,7 @@ static bool setup_runtime_graph(
             cfg["next_is_final"] = (next.role == DIST_ROLE_FINAL);
             if (speculative) {
                 cfg["fa_port"] = fa_port;
+                cfg["tc_port"] = tc_port;
             }
             if (external_embedding && emb_assign != nullptr) {
                 const std::string emb_host =

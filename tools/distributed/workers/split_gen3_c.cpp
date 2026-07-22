@@ -213,6 +213,12 @@ struct final_stage_state {
     // the confirmed tokens spanning any gap instead of dying on the first
     // non-consecutive decode.
     std::map<int32_t, int32_t> * spec_confirmed = nullptr;
+    // Task 21.2: direct final->client token-return link (tc-link), same
+    // wire idiom as fa_fd (split_ab_send_verify_ids with n=1). Independent
+    // of the draft: it reports the token final actually confirmed, whether
+    // or not a draft was involved in producing it. Observability-only on
+    // the client side for now -- see node_agent.cpp's tc-link gap log.
+    int             tc_fd         = -1;
 };
 
 static int32_t logits_argmax(const float * logits, const int32_t n_vocab) {
@@ -431,6 +437,19 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
         if (st.dbg) {
             st.dbg->emit_token_selected(step, phase, token_id, msg.meta.pos_start, true);
         }
+        // st.next_pos now covers the whole decoded batch (rollback anchor);
+        // the corrected token itself lives right after the accepted prefix.
+        const int32_t corrected_pos = msg.meta.pos_start + accepted + 1;
+        // Task 21.2: fire the tc-link send first, ahead of the chain-return
+        // send below -- it's a single hop straight to the client vs. the
+        // chain's final->middle->entry path, so this ordering gives it the
+        // best chance to actually win the race being measured.
+        if (st.tc_fd >= 0) {
+            if (!split_ab_send_verify_ids(st.tc_fd, corrected_pos, &token_id, 1)) {
+                fprintf(stderr, "gen3_c: tc-link send failed, disabling for this session\n");
+                st.tc_fd = -1;
+            }
+        }
         split_gen3_c_resp resp{};
         resp.magic          = SPLIT_GEN_MAGIC;
         resp.token_id       = token_id;
@@ -442,9 +461,6 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
             fprintf(stderr, "gen3_c: send verify resp failed\n");
             return false;
         }
-        // st.next_pos now covers the whole decoded batch (rollback anchor);
-        // the corrected token itself lives right after the accepted prefix.
-        const int32_t corrected_pos = msg.meta.pos_start + accepted + 1;
         if (st.spec_confirmed != nullptr && st.draft_mu != nullptr) {
             std::lock_guard<std::mutex> lock(*st.draft_mu);
             for (int32_t i = 0; i <= accepted && i < (int32_t) item.verify_ids.size(); ++i) {
@@ -544,6 +560,14 @@ static bool final_process_hidden_item(final_stage_state & st, hidden_wave_work_i
     }
 
     st.next_pos = msg.meta.pos_start + n_tok;
+
+    // Task 21.2: see the verify-wave branch above for why this goes first.
+    if (st.tc_fd >= 0) {
+        if (!split_ab_send_verify_ids(st.tc_fd, st.next_pos, &token_id, 1)) {
+            fprintf(stderr, "gen3_c: tc-link send failed, disabling for this session\n");
+            st.tc_fd = -1;
+        }
+    }
 
     split_gen3_c_resp resp{};
     resp.magic          = SPLIT_GEN_MAGIC;
@@ -823,6 +847,8 @@ int main(int argc, char ** argv) {
     const char * fa_host = "127.0.0.1";
     int fa_port = -1;
     int draft_k = 4;
+    const char * tc_host = "127.0.0.1";
+    int tc_port = -1;
 
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--bc-port") == 0 && i + 1 < argc) {
@@ -849,6 +875,10 @@ int main(int argc, char ** argv) {
             fa_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--draft-k") == 0 && i + 1 < argc) {
             draft_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--tc-host") == 0 && i + 1 < argc) {
+            tc_host = argv[++i];
+        } else if (strcmp(argv[i], "--tc-port") == 0 && i + 1 < argc) {
+            tc_port = atoi(argv[++i]);
         } else {
             usage(argv[0]);
             return 1;
@@ -966,9 +996,22 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Task 21.2: connect the tc-link independent of the draft -- it reports
+    // whatever token final confirms, draft or no draft, so a session where
+    // the local draft load happened to fail should still get it.
+    int tc_fd = -1;
+    if (tc_port > 0) {
+        tc_fd = split_tcp_connect_retry(tc_host, tc_port, 300, 100);
+        if (tc_fd < 0) {
+            fprintf(stderr, "gen3_c: tc connect failed %s:%d (token-return link disabled)\n",
+                    tc_host, tc_port);
+        }
+    }
+
     fprintf(stderr,
-            "gen3_c: waiting bc_port=%d layer_start=%d layer_end=%d external_output=%d draft=%d\n",
-            bc_port, layer_start, effective_layer_end, external_output ? 1 : 0, draft_ctx != nullptr ? 1 : 0);
+            "gen3_c: waiting bc_port=%d layer_start=%d layer_end=%d external_output=%d draft=%d tc_link=%d\n",
+            bc_port, layer_start, effective_layer_end, external_output ? 1 : 0, draft_ctx != nullptr ? 1 : 0,
+            tc_fd >= 0 ? 1 : 0);
     split_gen_write_ready_state(ready_file, "PIPE_READY");
     split_gen_write_ready_state(ready_file, "READY");
 
@@ -990,6 +1033,7 @@ int main(int argc, char ** argv) {
             ctx, model, smpl, bc_fd, layer_start, effective_layer_end, n_layer, n_vocab,
             external_output, output_http_host, output_http_port, dbg, &debug_step, &final_queue_depth
         };
+        st.tc_fd = tc_fd;
         if (draft_ctx != nullptr) {
             st.draft_ctx     = draft_ctx;
             st.draft_n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(draft_model));

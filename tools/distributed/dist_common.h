@@ -129,6 +129,12 @@ struct dist_configure_req {
     std::string    fa_host;
     std::string    draft_model;
     int            draft_k     = 4;
+    // Task 21.2: direct final->client token-return link, same pattern as
+    // fa_port (entry listens, final connects to tc_host:tc_port). Currently
+    // observability-only -- the client logs the gap between tc-link arrival
+    // and the normal chain response, it doesn't yet act on tc-link data.
+    int            tc_port     = 0;
+    std::string    tc_host;
 };
 
 struct dist_gen_resp {

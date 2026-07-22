@@ -137,6 +137,76 @@ static uint32_t g_pipeline_protocol = DIST_RUNTIME_PROTOCOL_V1;
 // env var that can't know which node will hold entry ahead of time.
 static int g_pipeline_fa_port = 0;
 
+// Task 21.2: direct final->client token-return link (tc-link). Reports the
+// gap between tc-link arrival and the normal chain response so a future
+// session can decide whether pipelining the client loop on it (issuing the
+// next VERIFY before the chain response is fully drained) is worth the
+// protocol surgery -- see docs/TASK_21_PROVEN_PRACTICES_PLAN.md Item 2 for
+// why this stops at observability rather than wiring it into request
+// timing. Not used to make any timing/control decision by itself.
+struct tc_link_state {
+    std::mutex mu;
+    int32_t    pos      = -1;
+    int32_t    token_id = -1;
+    std::chrono::steady_clock::time_point arrival_tp;
+};
+static tc_link_state      g_tc_link;
+static std::mutex         g_tc_listener_mu;
+static int                g_tc_listener_port = 0; // 0 = not started yet
+
+// Accepts one final connection per iteration and loops forever -- node_agent
+// itself is long-lived across sessions (unlike the per-session worker
+// processes fa-link's receiver lives in), so the listener has to survive
+// session churn rather than relying on process exit to free the port.
+static void tc_link_listener_thread(int port) {
+    const int listen_fd = split_tcp_listen_host("0.0.0.0", port);
+    if (listen_fd < 0) {
+        fprintf(stderr, "node_agent: tc-link listen failed port=%d\n", port);
+        return;
+    }
+    for (;;) {
+        const int fd = split_tcp_accept(listen_fd);
+        if (fd < 0) {
+            continue;
+        }
+        while (true) {
+            split_ab_cmd cmd;
+            if (!split_ab_recv_cmd(fd, cmd) || cmd != SPLIT_AB_CMD_VERIFY_IDS) {
+                break;
+            }
+            int32_t pos = -1;
+            std::vector<int32_t> ids;
+            if (!split_ab_recv_verify_ids(fd, pos, ids) || ids.empty()) {
+                break;
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_tc_link.mu);
+                g_tc_link.pos        = pos;
+                g_tc_link.token_id   = ids[0];
+                g_tc_link.arrival_tp = std::chrono::steady_clock::now();
+            }
+        }
+        split_tcp_close(fd);
+        // loop back and accept the next session's connection
+    }
+}
+
+// Called from /configure's entry branch. Idempotent for a given port; if
+// the port value ever changes across sessions (topology change), the old
+// listener thread just sits idle forever on its old port -- acceptable
+// for an observability-only feature, not worth teardown complexity here.
+static void ensure_tc_link_listener(int port) {
+    if (port <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_tc_listener_mu);
+    if (g_tc_listener_port == port) {
+        return;
+    }
+    g_tc_listener_port = port;
+    std::thread(tc_link_listener_thread, port).detach();
+}
+
 struct node_runtime_stats {
     int configure_count        = 0;
     int materialization_count  = 0;
@@ -914,6 +984,8 @@ static dist_configure_req parse_configure(const json & body) {
     req.fa_host     = body.value("fa_host", "127.0.0.1");
     req.draft_model = body.value("draft_model", "");
     req.draft_k     = body.value("draft_k", 4);
+    req.tc_port     = body.value("tc_port", 0);
+    req.tc_host     = body.value("tc_host", "127.0.0.1");
     return req;
 }
 
@@ -1412,6 +1484,7 @@ static bool run_local_pipeline_generate(
                 rt_span.set_token_idx((int32_t) out_tokens.size() - 1);
                 rt_ok = pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_VERIFY, 1, pos, layer_end, &cur, resp);
             }
+            const auto t_chain_arrival = std::chrono::steady_clock::now();
             if (!rt_ok || resp.token_id < 0) {
                 err = "verify failed at token " + std::to_string(out_tokens.size());
                 split_tcp_close(ctrl_fd);
@@ -1422,6 +1495,21 @@ static bool run_local_pipeline_generate(
             spec_accepted_total += accepted;
             fprintf(stderr, "SPEC_DEBUG wave=%lld pos=%d accepted=%d\n",
                     (long long) spec_waves, pos, accepted);
+            // Task 21.2: tc-link gap measurement (observability only -- does
+            // not change what gets sent next or how out_tokens is built).
+            if (g_tc_listener_port > 0) {
+                const int32_t corrected_pos = pos + accepted + 1;
+                std::lock_guard<std::mutex> tc_lock(g_tc_link.mu);
+                if (g_tc_link.pos == corrected_pos && g_tc_link.token_id == resp.token_id) {
+                    const double gap_ms = std::chrono::duration<double, std::milli>(
+                            t_chain_arrival - g_tc_link.arrival_tp).count();
+                    fprintf(stderr, "SPEC_DEBUG tc-link: pos=%d gap_ms=%.2f (tc arrived %s chain)\n",
+                            corrected_pos, gap_ms, gap_ms >= 0.0 ? "before" : "after");
+                } else {
+                    fprintf(stderr, "SPEC_DEBUG tc-link: pos=%d not yet arrived at chain-response time\n",
+                            corrected_pos);
+                }
+            }
             for (int32_t i = 0; i < accepted && (int) out_tokens.size() < max_new; ++i) {
                 cur = resp.accepted_ids[i];
                 out_tokens.push_back(cur);
@@ -1841,6 +1929,12 @@ static bool start_worker(
             args.push_back(std::to_string(cfg.fa_port));
             args.push_back("--draft-k");
             args.push_back(std::to_string(cfg.draft_k));
+        }
+        if (cfg.tc_port > 0) {
+            args.push_back("--tc-host");
+            args.push_back(cfg.tc_host);
+            args.push_back("--tc-port");
+            args.push_back(std::to_string(cfg.tc_port));
         }
     } else {
         err = "invalid role";
@@ -2997,6 +3091,7 @@ int main(int argc, char ** argv) {
             g_pipeline_session_id  = cfg.session_id;
             g_pipeline_protocol    = DIST_RUNTIME_PROTOCOL_V1;
             g_pipeline_fa_port     = cfg.fa_port;
+            ensure_tc_link_listener(cfg.tc_port);
             if (worker_model == LAYER_STORE_MODEL_SENTINEL) {
                 g_entry_worker_gguf.clear();
                 g_entry_model_id = cfg.model_id;
