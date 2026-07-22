@@ -1,6 +1,7 @@
 #include "memory_estimator.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +14,35 @@ static constexpr uint64_t MIN_SCRATCH_BYTES    = 128ULL * 1024ULL * 1024ULL;
 
 static double bytes_to_gb(const uint64_t bytes) {
     return static_cast<double>(bytes) / static_cast<double>(BYTES_PER_GB);
+}
+
+// compute_bytes/scratch_bytes below are a crude weights-proportional
+// heuristic with no architecture awareness at all -- confirmed empirically
+// 2026-07-23: it silently OK'd a Qwen3-30B-A3B (qwen3moe) layout that then
+// OOM-crashed node-b during graph_reserve with no diagnostic (the crash
+// happens inside ggml's real allocation, which our pre-flight check never
+// sees). MoE's per-token top-k expert gather/scatter needs materially more
+// intermediate/routing buffer than a dense model's same weight count, and
+// the manifest's real per-layer weight_bytes (correctly larger for MoE
+// layers, since it reads actual GGUF tensor sizes) doesn't capture that --
+// only the *weights* are architecture-accurate here, not the runtime
+// scratch need. This multiplier is a safety-margin guess, not a measured
+// model: pending calibration from an actual successful MoE run's observed
+// memory use (see docs/FIRST_SHOWCASE_CRITERIA.md G1 / TASK_21 follow-up).
+// Erring toward overestimating -- a layout that's too conservative just
+// wastes a bit of capacity; one that's too optimistic crashes a node.
+static bool architecture_is_moe(const std::string & architecture) {
+    std::string lower = architecture;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+            [](unsigned char c) { return std::tolower(c); });
+    return lower.find("moe") != std::string::npos;
+}
+
+static void apply_compute_scratch_estimate(model_memory_requirements & result, bool is_moe) {
+    const uint64_t compute_divisor = is_moe ? 4  : 16;
+    const uint64_t scratch_divisor = is_moe ? 8  : 32;
+    result.compute_bytes = std::max(MIN_COMPUTE_BYTES, result.weights_bytes / compute_divisor);
+    result.scratch_bytes = std::max(MIN_SCRATCH_BYTES, result.weights_bytes / scratch_divisor);
 }
 
 double model_memory_requirements::weights_gb() const { return bytes_to_gb(weights_bytes); }
@@ -82,8 +112,10 @@ model_memory_requirements estimate_model_memory_from_catalog(
                                           static_cast<uint64_t>(n_ctx);
     result.kv_bytes = kv_per_layer_for_ctx * static_cast<uint64_t>(n_layer);
 
-    result.compute_bytes = std::max(MIN_COMPUTE_BYTES, result.weights_bytes / 16);
-    result.scratch_bytes = std::max(MIN_SCRATCH_BYTES, result.weights_bytes / 32);
+    // Catalog entries carry no architecture string -- can't detect MoE here,
+    // falls back to the dense heuristic. Registered models go through
+    // estimate_model_memory_from_manifest below instead, which can.
+    apply_compute_scratch_estimate(result, /*is_moe=*/false);
 
     const uint64_t per_layer_weight = result.weights_bytes / static_cast<uint64_t>(n_layer);
     result.layers.reserve(n_layer);
@@ -135,8 +167,7 @@ model_memory_requirements estimate_model_memory_from_manifest(
                                           static_cast<uint64_t>(n_ctx);
     result.kv_bytes = kv_per_layer_for_ctx * static_cast<uint64_t>(n_layer);
 
-    result.compute_bytes = std::max(MIN_COMPUTE_BYTES, result.weights_bytes / 16);
-    result.scratch_bytes = std::max(MIN_SCRATCH_BYTES, result.weights_bytes / 32);
+    apply_compute_scratch_estimate(result, architecture_is_moe(manifest.architecture));
 
     result.layers.reserve(n_layer);
     for (int32_t i = 0; i < n_layer; ++i) {
