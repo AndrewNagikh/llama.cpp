@@ -26,6 +26,8 @@ public:
 
     void set_root(std::filesystem::path root, std::string model_id);
 
+    const std::string & model_id() const { return model_id_; }
+
     std::filesystem::path model_root() const;
     std::filesystem::path layers_dir() const;
     std::filesystem::path layer_path(int32_t layer_index) const;

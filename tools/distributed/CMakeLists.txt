@@ -165,6 +165,7 @@ set(NODE_AGENT_SOURCES
     dist_http_fetch.cpp
     node_agent/layer_store/layer_store.cpp
     node_agent/layer_store/layer_checksum.cpp
+    node_agent/layer_store/layer_verify_cache.cpp
     node_agent/layer_store/descriptor_materialize.cpp
     node_agent/layer_store/layer_gguf_assembler.cpp
     node_agent/layer_store/worker_builder.cpp

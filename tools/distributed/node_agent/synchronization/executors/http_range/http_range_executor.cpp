@@ -2,6 +2,7 @@
 
 #include "dist_http_fetch.h"
 #include "node_agent/layer_store/layer_checksum.h"
+#include "node_agent/layer_store/layer_verify_cache.h"
 
 #include <vector>
 
@@ -80,15 +81,28 @@ executor_result http_range_download_executor::store_body(
     const bool verified = is_blob_tensor
             ? store.verify_blob_tensor(dl.blob_id, dl.tensor_name, dl.checksum)
             : store.verify_layer(dl.layer_index, dl.checksum);
+    const std::string cache_key = is_blob_tensor
+            ? ("tensor:" + dl.blob_id + ":" + dl.tensor_name)
+            : ("layer:" + std::to_string(dl.layer_index));
+
     if (!verified) {
         if (is_blob_tensor) {
             store.remove_blob_tensor(dl.blob_id, dl.tensor_name);
         } else {
             store.remove_layer(dl.layer_index);
         }
+        // A stale "ready" cache entry from an earlier successful install
+        // must not keep serving READY for this now-removed blob until its
+        // TTL expires.
+        layer_verify_cache_put(store.model_id(), cache_key, false);
         result.error = "post-store verification failed";
         return result;
     }
+
+    // Seed the coverage-poll cache with the verification result we already
+    // just computed above, instead of leaving the next /installed-layers
+    // call to redo the same full-content check (see layer_verify_cache.h).
+    layer_verify_cache_put(store.model_id(), cache_key, true);
 
     result.success = true;
     return result;

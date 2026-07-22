@@ -6,6 +6,7 @@
 #include "node_agent/layer_store/layer_store.h"
 #include "node_agent/layer_store/worker_builder.h"
 #include "node_agent/layer_store/layer_gguf_assembler.h"
+#include "node_agent/layer_store/layer_verify_cache.h"
 #include "architecture/semantic_runtime_descriptor.h"
 #include "architecture/worker_requirement.h"
 #include "runtime/runtime_config.h"
@@ -3246,6 +3247,12 @@ int main(int argc, char ** argv) {
     });
 
     // GET /installed-layers - Report per-layer state from Layer Store (Task 9.7).
+    // Full checksum verification is cached (layer_verify_cache) rather than
+    // redone on every call -- this endpoint is polled on every orchestrator
+    // /session/create, and re-reading+re-hashing a large model's full weight
+    // data that often was slow enough to fail session-create outright under
+    // soak (docs/bench/2026-07-23_g3_soak/G3_SOAK_REPORT.md).
+    static constexpr int64_t LAYER_VERIFY_CACHE_TTL_SEC = 300;
     svr.Get("/installed-layers", [](const httplib::Request & req, httplib::Response & res) {
         const std::string model_id = req.get_param_value("model");
         json layers_json = json::array();
@@ -3256,10 +3263,13 @@ int main(int argc, char ** argv) {
             const layer_store store = get_layer_store(model_id);
 
             for (const layer_blob & blob : store.list_layers()) {
-                std::string state = "READY";
-                if (!store.verify_layer(blob.layer_index, blob.checksum)) {
-                    state = "CORRUPTED";
+                const std::string cache_key = "layer:" + std::to_string(blob.layer_index);
+                bool ready;
+                if (!layer_verify_cache_get(model_id, cache_key, LAYER_VERIFY_CACHE_TTL_SEC, ready)) {
+                    ready = store.verify_layer(blob.layer_index, blob.checksum);
+                    layer_verify_cache_put(model_id, cache_key, ready);
                 }
+                const std::string state = ready ? "READY" : "CORRUPTED";
 
                 layers_json.push_back({
                     { "layer", blob.layer_index },
@@ -3273,13 +3283,16 @@ int main(int argc, char ** argv) {
             }
 
             for (const layer_store::blob_tensor_info & blob : store.list_blob_tensors()) {
-                std::string state = "READY";
                 const std::string checksum = blob.checksum.empty()
                         ? ("manifest:tensor:" + blob.tensor_name)
                         : blob.checksum;
-                if (!store.verify_blob_tensor(blob.blob_id, blob.tensor_name, checksum)) {
-                    state = "CORRUPTED";
+                const std::string cache_key = "tensor:" + blob.blob_id + ":" + blob.tensor_name;
+                bool ready;
+                if (!layer_verify_cache_get(model_id, cache_key, LAYER_VERIFY_CACHE_TTL_SEC, ready)) {
+                    ready = store.verify_blob_tensor(blob.blob_id, blob.tensor_name, checksum);
+                    layer_verify_cache_put(model_id, cache_key, ready);
                 }
+                const std::string state = ready ? "READY" : "CORRUPTED";
 
                 layers_json.push_back({
                     { "layer", -1 },
