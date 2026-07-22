@@ -71,6 +71,13 @@ cluster_memory_fits_result dist_check_cluster_memory_fit(
         const model_memory_requirements & mem,
         const std::vector<dist_node_info> & nodes);
 
+// True if the architecture string (e.g. manifest.architecture, "qwen3moe")
+// names a Mixture-of-Experts variant. Used to widen the compute/scratch
+// safety margin -- MoE's per-token top-k expert gather/scatter needs
+// materially more runtime buffer than a dense model at the same weight
+// count, which the weights-proportional heuristic alone doesn't capture.
+bool model_architecture_is_moe(const std::string & architecture);
+
 // Estimate memory from a local GGUF file. Reads real model metadata.
 model_memory_requirements estimate_model_memory(
         const std::string & gguf_path,

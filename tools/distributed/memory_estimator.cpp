@@ -31,7 +31,14 @@ static double bytes_to_gb(const uint64_t bytes) {
 // memory use (see docs/FIRST_SHOWCASE_CRITERIA.md G1 / TASK_21 follow-up).
 // Erring toward overestimating -- a layout that's too conservative just
 // wastes a bit of capacity; one that's too optimistic crashes a node.
-static bool architecture_is_moe(const std::string & architecture) {
+// Not static: orchestrator/layout_planner/layout_planner.cpp has its own,
+// separate (duplicated) memory_requirements_from_manifest() with the same
+// crude heuristic and needs the same MoE detection -- exposed via
+// memory_estimator.h rather than tripling this string-matching logic.
+// Unifying the two implementations outright is a real follow-up (they've
+// independently drifted before, e.g. duplicated MIN_COMPUTE_BYTES/
+// MIN_SCRATCH_BYTES constants), just not tonight's fix.
+bool model_architecture_is_moe(const std::string & architecture) {
     std::string lower = architecture;
     std::transform(lower.begin(), lower.end(), lower.begin(),
             [](unsigned char c) { return std::tolower(c); });
@@ -167,7 +174,7 @@ model_memory_requirements estimate_model_memory_from_manifest(
                                           static_cast<uint64_t>(n_ctx);
     result.kv_bytes = kv_per_layer_for_ctx * static_cast<uint64_t>(n_layer);
 
-    apply_compute_scratch_estimate(result, architecture_is_moe(manifest.architecture));
+    apply_compute_scratch_estimate(result, model_architecture_is_moe(manifest.architecture));
 
     result.layers.reserve(n_layer);
     for (int32_t i = 0; i < n_layer; ++i) {

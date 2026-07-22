@@ -141,8 +141,13 @@ model_memory_requirements memory_requirements_from_manifest(
     const uint64_t kv_per_layer_for_ctx = 2 * kv_dim_per_token * KV_ELEMENT_BYTES *
                                           static_cast<uint64_t>(mem.n_ctx);
     mem.kv_bytes = kv_per_layer_for_ctx * static_cast<uint64_t>(std::max(1, mem.n_layer));
-    mem.compute_bytes = std::max(MIN_COMPUTE_BYTES, mem.weights_bytes / 16);
-    mem.scratch_bytes = std::max(MIN_SCRATCH_BYTES, mem.weights_bytes / 32);
+    // MoE-aware safety margin (2026-07-23 fix, see memory_estimator.cpp for
+    // the full incident writeup): this is the ACTUAL function build_desired_
+    // layout() calls, so this is where the fix has to land, not just the
+    // duplicate estimate_model_memory_from_manifest() in memory_estimator.cpp.
+    const bool is_moe = model_architecture_is_moe(manifest.architecture);
+    mem.compute_bytes = std::max(MIN_COMPUTE_BYTES, mem.weights_bytes / (is_moe ? 4 : 16));
+    mem.scratch_bytes = std::max(MIN_SCRATCH_BYTES, mem.weights_bytes / (is_moe ? 8 : 32));
     return mem;
 }
 
