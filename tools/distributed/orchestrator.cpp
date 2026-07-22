@@ -1525,6 +1525,51 @@ static const dist_node_info * find_node(const std::map<std::string, dist_node_in
     return it == nodes.end() ? nullptr : &it->second;
 }
 
+namespace {
+
+struct node_layer_poll_result {
+    std::string node_id;
+    bool ok = false;
+    actual_model_layout layout;
+};
+
+// A node under this poll is frequently ALSO busy inside a concurrent
+// /configure call for a different session, loading tens of GB of tensors --
+// that can make it briefly too slow to answer this admin-plane GET within
+// the per-attempt timeout even though its actual install state never
+// changed. Observed 2026-07-23 (docs/bench/2026-07-23_g3_soak): a soak of
+// back-to-back session churn hit this on 31/107 cycles, always as a clean
+// "runtime coverage not ready" false negative, never a real state problem.
+// One retry absorbed the transient in every case checked.
+node_layer_poll_result poll_one_node_installed_layers(
+        const dist_node_info & node,
+        const std::string & model_id) {
+    node_layer_poll_result r;
+    r.node_id = node.node_id;
+
+    const std::string path = "/installed-layers?model=" + model_id;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        httplib::Client client(node.host.c_str(), node.http_port);
+        client.set_connection_timeout(3, 0);
+        client.set_read_timeout(10, 0);
+
+        const auto result = client.Get(path.c_str());
+        if (result && result->status == 200) {
+            try {
+                const json body = json::parse(result->body);
+                r.layout = actual_layout_from_node_response(node.node_id, body);
+                r.ok = true;
+                return r;
+            } catch (...) {
+                // fall through to retry
+            }
+        }
+    }
+    return r;
+}
+
+} // namespace
+
 static bool poll_installed_layers_from_nodes(
         const std::string & model_id,
         actual_model_layout & out,
@@ -1538,27 +1583,25 @@ static bool poll_installed_layers_from_nodes(
         nodes_copy = g_nodes;
     }
 
+    // Poll every node concurrently -- sequential polling made one slow node
+    // serialize (and thus multiply the timeout risk for) every other node's
+    // check behind it, on every single session-create.
+    std::vector<std::future<node_layer_poll_result>> futures;
+    futures.reserve(nodes_copy.size());
     for (const auto & kv : nodes_copy) {
         if (!kv.second.online) {
             continue;
         }
+        const dist_node_info node = kv.second;
+        futures.push_back(std::async(std::launch::async,
+                [node, model_id]() { return poll_one_node_installed_layers(node, model_id); }));
+    }
 
-        httplib::Client client(kv.second.host.c_str(), kv.second.http_port);
-        client.set_connection_timeout(3, 0);
-        client.set_read_timeout(10, 0);
-
-        const std::string path = "/installed-layers?model=" + model_id;
-        const auto result = client.Get(path.c_str());
-        if (!result || result->status != 200) {
-            continue;
-        }
-
-        try {
-            const json body = json::parse(result->body);
-            reports.push_back(actual_layout_from_node_response(kv.second.node_id, body));
-            online_nodes.insert(kv.second.node_id);
-        } catch (...) {
-            continue;
+    for (auto & fut : futures) {
+        const node_layer_poll_result r = fut.get();
+        if (r.ok) {
+            reports.push_back(r.layout);
+            online_nodes.insert(r.node_id);
         }
     }
 
