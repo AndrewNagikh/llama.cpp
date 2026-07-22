@@ -83,7 +83,9 @@ llama_model_smallthinker::graph<iswa>::graph(const llama_model & model, const ll
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    const auto [layer_start, layer_end] = build_layer_range(n_layer);
+
+    inpL = build_inp_embd_or_hidden(model.tok_embd);
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -98,7 +100,7 @@ llama_model_smallthinker::graph<iswa>::graph(const llama_model & model, const ll
     }
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_start; il < layer_end; ++il) {
         const float freq_base_l  = model.get_rope_freq_base (cparams, il);
         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
 
@@ -135,7 +137,7 @@ llama_model_smallthinker::graph<iswa>::graph(const llama_model & model, const ll
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == layer_end - 1 && inp_out_ids) {
             cur = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             probs = ggml_get_rows(ctx0, probs, inp_out_ids);
@@ -173,14 +175,22 @@ llama_model_smallthinker::graph<iswa>::graph(const llama_model & model, const ll
     }
     cur = inpL;
 
-    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+    const bool partial = build_layer_range_is_partial(layer_end, n_layer);
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+    if (!partial) {
+        cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        // lm_head
+        cur = build_lora_mm(model.output, cur, model.output_s);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    } else {
+        cb(cur, "partial_out", -1);
+        res->t_embd   = cur;
+        res->t_logits = nullptr;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }

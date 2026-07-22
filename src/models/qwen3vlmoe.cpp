@@ -73,7 +73,9 @@ llama_model_qwen3vlmoe::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    const auto [layer_start, layer_end] = build_layer_range(n_layer);
+
+    inpL = build_inp_embd_or_hidden(model.tok_embd);
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -85,7 +87,7 @@ llama_model_qwen3vlmoe::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_start; il < layer_end; ++il) {
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -127,7 +129,7 @@ llama_model_qwen3vlmoe::graph::graph(const llama_model & model, const llm_graph_
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == layer_end - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -161,7 +163,7 @@ llama_model_qwen3vlmoe::graph::graph(const llama_model & model, const llm_graph_
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
-        if (il < (int) n_deepstack_layers) {
+        if (il < (int) n_deepstack_layers && res->t_inp_embd) {
             ggml_tensor * ds = ggml_view_2d(ctx0, res->t_inp_embd, n_embd, n_tokens, res->t_inp_embd->nb[1], (il + 1) * n_embd * sizeof(float));
             cur = ggml_add(ctx0, cur, ds);
             cb(cur, "deepstack_out", il);
@@ -173,18 +175,26 @@ llama_model_qwen3vlmoe::graph::graph(const llama_model & model, const llm_graph_
 
     cur = inpL;
 
-    cur = build_norm(cur,
-            model.output_norm, NULL,
-            LLM_NORM_RMS, -1);
+    const bool partial = build_layer_range_is_partial(layer_end, n_layer);
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+    if (!partial) {
+        cur = build_norm(cur,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, -1);
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        // lm_head
+        cur = build_lora_mm(model.output, cur, model.output_s);
+
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    } else {
+        cb(cur, "partial_out", -1);
+        res->t_embd   = cur;
+        res->t_logits = nullptr;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }

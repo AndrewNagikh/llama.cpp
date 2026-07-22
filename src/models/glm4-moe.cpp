@@ -141,7 +141,9 @@ llama_model_glm4_moe::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    const auto [layer_start, layer_end] = build_layer_range(n_layer);
+
+    inpL = build_inp_embd_or_hidden(model.tok_embd);
 
     bool use_mrope = hparams.use_mrope();
     if (ubatch.embd && !use_mrope) {
@@ -158,7 +160,7 @@ llama_model_glm4_moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     // Only process up to last layer (skip final NextN layer)
     // Final layer tensors are loaded but not processed in forward pass
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_start; il < layer_end; ++il) {
         ggml_tensor * inpSA = inpL;
 
         // Pre-attention norm
@@ -207,7 +209,7 @@ llama_model_glm4_moe::graph::graph(const llama_model & model, const llm_graph_pa
                     model.layers[il].wo, NULL, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == layer_end - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -265,16 +267,25 @@ llama_model_glm4_moe::graph::graph(const llama_model & model, const llm_graph_pa
         inpL = cur;
     }
     cur = inpL;
-    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+    const bool partial = build_layer_range_is_partial(layer_end, n_layer);
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (!partial) {
+        cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        // lm_head
+        cur = build_lora_mm(model.output, cur, model.output_s);
+
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    } else {
+        cb(cur, "partial_out", -1);
+        res->t_embd   = cur;
+        res->t_logits = nullptr;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }

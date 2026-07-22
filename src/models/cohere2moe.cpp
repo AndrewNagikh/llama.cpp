@@ -162,14 +162,17 @@ llama_model_cohere2moe::graph::graph(const llama_model & model, const llm_graph_
     const llm_norm_type cohere2moe_norm_type = hparams.f_norm_rms_eps == 0.0f ? LLM_NORM : LLM_NORM_RMS;
     const float f_logit_scale = hparams.f_logit_scale;
     ggml_tensor * cur;
-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+
+    const auto [layer_start, layer_end] = build_layer_range(n_layer);
+
+    ggml_tensor * inpL = build_inp_embd_or_hidden(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv_iswa();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_start; il < layer_end; ++il) {
         const bool is_swa = hparams.is_swa(il);
         // Dense-prefix full-attention layers use RoPE; later layers follow the SWA pattern.
         const bool force_rope = static_cast<uint32_t>(il) < hparams.n_layer_dense_lead;
@@ -209,7 +212,7 @@ llama_model_cohere2moe::graph::graph(const llama_model & model, const llm_graph_
                     1.0f / sqrtf(float(n_embd_head)), il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == layer_end - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur     = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpL    = ggml_get_rows(ctx0, inpL, inp_out_ids);
             ffn_inp = ggml_get_rows(ctx0, ffn_inp, inp_out_ids);
@@ -268,26 +271,35 @@ llama_model_cohere2moe::graph::graph(const llama_model & model, const llm_graph_
     }
 
     cur = inpL;
-    cur = build_norm(cur, model.output_norm, nullptr, cohere2moe_norm_type, -1);
 
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
+    const bool partial = build_layer_range_is_partial(layer_end, n_layer);
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (!partial) {
+        cur = build_norm(cur, model.output_norm, nullptr, cohere2moe_norm_type, -1);
+
+        cb(cur, "h_nextn", -1);
+        res->t_h_nextn = cur;
+
+        if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        cur = build_lora_mm(model.output, cur);
+
+        if (f_logit_scale) {
+            cur = ggml_scale(ctx0, cur, f_logit_scale);
+        }
+
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    } else {
+        cb(cur, "partial_out", -1);
+        res->t_embd   = cur;
+        res->t_logits = nullptr;
     }
-
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
-
-    cur = build_lora_mm(model.output, cur);
-
-    if (f_logit_scale) {
-        cur = ggml_scale(ctx0, cur, f_logit_scale);
-    }
-
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
 }
