@@ -2090,6 +2090,25 @@ ggml_tensor * llm_graph_context::build_inp_hidden() const {
     return cur;
 }
 
+std::pair<int32_t, int32_t> llm_graph_context::build_layer_range(int32_t n_layer) const {
+    const int32_t layer_start = cparams.layer_start;
+    const int32_t layer_end   = cparams.layer_end < 0 ? n_layer : cparams.layer_end;
+
+    GGML_ASSERT(layer_start >= 0);
+    GGML_ASSERT(layer_start <= layer_end);
+    GGML_ASSERT(layer_end <= n_layer);
+
+    return { layer_start, layer_end };
+}
+
+bool llm_graph_context::build_layer_range_is_partial(int32_t layer_end, int32_t n_layer) const {
+    return layer_end < n_layer || (cparams.skip_output_head && cparams.layer_start > 0);
+}
+
+ggml_tensor * llm_graph_context::build_inp_embd_or_hidden(ggml_tensor * tok_embd) const {
+    return cparams.layer_start > 0 ? build_inp_hidden() : build_inp_embd(tok_embd);
+}
+
 ggml_tensor * llm_graph_context::build_inp_pos() const {
     llm_graph_trace_scope trace(*this, "common", "build_position");
     auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());

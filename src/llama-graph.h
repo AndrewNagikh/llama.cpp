@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <utility>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -978,6 +979,28 @@ struct llm_graph_context {
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_embd_token_only(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_hidden() const;
+
+    //
+    // distributed-runtime: partial-layer-range helpers
+    //
+    // Every architecture's graph() historically looped over the full
+    // [0, n_layer) range and always started from token embeddings. Pipeline-
+    // sharded workers only own [cparams.layer_start, cparams.layer_end), so
+    // any graph() that skips these helpers will build attention/FFN ops
+    // against layer weights this worker never loaded (null tensors -- see
+    // the qwen3moe SIGSEGV writeup in models/qwen3moe.cpp).
+
+    // Resolves and range-checks this graph's owned layer span.
+    std::pair<int32_t, int32_t> build_layer_range(int32_t n_layer) const;
+
+    // True when this graph does not own the final layer of the model, i.e.
+    // output norm/LM head belong to a downstream stage and must be skipped.
+    bool build_layer_range_is_partial(int32_t layer_end, int32_t n_layer) const;
+
+    // First-layer input: raw token embeddings when this stage owns layer 0,
+    // otherwise the hidden state handed off from the previous stage.
+    ggml_tensor * build_inp_embd_or_hidden(ggml_tensor * tok_embd) const;
+
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
