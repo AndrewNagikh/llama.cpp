@@ -1158,7 +1158,12 @@ static void fill_peer_rtt_from_network_stats(
         }
         try {
             const json body = json::parse(res->body);
-            for (const auto & [peer_id, stats] : body.value("peers", json::object()).items()) {
+            // Bind to a named local before iterating -- .items() on the
+            // unnamed temporary from .value(...) is a real use-after-free
+            // trap in a range-for (the temporary's lifetime isn't
+            // guaranteed to cover the loop body pre-C++23).
+            const json peers = body.value("peers", json::object());
+            for (const auto & [peer_id, stats] : peers.items()) {
                 if (stats.contains("rtt_p95_ms") && !stats["rtt_p95_ms"].is_null()) {
                     n.peer_rtt_p95_ms[peer_id] = stats["rtt_p95_ms"].get<double>();
                 }
