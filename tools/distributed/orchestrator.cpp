@@ -1134,6 +1134,41 @@ static bool shutdown_node(const dist_node_info & node) {
     return res && res->status == 200;
 }
 
+// Task 21.1: pull each node's /network/stats (Task 19 level 2 -- RTT/jitter/
+// loss to its peers, already running as a background heartbeat on every
+// node_agent) and fill layout_node_input::peer_rtt_p95_ms so the layout
+// planner can pick entry by measured latency instead of score alone. A node
+// that fails to answer or hasn't warmed up its tracker yet just contributes
+// no data for itself; build_desired_layout treats incomplete data as "no
+// RTT info" and falls back to the original score-order placement.
+static void fill_peer_rtt_from_network_stats(
+        std::vector<layout_node_input> & nodes,
+        const std::map<std::string, dist_node_info> & node_map) {
+    for (auto & n : nodes) {
+        const auto it = node_map.find(n.node_id);
+        if (it == node_map.end()) {
+            continue;
+        }
+        httplib::Client cli(it->second.host.c_str(), it->second.http_port);
+        cli.set_connection_timeout(2, 0);
+        cli.set_read_timeout(2, 0);
+        const auto res = cli.Get("/network/stats");
+        if (!res || res->status != 200) {
+            continue;
+        }
+        try {
+            const json body = json::parse(res->body);
+            for (const auto & [peer_id, stats] : body.value("peers", json::object()).items()) {
+                if (stats.contains("rtt_p95_ms") && !stats["rtt_p95_ms"].is_null()) {
+                    n.peer_rtt_p95_ms[peer_id] = stats["rtt_p95_ms"].get<double>();
+                }
+            }
+        } catch (...) {
+            // malformed response -- leave this node's RTT map empty, planner falls back
+        }
+    }
+}
+
 static bool check_node_health(const dist_node_info & node, std::string & err) {
     httplib::Client cli(node.host.c_str(), node.http_port);
     cli.set_connection_timeout(3, 0);
@@ -4159,14 +4194,17 @@ int main(int argc, char ** argv) {
         }
 
         std::vector<layout_node_input> nodes;
+        std::map<std::string, dist_node_info> online_node_map;
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto & kv : g_nodes) {
                 if (kv.second.online) {
                     nodes.push_back(layout_node_from_dist(kv.second));
+                    online_node_map[kv.first] = kv.second;
                 }
             }
         }
+        fill_peer_rtt_from_network_stats(nodes, online_node_map);
 
         desired_model_layout previous;
         if (record->layout.has_value()) {

@@ -491,18 +491,56 @@ layout_build_result build_desired_layout(
     // Pipeline role order. The node holding the first layers becomes the
     // entry stage and the node holding the last layers becomes final. Final
     // is the heaviest per-token stage (output norm + lm_head + sampler on
-    // top of its layers; see Research 17), entry is second (embedding), so
-    // give final to the strongest node and entry to the second-strongest
-    // instead of the previous strongest-first order, which systematically
-    // parked the heaviest stage on the weakest node.
+    // top of its layers; see Research 17), so it keeps going to the
+    // strongest node (active[0]) unconditionally.
+    //
+    // Entry is chosen from the rest by measured network RTT to final
+    // (Task 21.1), not just score: entry carries the client-facing control
+    // connection AND the fa-link draft delivery from final (Task 19), so it
+    // is the most latency-sensitive non-final role -- parking it on the
+    // worst-RTT node (as pure score-order did whenever the weaker of two
+    // similarly-scored nodes happened to be on Wi-Fi) directly hurts
+    // speculative decoding's wait-window economics. Falls back to the
+    // original "second-strongest becomes entry" when RTT data is missing
+    // or incomplete for any candidate, so an unmeasured/cold cluster
+    // behaves exactly as before.
     std::vector<size_t> stage_order;
     stage_order.reserve(active.size());
     if (active.size() >= 2) {
-        stage_order.push_back(1);
-        for (size_t i = 2; i < active.size(); ++i) {
-            stage_order.push_back(i);
+        const std::string & final_node_id = active[0]->input.node_id;
+        size_t entry_idx = 1; // fallback: second-strongest, original behavior
+        bool have_rtt = true;
+        double best_rtt = -1.0;
+        for (size_t i = 1; i < active.size(); ++i) {
+            const auto it = active[i]->input.peer_rtt_p95_ms.find(final_node_id);
+            if (it == active[i]->input.peer_rtt_p95_ms.end()) {
+                have_rtt = false;
+                break;
+            }
+        }
+        if (have_rtt) {
+            for (size_t i = 1; i < active.size(); ++i) {
+                const double rtt = active[i]->input.peer_rtt_p95_ms.at(final_node_id);
+                if (best_rtt < 0.0 || rtt < best_rtt) {
+                    best_rtt = rtt;
+                    entry_idx = i;
+                }
+            }
+        }
+        stage_order.push_back(entry_idx);
+        for (size_t i = 1; i < active.size(); ++i) {
+            if (i != entry_idx) {
+                stage_order.push_back(i);
+            }
         }
         stage_order.push_back(0);
+        if (have_rtt) {
+            fprintf(stderr, "layout_planner: entry=%s final=%s (rtt-aware, best_rtt_p95_ms=%.1f)\n",
+                    active[entry_idx]->input.node_id.c_str(), final_node_id.c_str(), best_rtt);
+        } else {
+            fprintf(stderr, "layout_planner: entry=%s final=%s (no rtt data, fallback to score order)\n",
+                    active[entry_idx]->input.node_id.c_str(), final_node_id.c_str());
+        }
     } else {
         stage_order.push_back(0);
     }
