@@ -718,6 +718,33 @@ static const llama_vocab * tokenizer_service_vocab() {
     return g_tokenizer_service_model ? llama_model_get_vocab(g_tokenizer_service_model) : nullptr;
 }
 
+// Wraps a raw user prompt in the model's own chat template (single user
+// turn, assistant turn left open) instead of sending it as a bare string
+// -- instruct-tuned models otherwise treat the prompt as free-form text
+// continuation, not a question to answer. Returns false (leaving `prompt`
+// untouched) if the GGUF carries no chat template.
+static bool apply_chat_template_to_prompt(const llama_model * model, const std::string & prompt, std::string & out) {
+    const char * tmpl = llama_model_chat_template(model, nullptr);
+    if (tmpl == nullptr || tmpl[0] == '\0') {
+        return false;
+    }
+    llama_chat_message msg{ "user", prompt.c_str() };
+    std::vector<char> buf(prompt.size() * 2 + 256);
+    int32_t n = llama_chat_apply_template(tmpl, &msg, 1, true, buf.data(), (int32_t) buf.size());
+    if (n < 0) {
+        return false;
+    }
+    if ((size_t) n > buf.size()) {
+        buf.resize((size_t) n);
+        n = llama_chat_apply_template(tmpl, &msg, 1, true, buf.data(), (int32_t) buf.size());
+        if (n < 0) {
+            return false;
+        }
+    }
+    out.assign(buf.data(), (size_t) n);
+    return true;
+}
+
 static const llama_vocab * entry_node_vocab() {
     if (!g_entry_tokenizer) {
         if (!g_entry_worker_gguf.empty() &&
@@ -2546,12 +2573,18 @@ int main(int argc, char ** argv) {
             res.set_content(R"({"error":"invalid json"})", "application/json");
             return;
         }
-        const std::string prompt = body.value("prompt", "");
+        std::string prompt = body.value("prompt", "");
         const llama_vocab * vocab = tokenizer_service_vocab();
         if (!vocab) {
             res.status = 503;
             res.set_content(R"({"ok":false,"error":"tokenizer service not configured"})", "application/json");
             return;
+        }
+        if (body.value("chat", false) && g_tokenizer_service_model != nullptr) {
+            std::string formatted;
+            if (apply_chat_template_to_prompt(g_tokenizer_service_model, prompt, formatted)) {
+                prompt = formatted;
+            }
         }
         const std::vector<llama_token> toks = split_gen_tokenize(vocab, prompt);
         json tokens = json::array();

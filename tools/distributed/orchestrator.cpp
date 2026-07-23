@@ -2607,7 +2607,8 @@ static bool run_generation(
         json & out_tokens,
         std::string & text_out,
         std::string & err,
-        json * timing_out = nullptr) {
+        json * timing_out = nullptr,
+        bool apply_chat_template = false) {
     if (session.pipeline.empty()) {
         err = "empty pipeline";
         return false;
@@ -2646,7 +2647,7 @@ static bool run_generation(
         httplib::Client tcli(tok_assign->host.c_str(), tok_assign->http_port);
         tcli.set_connection_timeout(10, 0);
         tcli.set_read_timeout(60, 0);
-        const json tok_req = { { "prompt", prompt } };
+        const json tok_req = { { "prompt", prompt }, { "chat", apply_chat_template } };
         const auto tok_res = tcli.Post("/runtime/tokenizer/tokenize", tok_req.dump(), "application/json");
         if (!tok_res || tok_res->status != 200) {
             err = "tokenizer service failed on " + tok_assign->node_id;
@@ -3649,6 +3650,7 @@ int main(int argc, char ** argv) {
         const std::string session_id = body.value("session_id", "");
         const std::string prompt     = body.value("prompt", DEFAULT_GENERATE_PROMPT);
         const int max_tokens         = body.value("max_tokens", DIST_MAX_NEW_TOKENS);
+        const bool chat_mode         = body.value("chat", false);
 
         // Request-driven trace enablement: the benchmark harness runs on a
         // different host, so gating fanout on this process's env alone means
@@ -3684,7 +3686,7 @@ int main(int argc, char ** argv) {
         std::string text;
         std::string err;
         json pipeline_timing = json::object();
-        bool ok = run_generation(session, prompt, max_tokens, out_tokens, text, err, &pipeline_timing);
+        bool ok = run_generation(session, prompt, max_tokens, out_tokens, text, err, &pipeline_timing, chat_mode);
         if (!ok) {
             const std::string first_err = err;
             std::string recovery_err;
@@ -3694,7 +3696,7 @@ int main(int argc, char ** argv) {
                 std::string retry_err;
                 json retry_tokens = json::array();
                 std::string retry_text;
-                if (run_generation(recovered, prompt, max_tokens, retry_tokens, retry_text, retry_err, &retry_timing)) {
+                if (run_generation(recovered, prompt, max_tokens, retry_tokens, retry_text, retry_err, &retry_timing, chat_mode)) {
                     ok = true;
                     out_tokens = std::move(retry_tokens);
                     text = std::move(retry_text);
