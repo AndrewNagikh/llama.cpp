@@ -3189,6 +3189,47 @@ int main(int argc, char ** argv) {
         }).dump(), "application/json");
     });
 
+    // POST /worker/stop {"role": "entry"|"middle"|"final"} -- stop just this
+    // role's pipeline-stage worker process now, without touching the
+    // tokenizer/embedding/output services (those may be shared/reused
+    // across sessions; /shutdown below tears down everything and is too
+    // broad for a routine per-session cleanup). Called by the orchestrator
+    // on /session/destroy so a destroyed session's worker doesn't sit
+    // around consuming memory/CPU until some later session happens to
+    // reconfigure the same role -- previously the only way a stale worker
+    // got killed was lazily, inside start_worker()'s own
+    // stop_worker_for_role() call for the NEXT session on that role, which
+    // let a destroyed session's worker linger indefinitely (contaminating
+    // later, unrelated measurements/sessions with resource contention --
+    // see docs/bench/2026-07-23_g1_ceiling/G1_CEILING_REPORT.md for the
+    // concrete case that surfaced this).
+    svr.Post("/worker/stop", [](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        const std::string role_str = body.value("role", "");
+        dist_node_role role = DIST_ROLE_UNCONFIGURED;
+        if (role_str == "entry") {
+            role = DIST_ROLE_ENTRY;
+        } else if (role_str == "middle") {
+            role = DIST_ROLE_MIDDLE;
+        } else if (role_str == "final") {
+            role = DIST_ROLE_FINAL;
+        } else {
+            res.status = 400;
+            res.set_content(json({ { "error", "role must be entry, middle, or final" } }).dump(),
+                    "application/json");
+            return;
+        }
+        stop_worker_for_role(role);
+        res.set_content(R"({"ok":true})", "application/json");
+    });
+
     svr.Post("/shutdown", [](const httplib::Request &, httplib::Response & res) {
         stop_all_workers();
         free_entry_tokenizer();

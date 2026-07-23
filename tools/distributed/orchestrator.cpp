@@ -938,6 +938,34 @@ static void bootstrap_all_models_from_cluster() {
     persist_registry();
 }
 
+// Previously a destroyed session's pipeline-stage workers were only ever
+// killed lazily -- inside the NEXT session's start_worker() ->
+// stop_worker_for_role() call for the same node+role -- meaning a destroyed
+// session's worker sat around holding memory/CPU indefinitely until some
+// later, unrelated session happened to reconfigure that exact role. This
+// contaminated later measurements with real resource contention (see
+// docs/bench/2026-07-23_g1_ceiling/G1_CEILING_REPORT.md for the concrete
+// case: repeated ceiling measurements on the same model swung from 96% to
+// 43% purely from a stale prior session's worker still resident on node-a).
+// Best-effort and fire-and-forget: destroy already succeeded from the
+// caller's point of view (session removed from g_sessions) by the time this
+// runs; a node being briefly unreachable here just means its worker gets
+// cleaned up on the next /configure instead, same as before this fix.
+static void stop_session_workers_async(const dist_session & session) {
+    std::thread([pipeline = session.pipeline]() {
+        for (const auto & stage : pipeline) {
+            const std::string role_str = dist_role_name(stage.role);
+            if (role_str == "unconfigured") {
+                continue;
+            }
+            httplib::Client cli(stage.host.c_str(), stage.http_port);
+            cli.set_connection_timeout(3, 0);
+            cli.set_read_timeout(5, 0);
+            cli.Post("/worker/stop", json({ { "role", role_str } }).dump(), "application/json");
+        }
+    }).detach();
+}
+
 static void trigger_cluster_optimization_async() {
     std::thread([]() {
         const auto models = g_registry.list();
@@ -3766,6 +3794,7 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lock(g_mu);
             const auto it = g_sessions.find(session_id);
             if (it != g_sessions.end()) {
+                stop_session_workers_async(it->second);
                 g_sessions.erase(it);
                 removed = true;
             }
@@ -3798,6 +3827,7 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lock(g_mu);
             const auto it = g_sessions.find(session_id);
             if (it != g_sessions.end()) {
+                stop_session_workers_async(it->second);
                 g_sessions.erase(it);
                 removed = true;
             }
