@@ -197,8 +197,20 @@ static void write_event_line(const std::string & line) {
     if (!g_out) {
         return;
     }
+    // No flush() here on purpose: this runs on the decode hot path, with
+    // 20-30+ events per token per node (span begin/end, GPU samples, queue
+    // depth, ...) all serialized through g_mu. A synchronous flush() per
+    // event was measured collapsing real decode throughput by ~6x under
+    // DIST_PERF_TRACE=1 on real hardware (qwen2.5-32b: ~135ms/token
+    // untraced vs ~812ms/token traced, see docs/bench G1 ceiling
+    // measurement writeup) -- defeating the entire point of using a trace
+    // to measure real throughput. The stream is still flushed on every
+    // close() below (trace-session boundaries), which is the only point
+    // that matters for a completed trace read after the fact; the only
+    // cost of not flushing per-line is losing the last few buffered events
+    // if the process crashes mid-trace, which is an acceptable trade-off
+    // for a debugging/analysis instrument, not a live-tailed stream.
     g_out << line << '\n';
-    g_out.flush();
 }
 
 static void write_event(
