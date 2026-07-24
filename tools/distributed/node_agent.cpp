@@ -1518,10 +1518,12 @@ static bool run_local_pipeline_generate(
     int32_t cur = resp.token_id;
 
     const int n_prompt = (int) prompt_tokens.size();
+    const llama_vocab * gen_vocab = tokenizer_service_vocab();
     const bool speculative = speculative_client_enabled() && !use_entry_queue && !g_external_embedding;
     if (speculative) {
         int64_t spec_waves = 0, spec_accepted_total = 0;
-        while ((int) out_tokens.size() < max_new) {
+        bool hit_eog = false;
+        while (!hit_eog && (int) out_tokens.size() < max_new) {
             const int32_t pos = n_prompt + (int32_t) out_tokens.size() - 1;
             bool rt_ok;
             {
@@ -1555,8 +1557,12 @@ static bool run_local_pipeline_generate(
                             corrected_pos);
                 }
             }
-            for (int32_t i = 0; i < accepted && (int) out_tokens.size() < max_new; ++i) {
+            for (int32_t i = 0; i < accepted && !hit_eog && (int) out_tokens.size() < max_new; ++i) {
                 cur = resp.accepted_ids[i];
+                if (gen_vocab != nullptr && llama_vocab_is_eog(gen_vocab, (llama_token) cur)) {
+                    hit_eog = true;
+                    break;
+                }
                 out_tokens.push_back(cur);
                 if (dbg) {
                     dbg->emit_token_selected(debug_step, "decode", cur, n_prompt + (int32_t) out_tokens.size() - 2, false);
@@ -1564,7 +1570,10 @@ static bool run_local_pipeline_generate(
                 debug_step++;
             }
             cur = resp.token_id;
-            if ((int) out_tokens.size() < max_new) {
+            if (!hit_eog && gen_vocab != nullptr && llama_vocab_is_eog(gen_vocab, (llama_token) cur)) {
+                hit_eog = true;
+            }
+            if (!hit_eog && (int) out_tokens.size() < max_new) {
                 out_tokens.push_back(cur);
                 if (dbg) {
                     dbg->emit_token_selected(debug_step, "decode", cur, n_prompt + (int32_t) out_tokens.size() - 2, false);
@@ -1572,11 +1581,15 @@ static bool run_local_pipeline_generate(
                 debug_step++;
             }
         }
+        // hit_eog stops the wave loop before the next SPLIT_GEN_CMD_VERIFY
+        // round-trip is sent -- that's the actual compute/network saved.
+        // truncate_at_eog() below is a correctness backstop, not the
+        // mechanism doing the saving here.
         split_tcp_close(ctrl_fd);
         fprintf(stderr, "SPEC_DEBUG summary waves=%lld accepted_total=%lld avg_accepted=%.2f\n",
                 (long long) spec_waves, (long long) spec_accepted_total,
                 spec_waves > 0 ? (double) spec_accepted_total / (double) spec_waves : 0.0);
-        truncate_at_eog(tokenizer_service_vocab(), out_tokens);
+        truncate_at_eog(gen_vocab, out_tokens);
         const auto t_total1_spec = std::chrono::steady_clock::now();
         if (timing_out) {
             const double prefill_ms = std::chrono::duration<double, std::milli>(t_first_token - t_prefill0).count();
@@ -1725,7 +1738,13 @@ static bool run_local_pipeline_generate(
             resp.token_id = token_id;
             pending_wave = false;
 
-            if (client_pipeline && step + 1 < max_new) {
+            // Checked here, before the client_pipeline look-ahead below
+            // decides whether to pre-send step+1 -- catching it this early
+            // (rather than after the shared tail's push_back further down)
+            // avoids sending that one extra wasted round-trip too.
+            const bool step_is_eog = gen_vocab != nullptr && llama_vocab_is_eog(gen_vocab, (llama_token) cur);
+
+            if (client_pipeline && step + 1 < max_new && !step_is_eog) {
                 const int32_t next_pos = n_prompt + step;
                 if (g_external_embedding) {
                     std::vector<float> next_hidden;
@@ -1783,7 +1802,7 @@ static bool run_local_pipeline_generate(
                 pending_wave = true;
             }
 
-            if (client_pipeline && step + 1 >= max_new) {
+            if (client_pipeline && (step + 1 >= max_new || step_is_eog)) {
                 if (!pipeline_send_drain_pending(ctrl_fd, layer_end)) {
                     err = "decode drain failed at step " + std::to_string(step);
                     split_tcp_close(ctrl_fd);
@@ -1812,6 +1831,13 @@ static bool run_local_pipeline_generate(
             return false;
         }
         cur = resp.token_id;
+        if (gen_vocab != nullptr && llama_vocab_is_eog(gen_vocab, (llama_token) cur)) {
+            // Stops here: no further decode request goes out for step+1
+            // (that's the compute/network saved). truncate_at_eog() below
+            // is a correctness backstop, not what does the saving here --
+            // this token is simply never appended.
+            break;
+        }
         out_tokens.push_back(cur);
         if (dbg) {
             dbg->emit_token_selected(debug_step, "decode", cur, pos, false);
@@ -1820,7 +1846,7 @@ static bool run_local_pipeline_generate(
     }
 
     split_tcp_close(ctrl_fd);
-    truncate_at_eog(tokenizer_service_vocab(), out_tokens);
+    truncate_at_eog(gen_vocab, out_tokens);
 
     const auto t_total1 = std::chrono::steady_clock::now();
     if (timing_out) {
