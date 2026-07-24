@@ -1330,6 +1330,23 @@ static bool pipeline_gen3_send_hidden_recv(
     return split_gen3_recv_a_resp(ctrl_fd, resp, nullptr);
 }
 
+// Trims out_tokens at the first end-of-generation token so the client
+// never sees the model's own stop token (or hallucinated continuation
+// past it) as literal text. The pipeline wire protocol has no notion of
+// "stop early" -- see the loops below -- so this can't recover the
+// wasted compute on middle/final, it only keeps what's returned honest.
+static void truncate_at_eog(const llama_vocab * vocab, std::vector<int32_t> & out_tokens) {
+    if (vocab == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < out_tokens.size(); ++i) {
+        if (llama_vocab_is_eog(vocab, (llama_token) out_tokens[i])) {
+            out_tokens.resize(i);
+            return;
+        }
+    }
+}
+
 static bool run_local_pipeline_generate(
         const std::vector<int32_t> & prompt_tokens,
         int max_new,
@@ -1559,6 +1576,7 @@ static bool run_local_pipeline_generate(
         fprintf(stderr, "SPEC_DEBUG summary waves=%lld accepted_total=%lld avg_accepted=%.2f\n",
                 (long long) spec_waves, (long long) spec_accepted_total,
                 spec_waves > 0 ? (double) spec_accepted_total / (double) spec_waves : 0.0);
+        truncate_at_eog(tokenizer_service_vocab(), out_tokens);
         const auto t_total1_spec = std::chrono::steady_clock::now();
         if (timing_out) {
             const double prefill_ms = std::chrono::duration<double, std::milli>(t_first_token - t_prefill0).count();
@@ -1802,6 +1820,7 @@ static bool run_local_pipeline_generate(
     }
 
     split_tcp_close(ctrl_fd);
+    truncate_at_eog(tokenizer_service_vocab(), out_tokens);
 
     const auto t_total1 = std::chrono::steady_clock::now();
     if (timing_out) {
