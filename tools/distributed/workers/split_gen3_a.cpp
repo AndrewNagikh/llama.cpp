@@ -686,6 +686,28 @@ static bool entry_handle_control_cmd(
         normal_shutdown = true;
         return true;
     }
+    if (req.cmd == SPLIT_GEN_CMD_KEEP_PREFIX) {
+        // Drop KV from pos_start onward, keeping the shared prompt prefix.
+        // Forwarded downstream first so every stage truncates to the same
+        // position -- a stage left with a longer cache would silently attend
+        // to tokens the others have discarded.
+        const int32_t keep = req.pos_start > 0 ? req.pos_start : 0;
+        split_ab_send_keep_prefix(b_fd, keep);
+        if (st.ctx_mu) {
+            st.ctx_mu->lock();
+        }
+        llama_memory_seq_rm(llama_get_memory(st.ctx), -1, keep, -1);
+        llama_clear_hidden_state(st.ctx);
+        if (st.ctx_mu) {
+            st.ctx_mu->unlock();
+        }
+        split_gen3_a_resp resp{};
+        resp.magic    = SPLIT_GEN_MAGIC;
+        resp.version  = SPLIT_GEN3_VERSION;
+        resp.token_id = -1;
+        split_gen3_send_a_resp(ctrl_fd, resp, nullptr, 0);
+        return true;
+    }
     if (req.cmd == SPLIT_GEN_CMD_RESET) {
         if (st.ctx_mu) {
             st.ctx_mu->lock();

@@ -104,6 +104,11 @@ enum split_gen_cmd : uint32_t {
     // entry decodes the batch and forwards hidden + the draft ids downstream,
     // final verifies per position and returns accepted_count + corrected token.
     SPLIT_GEN_CMD_VERIFY          = 9,
+    // Prompt-prefix reuse: keep KV for positions [0, pos_start) and drop the
+    // rest, instead of RESET's full clear. Lets a follow-up turn in a chat
+    // re-prefill only the tokens that actually changed. Every stage must
+    // truncate to the same position or their caches diverge.
+    SPLIT_GEN_CMD_KEEP_PREFIX     = 10,
 };
 
 enum split_ab_cmd : uint32_t {
@@ -113,6 +118,9 @@ enum split_ab_cmd : uint32_t {
     // Draft token ids for the verify wave that follows as the next HIDDEN
     // on this connection. Middle stages forward it unchanged.
     SPLIT_AB_CMD_VERIFY_IDS = 4,
+    // Downstream half of SPLIT_GEN_CMD_KEEP_PREFIX: truncate KV to the given
+    // position instead of clearing it. Middle stages apply it and forward.
+    SPLIT_AB_CMD_KEEP_PREFIX = 5,
 };
 
 #pragma pack(push, 1)
@@ -160,6 +168,8 @@ bool split_ab_send_cmd(int fd, split_ab_cmd cmd);
 bool split_ab_send_hidden(int fd, int32_t n_tokens, int32_t n_embd, int32_t layer_end,
         int32_t pos_start, int32_t include_logits, const float * data);
 bool split_ab_send_reset(int fd);
+bool split_ab_send_keep_prefix(int fd, int32_t keep_pos);
+bool split_ab_recv_keep_prefix(int fd, int32_t & keep_pos);
 bool split_ab_send_shutdown(int fd);
 
 // Verify-wave draft ids (Task 19). Sent immediately before the wave's HIDDEN

@@ -516,6 +516,17 @@ bool split_ab_send_shutdown(int fd) {
     return split_ab_send_cmd(fd, SPLIT_AB_CMD_SHUTDOWN);
 }
 
+bool split_ab_send_keep_prefix(int fd, int32_t keep_pos) {
+    if (!split_ab_send_cmd(fd, SPLIT_AB_CMD_KEEP_PREFIX)) {
+        return false;
+    }
+    return split_tcp_send_all(fd, &keep_pos, sizeof(keep_pos));
+}
+
+bool split_ab_recv_keep_prefix(int fd, int32_t & keep_pos) {
+    return split_tcp_recv_all(fd, &keep_pos, sizeof(keep_pos));
+}
+
 bool split_ab_send_verify_ids(int fd, int32_t pos_start, const int32_t * ids, int32_t n) {
     if (!split_ab_send_cmd(fd, SPLIT_AB_CMD_VERIFY_IDS)) {
         return false;

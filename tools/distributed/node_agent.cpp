@@ -1400,6 +1400,32 @@ static bool pipeline_gen3_send_hidden_recv(
     return split_gen3_recv_a_resp(ctrl_fd, resp, nullptr);
 }
 
+// Prompt-prefix reuse across generate calls (off by default).
+//
+// Restricted to the plain token path: the external-embedding and speculative
+// paths carry their own position/rollback state, and reusing a prefix under
+// them would need that state truncated in step too.
+static bool prefix_cache_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("DIST_PREFIX_CACHE");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    // The queued/pipelined paths pre-send the next step before the current
+    // one is accounted for, so the token list here would drift out of step
+    // with what the workers actually hold.
+    return enabled
+            && !g_external_embedding
+            && !speculative_client_enabled()
+            && !runtime_entry_queue_client_enabled(g_pipeline_protocol)
+            && !runtime_client_pipeline_client_enabled(g_pipeline_protocol);
+}
+
+// Exact token sequence currently held in the pipeline's KV cache, so the next
+// call can tell how much of its prompt is already there. Must mirror what was
+// actually fed to the workers -- an optimistic entry here yields wrong output
+// rather than an error.
+static std::vector<int32_t> g_kv_tokens;
+
 // Trims out_tokens at the first end-of-generation token so the client
 // never sees the model's own stop token (or hallucinated continuation
 // past it) as literal text. The pipeline wire protocol has no notion of
@@ -1474,12 +1500,44 @@ static bool run_local_pipeline_generate(
     if (dbg) {
         dbg->emit_step_begin(debug_step, "reset", -1, 0, 0);
     }
-    if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_RESET, 0, 0, layer_end, nullptr, resp)) {
-        err = "reset failed";
-        split_tcp_close(ctrl_fd);
-        return false;
+    // Prompt-prefix reuse. A chat turn resends the whole conversation, so the
+    // new prompt usually shares a long prefix with what is already in KV --
+    // re-prefilling it is pure waste. When enabled, keep that prefix and
+    // prefill only the tail.
+    //
+    // Off by default: this trades a full, always-correct reset for state that
+    // has to stay exactly in step across three nodes, and a stale prefix
+    // produces plausible-looking wrong output rather than an error. Enable
+    // with DIST_PREFIX_CACHE=1 once measured.
+    int prefix_keep = 0;
+    if (prefix_cache_enabled() && !g_kv_tokens.empty() && prompt_tokens.size() > 1) {
+        const size_t limit = std::min(g_kv_tokens.size(), prompt_tokens.size() - 1);
+        size_t common = 0;
+        while (common < limit && g_kv_tokens[common] == prompt_tokens[common]) {
+            ++common;
+        }
+        prefix_keep = (int) common;
     }
-    g_runtime_stats.kv_cache_reset_count++;
+
+    if (prefix_keep > 0) {
+        if (!pipeline_gen3_send_recv(
+                    ctrl_fd, SPLIT_GEN_CMD_KEEP_PREFIX, 0, prefix_keep, layer_end, nullptr, resp)) {
+            err = "keep-prefix failed";
+            split_tcp_close(ctrl_fd);
+            return false;
+        }
+        g_kv_tokens.resize((size_t) prefix_keep);
+        fprintf(stderr, "node_agent: prefix cache kept %d of %zu prompt tokens\n",
+                prefix_keep, prompt_tokens.size());
+    } else {
+        if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_RESET, 0, 0, layer_end, nullptr, resp)) {
+            err = "reset failed";
+            split_tcp_close(ctrl_fd);
+            return false;
+        }
+        g_runtime_stats.kv_cache_reset_count++;
+        g_kv_tokens.clear();
+    }
 
     if (g_external_embedding && !embedding_service_reset(err)) {
         split_tcp_close(ctrl_fd);
@@ -1530,12 +1588,18 @@ static bool run_local_pipeline_generate(
             split_tcp_close(ctrl_fd);
             return false;
         }
-    } else if (!pipeline_gen3_send_recv(ctrl_fd, SPLIT_GEN_CMD_PREFILL, (int32_t) prompt_tokens.size(), 0,
-            layer_end, prompt_tokens.data(), resp)) {
+    } else if (!pipeline_gen3_send_recv(
+                       ctrl_fd, SPLIT_GEN_CMD_PREFILL,
+                       (int32_t) prompt_tokens.size() - prefix_keep, prefix_keep,
+                       layer_end, prompt_tokens.data() + prefix_keep, resp)) {
         err = "prefill failed";
         split_tcp_close(ctrl_fd);
         return false;
     }
+
+    // From here the KV holds the whole prompt regardless of how much of it was
+    // re-prefilled.
+    g_kv_tokens.assign(prompt_tokens.begin(), prompt_tokens.end());
 
     const auto t_first_token = std::chrono::steady_clock::now();
 
@@ -1900,6 +1964,10 @@ static bool run_local_pipeline_generate(
             split_tcp_close(ctrl_fd);
             return false;
         }
+        // `cur` was fed to the pipeline this step, so it is now in KV --
+        // record it before any early exit, or a later prefix match would
+        // assume a shorter cache than actually exists.
+        g_kv_tokens.push_back(cur);
         cur = resp.token_id;
         if (gen_vocab != nullptr && llama_vocab_is_eog(gen_vocab, (llama_token) cur)) {
             // Stops here: no further decode request goes out for step+1

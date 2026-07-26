@@ -347,6 +347,22 @@ static bool middle_run_queued_session(
                 break;
             }
 
+            if (cmd == SPLIT_AB_CMD_KEEP_PREFIX) {
+                int32_t keep = 0;
+                if (!split_ab_recv_keep_prefix(st.ab_fd, keep)) {
+                    break;
+                }
+                split_ab_send_keep_prefix(st.bc_fd, keep);
+                {
+                    std::lock_guard<std::mutex> lock(ctx_mu);
+                    llama_memory_seq_rm(llama_get_memory(st.ctx), -1, keep, -1);
+                    llama_clear_hidden_state(st.ctx);
+                }
+                pending_verify_pos = -1;
+                pending_verify_ids.clear();
+                continue;
+            }
+
             if (cmd == SPLIT_AB_CMD_RESET) {
                 {
                     std::lock_guard<std::mutex> lock(ctx_mu);
@@ -718,6 +734,17 @@ int main(int argc, char ** argv) {
             split_ab_send_shutdown(bc_fd);
             normal_shutdown = true;
             break;
+        }
+
+        if (cmd == SPLIT_AB_CMD_KEEP_PREFIX) {
+            int32_t keep = 0;
+            if (!split_ab_recv_keep_prefix(ab_fd, keep)) {
+                break;
+            }
+            split_ab_send_keep_prefix(bc_fd, keep);
+            llama_memory_seq_rm(llama_get_memory(ctx), -1, keep, -1);
+            llama_clear_hidden_state(ctx);
+            continue;
         }
 
         if (cmd == SPLIT_AB_CMD_RESET) {

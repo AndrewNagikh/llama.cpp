@@ -709,6 +709,23 @@ static bool final_run_queued_session(
                 break;
             }
 
+            if (cmd == SPLIT_AB_CMD_KEEP_PREFIX) {
+                int32_t keep = 0;
+                if (!split_ab_recv_keep_prefix(st.bc_fd, keep)) {
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(ctx_mu);
+                    llama_memory_seq_rm(llama_get_memory(st.ctx), -1, keep, -1);
+                    llama_clear_hidden_state(st.ctx);
+                }
+                // next_pos tracks where the next wave is expected; after a
+                // truncation it must follow the kept prefix, or the rollback
+                // logic would compare against a position that no longer exists.
+                st.next_pos = keep;
+                continue;
+            }
+
             if (cmd == SPLIT_AB_CMD_RESET) {
                 {
                     std::lock_guard<std::mutex> lock(ctx_mu);
@@ -1105,6 +1122,16 @@ int main(int argc, char ** argv) {
         if (cmd == SPLIT_AB_CMD_SHUTDOWN) {
             normal_shutdown = true;
             break;
+        }
+
+        if (cmd == SPLIT_AB_CMD_KEEP_PREFIX) {
+            int32_t keep = 0;
+            if (!split_ab_recv_keep_prefix(bc_fd, keep)) {
+                break;
+            }
+            llama_memory_seq_rm(llama_get_memory(ctx), -1, keep, -1);
+            llama_clear_hidden_state(ctx);
+            continue;
         }
 
         if (cmd == SPLIT_AB_CMD_RESET) {
