@@ -101,6 +101,7 @@ layout_node_input layout_node_from_dist(const dist_node_info & node) {
     n.has_gpu           = node.memory.has_gpu;
     n.cpu_budget_bytes  = node.memory.free_ram_bytes;
     n.gpu_budget_bytes  = node.memory.free_vram_bytes;
+    n.decode_tps        = node.performance.decode_tps;
     return n;
 }
 
@@ -315,6 +316,139 @@ static void apply_role_hysteresis(
     }
 }
 
+// Single-stream cost of an allocation: a token traverses every stage in
+// sequence, so what matters is the SUM of stage times, not the max. Stage
+// time is modelled as layers_i / decode_tps_i (Task 21.4; Petals/SWARM use
+// the same measured-throughput input, arXiv:2312.08361, 2301.11913).
+//
+// Note this deliberately does NOT balance load: balancing minimizes the
+// slowest stage, which is the right objective only when many requests are in
+// flight at once. With one stream there is nothing to overlap.
+static double single_stream_cost(
+        const std::vector<int> & counts,
+        const std::vector<layout_internal_node *> & active) {
+    double total = 0.0;
+    for (size_t i = 0; i < counts.size() && i < active.size(); ++i) {
+        const double tps = active[i]->input.decode_tps;
+        if (tps <= 0.0) {
+            return -1.0;
+        }
+        total += static_cast<double>(counts[i]) / tps;
+    }
+    return total;
+}
+
+static bool all_nodes_have_measured_tps(const std::vector<layout_internal_node *> & active) {
+    for (const auto * w : active) {
+        if (w->input.decode_tps <= 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Task 21.4: allocate layers by measured throughput instead of by score
+// proportion. Minimizing sum(layers_i / tps_i) has a degenerate optimum --
+// put everything on the fastest node -- so memory is what actually shapes the
+// result: fill the fastest node to its cap, then the next fastest, and so on.
+// That the split exists at all is a memory constraint, not a speed strategy.
+//
+// `caps` bounds each node; the caller still runs its own clamp/redistribute
+// pass afterwards, so this only has to produce a sane starting point.
+static std::vector<int> counts_by_measured_throughput(
+        const std::vector<layout_internal_node *> & active,
+        const std::vector<int> & caps,
+        int n_layer) {
+    std::vector<size_t> by_speed(active.size());
+    for (size_t i = 0; i < active.size(); ++i) {
+        by_speed[i] = i;
+    }
+    std::sort(by_speed.begin(), by_speed.end(), [&active](size_t a, size_t b) {
+        if (active[a]->input.decode_tps != active[b]->input.decode_tps) {
+            return active[a]->input.decode_tps > active[b]->input.decode_tps;
+        }
+        return active[a]->input.node_id < active[b]->input.node_id;
+    });
+
+    std::vector<int> counts(active.size(), 0);
+    int remaining = n_layer;
+    for (const size_t idx : by_speed) {
+        if (remaining <= 0) {
+            break;
+        }
+        const int take = std::min(remaining, std::max(0, caps[idx]));
+        counts[idx] = take;
+        remaining -= take;
+    }
+    return counts;
+}
+
+// Layer-count hysteresis. Same reasoning as apply_role_hysteresis, but the
+// thing being protected is more expensive: a changed count means weights
+// actually move between nodes. Keeps the previous allocation unless the new
+// one improves the single-stream cost by more than
+// LAYOUT_COUNT_HYSTERESIS_PERCENT.
+static void apply_count_hysteresis(
+        std::vector<int> & counts,
+        const std::vector<int> & caps,
+        const std::vector<layout_internal_node *> & active,
+        const desired_model_layout * previous,
+        int n_layer) {
+    if (previous == nullptr || previous->placements.empty()) {
+        return;
+    }
+    if (!all_nodes_have_measured_tps(active)) {
+        return;  // no cost model -> nothing to compare, leave counts alone
+    }
+
+    std::map<std::string, int> prev_counts;
+    for (const auto & p : previous->placements) {
+        prev_counts[p.node_id]++;
+    }
+
+    // The previous allocation has to still be usable today: same node set,
+    // same total, and within each node's current memory cap.
+    if (prev_counts.size() != active.size()) {
+        return;
+    }
+    std::vector<int> prev(active.size(), 0);
+    int prev_total = 0;
+    for (size_t i = 0; i < active.size(); ++i) {
+        const auto it = prev_counts.find(active[i]->input.node_id);
+        if (it == prev_counts.end() || it->second > caps[i]) {
+            return;
+        }
+        prev[i] = it->second;
+        prev_total += it->second;
+    }
+    if (prev_total != n_layer) {
+        return;  // model or cluster changed shape; not a like-for-like compare
+    }
+    if (prev == counts) {
+        return;
+    }
+
+    const double cost_prev = single_stream_cost(prev, active);
+    const double cost_new  = single_stream_cost(counts, active);
+    if (cost_prev <= 0.0 || cost_new <= 0.0) {
+        return;
+    }
+
+    const double gain_percent = (cost_prev - cost_new) * 100.0 / cost_prev;
+    if (gain_percent > LAYOUT_COUNT_HYSTERESIS_PERCENT) {
+        fprintf(stderr,
+                "layout_planner: layer rebalance accepted -- predicted single-stream gain "
+                "%.1f%% exceeds %.0f%% threshold\n",
+                gain_percent, LAYOUT_COUNT_HYSTERESIS_PERCENT);
+        return;
+    }
+    fprintf(stderr,
+            "layout_planner: keeping previous layer counts -- predicted gain %.1f%% is under "
+            "the %.0f%% threshold, not worth re-syncing weights\n",
+            gain_percent, LAYOUT_COUNT_HYSTERESIS_PERCENT);
+    counts = prev;
+}
+
 } // namespace
 
 bool layout_has_no_overlap(const desired_model_layout & layout) {
@@ -493,40 +627,68 @@ layout_build_result build_desired_layout(
 
     apply_role_hysteresis(active, previous);
 
-    // Score-proportional layer counts, then clamp to per-node memory caps.
-    std::vector<double> scores;
-    scores.reserve(active.size());
-    for (const auto * w : active) {
-        scores.push_back(w->input.score > 0.0 ? w->input.score : 1.0);
-    }
-
-    double score_total = 0.0;
-    for (double s : scores) {
-        score_total += s;
-    }
-    if (score_total <= 0.0) {
-        score_total = static_cast<double>(scores.size());
-    }
-
-    std::vector<int> counts(active.size(), 0);
-    int assigned = 0;
-    struct frac { size_t idx; double rem; };
-    std::vector<frac> fracs;
+    // Per-node memory caps. Independent of how layers are allocated, so it is
+    // computed first -- the measured-throughput allocation below needs to know
+    // where each node runs out of room.
+    std::vector<int> caps(active.size(), 0);
+    int cap_cursor = 0;
     for (size_t i = 0; i < active.size(); ++i) {
-        const double exact = static_cast<double>(n_layer) * scores[i] / score_total;
-        counts[i] = static_cast<int>(std::floor(exact));
-        assigned += counts[i];
-        fracs.push_back({ i, exact - static_cast<double>(counts[i]) });
-    }
-    int leftover = n_layer - assigned;
-    std::sort(fracs.begin(), fracs.end(), [](const frac & a, const frac & b) {
-        if (a.rem != b.rem) {
-            return a.rem > b.rem;
+        uint64_t used = 0;
+        int local = cap_cursor;
+        while (local < n_layer) {
+            const uint64_t cost = layer_placement_cost(mem, local);
+            if (cost == 0 || cost > active[i]->budget_bytes || used + cost > active[i]->budget_bytes) {
+                break;
+            }
+            used += cost;
+            ++local;
         }
-        return a.idx < b.idx;
-    });
-    for (int i = 0; i < leftover && i < static_cast<int>(active.size()); ++i) {
-        counts[fracs[static_cast<size_t>(i)].idx]++;
+        caps[i] = local - cap_cursor;
+    }
+
+    std::vector<int> counts;
+    if (all_nodes_have_measured_tps(active)) {
+        // Task 21.4: measured throughput drives the split.
+        counts = counts_by_measured_throughput(active, caps, n_layer);
+    } else {
+        // Fallback whenever any node has not reported a benchmark yet: the
+        // original score-proportional split. Score is always populated, so
+        // this keeps a cold or partially-registered cluster working exactly
+        // as before.
+        std::vector<double> scores;
+        scores.reserve(active.size());
+        for (const auto * w : active) {
+            scores.push_back(w->input.score > 0.0 ? w->input.score : 1.0);
+        }
+
+        double score_total = 0.0;
+        for (double s : scores) {
+            score_total += s;
+        }
+        if (score_total <= 0.0) {
+            score_total = static_cast<double>(scores.size());
+        }
+
+        counts.assign(active.size(), 0);
+        int assigned = 0;
+        struct frac { size_t idx; double rem; };
+        std::vector<frac> fracs;
+        for (size_t i = 0; i < active.size(); ++i) {
+            const double exact = static_cast<double>(n_layer) * scores[i] / score_total;
+            counts[i] = static_cast<int>(std::floor(exact));
+            assigned += counts[i];
+            fracs.push_back({ i, exact - static_cast<double>(counts[i]) });
+        }
+        int leftover = n_layer - assigned;
+        std::sort(fracs.begin(), fracs.end(), [](const frac & a, const frac & b) {
+            if (a.rem != b.rem) {
+                return a.rem > b.rem;
+            }
+            return a.idx < b.idx;
+        });
+        for (int i = 0; i < leftover && i < static_cast<int>(active.size()); ++i) {
+            counts[fracs[static_cast<size_t>(i)].idx]++;
+        }
     }
 
     if (n_layer >= static_cast<int>(active.size())) {
@@ -546,22 +708,6 @@ layout_build_result build_desired_layout(
             counts[donor]--;
             counts[i]++;
         }
-    }
-
-    std::vector<int> caps(active.size(), 0);
-    int cap_cursor = 0;
-    for (size_t i = 0; i < active.size(); ++i) {
-        uint64_t used = 0;
-        int local = cap_cursor;
-        while (local < n_layer) {
-            const uint64_t cost = layer_placement_cost(mem, local);
-            if (cost == 0 || cost > active[i]->budget_bytes || used + cost > active[i]->budget_bytes) {
-                break;
-            }
-            used += cost;
-            ++local;
-        }
-        caps[i] = local - cap_cursor;
     }
 
     for (int iter = 0; iter < static_cast<int>(active.size()) + 1; ++iter) {
@@ -606,6 +752,10 @@ layout_build_result build_desired_layout(
             return result;
         }
     }
+
+    // Only now, against a feasible allocation, decide whether the change is
+    // worth physically moving weights for.
+    apply_count_hysteresis(counts, caps, active, previous, n_layer);
 
     int total_assigned = 0;
     for (int c : counts) {

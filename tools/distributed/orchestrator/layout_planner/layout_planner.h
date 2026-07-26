@@ -65,6 +65,11 @@ struct layout_node_input {
     bool        has_gpu = false;
     uint64_t    cpu_budget_bytes = 0;
     uint64_t    gpu_budget_bytes = 0;
+    // Measured decode throughput (tokens/s) from the node's registration
+    // benchmark. Drives layer counts when available for every node (Task
+    // 21.4); 0 means "not measured", which falls the whole cluster back to
+    // the score-proportional split.
+    double      decode_tps = 0.0;
 };
 
 layout_node_input layout_node_from_dist(const dist_node_info & node);
@@ -84,6 +89,14 @@ model_memory_requirements memory_requirements_from_manifest(
 // Deliberately 2x the 5% score-delta that /register uses to notice a cluster
 // change at all: we look at a 5% drift, but only act on a 10% one.
 constexpr double LAYOUT_ROLE_HYSTERESIS_PERCENT = 10.0;
+
+// Same idea one level down, for layer COUNTS (Task 21.4/21.5). Changing how
+// many layers a node holds means physically re-syncing weights between nodes,
+// which is far more expensive than swapping which node is entry -- so the bar
+// is higher. 20% is borrowed directly from Petals, which only rebalances when
+// predicted total-throughput gain clears p=20%, explicitly to trade efficiency
+// against cache-invalidation cost (arXiv:2312.08361).
+constexpr double LAYOUT_COUNT_HYSTERESIS_PERCENT = 20.0;
 
 // Build desired per-layer layout from manifest + cluster nodes.
 //
