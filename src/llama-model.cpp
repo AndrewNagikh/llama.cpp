@@ -2153,6 +2153,35 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
+                    // Distributed inference: this context only executes
+                    // layers [layer_start, layer_end), so KV for the other
+                    // layers would be allocated and never written. Without
+                    // this every node in a layer-sharded pipeline reserves
+                    // KV for the WHOLE model -- on an 80-layer model split
+                    // three ways that is roughly 3x the cache the cluster
+                    // actually needs, and it is what caps usable context.
+                    //
+                    // Composed with (not substituted for) any filter set
+                    // above: those encode architecture rules (MTP, Gemma,
+                    // Step35) that still apply.
+                    if (cparams.layer_start > 0 ||
+                            (cparams.layer_end >= 0 &&
+                             (uint32_t) cparams.layer_end < hparams.n_layer_all)) {
+                        const uint32_t lo = (uint32_t) std::max(0, cparams.layer_start);
+                        const uint32_t hi = cparams.layer_end < 0
+                                ? hparams.n_layer_all
+                                : (uint32_t) cparams.layer_end;
+                        auto prev = filter;
+                        filter = [prev, lo, hi](uint32_t il) {
+                            if (prev && !prev(il)) {
+                                return false;
+                            }
+                            return il >= lo && il < hi;
+                        };
+                        LLAMA_LOG_INFO("%s: KV cache limited to layers [%u, %u) of %u\n",
+                                __func__, lo, hi, hparams.n_layer_all);
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
