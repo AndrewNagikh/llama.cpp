@@ -3129,6 +3129,75 @@ static int session_create_core(const json & body, json & out) {
 }
 
 // ---------------------------------------------------------------------------
+// Hugging Face browsing
+//
+// Lets the dashboard search for GGUF models and judge them against this
+// cluster before committing to a download. The fit numbers here are ESTIMATES
+// derived from the published file size: the exact requirement also needs
+// n_layer/n_embd/n_ctx from the GGUF header, which the existing
+// register -> discover -> manifest -> layout path reads (header only, no full
+// download). The UI is expected to offer that as the precise check; nothing
+// here should be presented as authoritative.
+// ---------------------------------------------------------------------------
+
+static httplib::Headers hf_headers() {
+    httplib::Headers headers = {
+        { "User-Agent", "distributed-llama-orchestrator/0.1" },
+        { "Accept", "application/json" },
+    };
+    const std::string token = dist_hf_token();
+    if (!token.empty()) {
+        headers.emplace("Authorization", "Bearer " + token);
+    }
+    return headers;
+}
+
+// Sum of what the layout planner would actually be allowed to use: a GPU node
+// contributes its free VRAM, a CPU-only node its free RAM -- matching
+// layout_node_from_dist's budget choice.
+static uint64_t cluster_free_budget_bytes() {
+    uint64_t total = 0;
+    std::lock_guard<std::mutex> lock(g_mu);
+    for (const auto & kv : g_nodes) {
+        if (!kv.second.online) {
+            continue;
+        }
+        total += kv.second.memory.has_gpu
+                ? kv.second.memory.free_vram_bytes
+                : kv.second.memory.free_ram_bytes;
+    }
+    return total;
+}
+
+// Coarse verdict from weight bytes alone. The real requirement adds KV,
+// compute and scratch, which measured out at ~0.75 GB on a 28-layer 3B and
+// ~1.7 GB on an 80-layer 70B -- i.e. it grows with layer count, not as a clean
+// fraction of file size. Rather than invent a multiplier that is wrong at both
+// ends, this only separates "clearly fits" from "tight" from "no".
+static json hf_fit_estimate(uint64_t file_bytes) {
+    const uint64_t budget = cluster_free_budget_bytes();
+    const double file_gb = (double) file_bytes / (1024.0 * 1024.0 * 1024.0);
+    const double budget_gb = (double) budget / (1024.0 * 1024.0 * 1024.0);
+
+    std::string verdict = "unknown";
+    if (budget > 0) {
+        if (file_bytes > budget) {
+            verdict = "no";
+        } else if ((double) file_bytes * 1.15 > (double) budget) {
+            verdict = "tight";
+        } else {
+            verdict = "fits";
+        }
+    }
+    return {
+        { "verdict", verdict },
+        { "file_gb", file_gb },
+        { "cluster_free_gb", budget_gb },
+        { "estimated", true },
+    };
+}
+
+// ---------------------------------------------------------------------------
 // OpenAI-compatible surface
 //
 // The impedance mismatch this bridges: an OpenAI client names a model on every
@@ -3615,6 +3684,118 @@ int main(int argc, char ** argv) {
         json out;
         res.status = session_create_core(body, out);
         res.set_content(out.dump(), "application/json");
+    });
+
+    // GET /hf/search?q=...&limit=  -- browse GGUF repositories on Hugging Face.
+    svr.Get("/hf/search", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string q = req.get_param_value("q");
+        const std::string limit = req.has_param("limit") ? req.get_param_value("limit") : "24";
+
+        httplib::Client cli("https://huggingface.co");
+        cli.set_connection_timeout(10, 0);
+        cli.set_read_timeout(30, 0);
+        cli.set_follow_location(true);
+
+        std::string path = "/api/models?filter=gguf&sort=downloads&direction=-1&limit=" + limit;
+        if (!q.empty()) {
+            path += "&search=" + httplib::encode_uri_component(q);
+        }
+
+        const auto hf = cli.Get(path.c_str(), hf_headers());
+        if (!hf) {
+            res.status = 502;
+            res.set_content(json({ { "error", "could not reach Hugging Face" } }).dump(), "application/json");
+            return;
+        }
+        if (hf->status != 200) {
+            res.status = hf->status;
+            res.set_content(json({
+                { "error", "Hugging Face API returned HTTP " + std::to_string(hf->status) },
+            }).dump(), "application/json");
+            return;
+        }
+
+        json parsed;
+        try {
+            parsed = json::parse(hf->body);
+        } catch (...) {
+            res.status = 502;
+            res.set_content(json({ { "error", "invalid JSON from Hugging Face" } }).dump(), "application/json");
+            return;
+        }
+
+        json models = json::array();
+        if (parsed.is_array()) {
+            for (const auto & m : parsed) {
+                models.push_back({
+                    { "repository", m.value("id", "") },
+                    { "downloads", m.value("downloads", 0) },
+                    { "likes", m.value("likes", 0) },
+                });
+            }
+        }
+        res.set_content(json({ { "models", models } }).dump(), "application/json");
+    });
+
+    // GET /hf/files?repo=...  -- GGUF files in a repo, with a size-based fit
+    // estimate against this cluster. Estimates only; see hf_fit_estimate.
+    svr.Get("/hf/files", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string repo = req.get_param_value("repo");
+        if (repo.empty()) {
+            res.status = 400;
+            res.set_content(json({ { "error", "repo required" } }).dump(), "application/json");
+            return;
+        }
+
+        httplib::Client cli("https://huggingface.co");
+        cli.set_connection_timeout(10, 0);
+        cli.set_read_timeout(30, 0);
+        cli.set_follow_location(true);
+
+        const auto hf = cli.Get(("/api/models/" + repo + "/tree/main").c_str(), hf_headers());
+        if (!hf) {
+            res.status = 502;
+            res.set_content(json({ { "error", "could not reach Hugging Face" } }).dump(), "application/json");
+            return;
+        }
+        if (hf->status != 200) {
+            res.status = hf->status;
+            res.set_content(json({
+                { "error", "Hugging Face API returned HTTP " + std::to_string(hf->status) },
+            }).dump(), "application/json");
+            return;
+        }
+
+        json parsed;
+        try {
+            parsed = json::parse(hf->body);
+        } catch (...) {
+            res.status = 502;
+            res.set_content(json({ { "error", "invalid JSON from Hugging Face" } }).dump(), "application/json");
+            return;
+        }
+
+        json files = json::array();
+        if (parsed.is_array()) {
+            for (const auto & f : parsed) {
+                const std::string path = f.value("path", "");
+                if (path.size() < 5 || path.compare(path.size() - 5, 5, ".gguf") != 0) {
+                    continue;
+                }
+                const uint64_t size = f.contains("size") && f["size"].is_number()
+                        ? f["size"].get<uint64_t>() : 0;
+                files.push_back({
+                    { "filename", path },
+                    { "size_bytes", size },
+                    { "fit", hf_fit_estimate(size) },
+                });
+            }
+        }
+        res.set_content(json({
+            { "repository", repo },
+            { "files", files },
+            { "cluster_free_gb", (double) cluster_free_budget_bytes() / (1024.0 * 1024.0 * 1024.0) },
+        }).dump(), "application/json");
     });
 
     // GET /v1/models -- OpenAI shape. Only models that are actually installed
