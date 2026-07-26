@@ -1126,6 +1126,25 @@ static std::map<std::string, int> g_optimize_attempts;
 
 static void trigger_cluster_optimization_async() {
     std::thread([]() {
+        // Decide from freshly polled coverage, never from whatever was
+        // persisted before the last shutdown.
+        //
+        // This runs on node registration, and the first node to come back
+        // after a restart triggers it while the others are still starting.
+        // Their layers then look absent, every model looks broken, and the
+        // optimizer "fixes" it by moving layers onto whichever node happens
+        // to be up -- deleting the copies elsewhere. That is how a healthy
+        // cluster lost data across a restart (gemma-3-1b, 2026-07-24), and
+        // how layouts collapsed onto a single node earlier the same day.
+        //
+        // Re-polling per model costs one round trip per node and makes the
+        // decision reflect the cluster as it is now.
+        for (const auto & model : g_registry.list()) {
+            if (model.manifest.has_value()) {
+                sync_model_state_from_cluster(model.model_id, false);
+            }
+        }
+
         const auto models = g_registry.list();
         for (const auto & model : models) {
             if (!model.manifest.has_value()) {
@@ -1165,6 +1184,35 @@ static void trigger_cluster_optimization_async() {
                         "a previous layout; skipping relayout (repair it to clean them up)\n",
                         model.model_id.c_str(), model.coverage->total_layers);
                 continue;
+            }
+
+            // A node that is merely offline still holds its layers. Relaying
+            // out around it would move the model onto the survivors and delete
+            // those copies -- turning a temporary absence into permanent data
+            // loss the moment the node comes back.
+            if (model.layout.has_value()) {
+                std::set<std::string> layout_nodes;
+                for (const auto & p : model.layout->desired.placements) {
+                    layout_nodes.insert(p.node_id);
+                }
+                bool any_offline = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_mu);
+                    for (const auto & nid : layout_nodes) {
+                        const auto it = g_nodes.find(nid);
+                        if (it == g_nodes.end() || !it->second.online) {
+                            any_offline = true;
+                            break;
+                        }
+                    }
+                }
+                if (any_offline) {
+                    fprintf(stderr,
+                            "orchestrator: %s uses a node that is not online -- leaving its layout "
+                            "alone until the cluster is whole\n",
+                            model.model_id.c_str());
+                    continue;
+                }
             }
 
             {
