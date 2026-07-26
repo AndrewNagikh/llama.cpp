@@ -990,6 +990,10 @@ int main(int argc, char ** argv) {
     const char * bind_host = "0.0.0.0";
     std::string ready_file;
 
+    // KV context for this stage. Every pipeline stage must agree on it;
+    // the orchestrator sends the session's value via --ctx-size.
+    int ctx_size = 4096;
+
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--ctrl-port") == 0 && i + 1 < argc) {
             ctrl_port = atoi(argv[++i]);
@@ -1009,6 +1013,11 @@ int main(int argc, char ** argv) {
             next_is_final = true;
         } else if (strcmp(argv[i], "--ready-file") == 0 && i + 1 < argc) {
             ready_file = argv[++i];
+        } else if (strcmp(argv[i], "--ctx-size") == 0 && i + 1 < argc) {
+            ctx_size = atoi(argv[++i]);
+            if (ctx_size < 512) {
+                ctx_size = 512;
+            }
         } else {
             usage(argv[0]);
             return 1;
@@ -1091,7 +1100,7 @@ int main(int argc, char ** argv) {
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx   = 512;
+    cparams.n_ctx   = (uint32_t) ctx_size;
     cparams.n_batch = 512;
     // n_ubatch > 1 so a k+1-token verify wave decodes as ONE graph instead
     // of k+1 sequential single-token graphs -- same fix as final/middle

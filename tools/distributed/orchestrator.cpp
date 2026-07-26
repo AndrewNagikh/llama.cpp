@@ -92,6 +92,9 @@ struct dist_session {
     float        repeat_penalty = 1.0f;
     int          repeat_last_n  = 64;
     unsigned int seed           = 0xFFFFFFFF;
+    // KV context this session's workers were built with. Kept so the
+    // reported limit matches what the pipeline can actually hold.
+    int          n_ctx          = 4096;
     // Client-supplied correlation id for create-time progress reporting.
     // Empty means the caller isn't watching, and no progress is recorded.
     std::string progress_id;
@@ -2137,6 +2140,7 @@ static bool setup_runtime_graph(
             { "layer_end", stage.layer_end },
             { "peer_bind", "0.0.0.0" },
             { "runtime_role", "pipeline_stage" },
+            { "n_ctx", session.n_ctx },
         };
         if (external_embedding && i == 0) {
             prep["external_embedding"] = true;
@@ -2956,6 +2960,16 @@ static int session_create_core(const json & body, json & out) {
             return 404;
         }
 
+        // Never build a context larger than the model was trained for: the
+        // extra KV would be allocated and paid for but could never be filled
+        // with anything the model handles correctly.
+        const int model_native_ctx = record->manifest.has_value() && record->manifest->n_ctx > 0
+                ? static_cast<int>(record->manifest->n_ctx)
+                : 0;
+        const int effective_ctx = model_native_ctx > 0
+                ? std::min(request_ctx, model_native_ctx)
+                : request_ctx;
+
         std::map<std::string, dist_node_info> node_map;
         int n_layers = 0;
         if (record->manifest.has_value() && record->manifest->n_layer > 0) {
@@ -2978,7 +2992,7 @@ static int session_create_core(const json & body, json & out) {
             return 503;
         }
 
-        const model_memory_requirements mem = get_model_memory_for_record(*record, request_ctx);
+        const model_memory_requirements mem = get_model_memory_for_record(*record, effective_ctx);
         if (!mem.valid()) {
             out = json({ { "error", "failed to estimate model memory" } });
             return 503;
@@ -3078,7 +3092,7 @@ static int session_create_core(const json & body, json & out) {
                     relayout_nodes.push_back(layout_node_from_dist(kv.second));
                 }
                 const auto rebuilt = build_desired_layout(
-                        model_id, *record->manifest, relayout_nodes, request_ctx, nullptr);
+                        model_id, *record->manifest, relayout_nodes, effective_ctx, nullptr);
                 if (rebuilt.success && rebuilt.layout.fits_cluster &&
                         g_registry.apply_layout(model_id, rebuilt.layout, nullptr)) {
                     store_runtime_plan_for_layout(model_id, rebuilt.layout, node_map);
@@ -3153,6 +3167,7 @@ static int session_create_core(const json & body, json & out) {
         session.repeat_last_n  = body.value("repeat_last_n", 64);
         session.seed           = body.value("seed", 0xFFFFFFFFu);
         session.progress_id    = progress_id;
+        session.n_ctx          = effective_ctx;
 
         std::string err;
         if (!setup_runtime_graph(session.session_id, n_layers, assignments, node_map, mem, session, err)) {
@@ -3192,6 +3207,13 @@ static int session_create_core(const json & body, json & out) {
                 { "kv_gb", mem.kv_gb() },
                 { "compute_gb", mem.compute_gb() },
                 { "scratch_gb", mem.scratch_gb() },
+            }},
+            // What the pipeline can actually hold, so a caller can size
+            // max_tokens instead of discovering the limit by hitting it.
+            { "context", {
+                { "n_ctx", session.n_ctx },
+                { "model_native_n_ctx", model_native_ctx },
+                { "requested_n_ctx", request_ctx },
             }},
         };
         out = response;

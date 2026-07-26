@@ -851,6 +851,10 @@ int main(int argc, char ** argv) {
     int tc_port = -1;
     split_gen_sampler_params sampler_params{};
 
+    // KV context for this stage. Every pipeline stage must agree on it;
+    // the orchestrator sends the session's value via --ctx-size.
+    int ctx_size = 4096;
+
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--bc-port") == 0 && i + 1 < argc) {
             bc_port = atoi(argv[++i]);
@@ -894,6 +898,11 @@ int main(int argc, char ** argv) {
             sampler_params.repeat_last_n = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             sampler_params.seed = (uint32_t) strtoul(argv[++i], nullptr, 10);
+        } else if (strcmp(argv[i], "--ctx-size") == 0 && i + 1 < argc) {
+            ctx_size = atoi(argv[++i]);
+            if (ctx_size < 512) {
+                ctx_size = 512;
+            }
         } else {
             usage(argv[0]);
             return 1;
@@ -933,7 +942,7 @@ int main(int argc, char ** argv) {
     }
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx   = 512;
+    cparams.n_ctx   = (uint32_t) ctx_size;
     cparams.n_batch = 512;
     // n_ubatch > 1 so a k+1-token verify wave runs as ONE graph compute
     // (memory-bound, ~one token's cost) instead of k+1 sequential

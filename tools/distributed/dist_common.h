@@ -146,6 +146,11 @@ struct dist_configure_req {
     float          repeat_penalty = 1.0f;
     int            repeat_last_n  = 64;
     unsigned int   seed           = 0xFFFFFFFF;  // LLAMA_DEFAULT_SEED
+    // KV-cache context for this session's workers. Every worker used to
+    // hardcode 512, which silently capped generation at ~500 tokens no matter
+    // what the model supported or what the planner had already reserved
+    // memory for. Carried per session so the two finally agree.
+    int            n_ctx          = 4096;
 };
 
 struct dist_gen_resp {

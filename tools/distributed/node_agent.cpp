@@ -245,6 +245,10 @@ static bool g_external_embedding = false;
 static std::string g_embedding_service_host;
 static int g_embedding_service_port = 0;
 static llama_model * g_output_service_model = nullptr;
+// Context size for the per-node services (embedding, output head). Set from
+// the session's configure request; the 4096 default only applies before any
+// session has configured this node.
+static int g_service_n_ctx = 4096;
 static llama_context * g_output_service_ctx = nullptr;
 static llama_sampler * g_output_service_smpl = nullptr;
 // Sampling settings for the output service. Set by /runtime/output/configure
@@ -313,7 +317,7 @@ static bool ensure_embedding_service_loaded(std::string & err) {
     }
     g_embedding_service_n_embd = llama_model_n_embd(g_embedding_service_model);
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx   = 512;
+    cparams.n_ctx   = (uint32_t) std::max(512, g_service_n_ctx);
     cparams.n_batch = 512;
     cparams.no_perf = true;
     g_embedding_service_ctx = llama_init_from_model(g_embedding_service_model, cparams);
@@ -530,7 +534,7 @@ static bool ensure_output_service_loaded(std::string & err) {
     g_output_service_n_vocab = llama_vocab_n_tokens(
             llama_model_get_vocab(g_output_service_model));
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx   = 512;
+    cparams.n_ctx   = (uint32_t) std::max(512, g_service_n_ctx);
     cparams.n_batch = 512;
     cparams.no_perf = true;
     g_output_service_ctx = llama_init_from_model(g_output_service_model, cparams);
@@ -1063,6 +1067,13 @@ static dist_configure_req parse_configure(const json & body) {
     req.draft_k     = body.value("draft_k", 4);
     req.tc_port     = body.value("tc_port", 0);
     req.tc_host     = body.value("tc_host", "127.0.0.1");
+    req.n_ctx       = body.value("n_ctx", 4096);
+    if (req.n_ctx > 0) {
+        // Services on this node share the session's context; without this the
+        // output head would still be built with the old 512-token cache and
+        // would fail as soon as a position ran past it.
+        g_service_n_ctx = req.n_ctx;
+    }
     if (body.contains("sampling") && body["sampling"].is_object()) {
         const auto & s = body["sampling"];
         req.temp           = s.value("temp", 0.0f);
@@ -2088,6 +2099,14 @@ static bool start_worker(
     } else {
         err = "invalid role";
         return false;
+    }
+
+    // Every pipeline stage holds KV for the same sequence, so they must all
+    // agree on the context size -- a stage with a smaller cache would be the
+    // one to fail mid-generation.
+    if (cfg.n_ctx > 0) {
+        args.push_back("--ctx-size");
+        args.push_back(std::to_string(cfg.n_ctx));
     }
 
     if (dist_debug_enabled()) {
