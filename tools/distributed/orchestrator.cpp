@@ -1115,6 +1115,15 @@ static void stop_session_workers_async(const dist_session & session) {
     }).detach();
 }
 
+// How many times in a row a model may be relaid out without reaching READY
+// before this stops trying. Guards the feedback loop described below: a
+// relayout that does not fix the model leaves it non-READY, which qualifies it
+// for another relayout on the next cluster change, and so on.
+static constexpr int OPTIMIZE_FUTILE_ATTEMPT_LIMIT = 2;
+
+static std::mutex g_optimize_attempt_mu;
+static std::map<std::string, int> g_optimize_attempts;
+
 static void trigger_cluster_optimization_async() {
     std::thread([]() {
         const auto models = g_registry.list();
@@ -1124,8 +1133,53 @@ static void trigger_cluster_optimization_async() {
             }
             if (model.coverage.has_value() &&
                     model.coverage->state == coverage_state::ready) {
+                // Healthy again -- forget any earlier futile attempts so a
+                // later, genuine problem still gets its retries.
+                std::lock_guard<std::mutex> lock(g_optimize_attempt_mu);
+                g_optimize_attempts.erase(model.model_id);
                 continue;
             }
+
+            // Every layer is present and intact, so the LAYOUT is not the
+            // problem -- what is left is stale state from an earlier layout
+            // (blobs sitting on nodes the current plan no longer uses).
+            //
+            // Relaying out here is actively harmful: it moves the expected
+            // placement again and orphans a fresh set of blobs, which keeps
+            // the model non-READY, which qualifies it for yet another
+            // relayout on the next cluster change. Observed on gemma-3-1b,
+            // which came back DEGRADED after every restart with 0 missing and
+            // 0 corrupted layers -- its repair plan was 479 operations, all
+            // DELETE, zero bytes to download.
+            //
+            // Cleanup is left to an explicit request (the Models screen's
+            // repair action) rather than started here, because it deletes
+            // data and a background sweep is the wrong place to decide that.
+            if (model.coverage.has_value() &&
+                    model.coverage->total_layers > 0 &&
+                    model.coverage->missing_layers == 0 &&
+                    model.coverage->corrupted_layers == 0 &&
+                    model.coverage->ready_layers == model.coverage->total_layers) {
+                fprintf(stderr,
+                        "orchestrator: %s has all %d layers but is not READY -- stale blobs from "
+                        "a previous layout; skipping relayout (repair it to clean them up)\n",
+                        model.model_id.c_str(), model.coverage->total_layers);
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_optimize_attempt_mu);
+                const int attempts = g_optimize_attempts[model.model_id];
+                if (attempts >= OPTIMIZE_FUTILE_ATTEMPT_LIMIT) {
+                    fprintf(stderr,
+                            "orchestrator: %s still not READY after %d relayout attempts -- "
+                            "not trying again automatically\n",
+                            model.model_id.c_str(), attempts);
+                    continue;
+                }
+                g_optimize_attempts[model.model_id] = attempts + 1;
+            }
+
             const optimization_result result = optimize_registered_model(model.model_id);
             if (result.decision == optimizer_decision::rebalance) {
                 coordinate_rebalance_pipeline(model.model_id);
