@@ -3047,6 +3047,56 @@ static int session_create_core(const json & body, json & out) {
             }
         }
 
+        // Self-heal a structurally unusable stored layout before anything acts
+        // on it. A layout that puts every layer on one node yields a one-stage
+        // pipeline, which this runtime cannot build (no final role) -- and
+        // since /models/<id>/layout serves the cached copy, it would never fix
+        // itself. Recomputing is cheap and bounded, so it is done inline.
+        //
+        // Deliberately limited to the STRUCTURALLY BROKEN case, not "the
+        // layout looks suboptimal": recomputing changes where layers are
+        // expected to live, which can strand already-installed blobs. The
+        // coverage gate immediately below is what then reports that honestly.
+        // Repairing the data itself (re-syncing gigabytes between nodes) is
+        // never started from here -- a session-create request is not consent
+        // to a multi-minute download.
+        if (record->layout.has_value() && record->manifest.has_value() &&
+                !record->layout->desired.placements.empty()) {
+            std::set<std::string> layout_nodes;
+            for (const auto & p : record->layout->desired.placements) {
+                layout_nodes.insert(p.node_id);
+            }
+            if (layout_nodes.size() < 2 && node_map.size() >= 2) {
+                fprintf(stderr,
+                        "orchestrator: stored layout for %s uses %zu node(s) but %zu are online "
+                        "-- recomputing before session setup\n",
+                        model_id.c_str(), layout_nodes.size(), node_map.size());
+                progress_set(progress_id, "relayout");
+
+                std::vector<layout_node_input> relayout_nodes;
+                for (const auto & kv : node_map) {
+                    relayout_nodes.push_back(layout_node_from_dist(kv.second));
+                }
+                const auto rebuilt = build_desired_layout(
+                        model_id, *record->manifest, relayout_nodes, request_ctx, nullptr);
+                if (rebuilt.success && rebuilt.layout.fits_cluster &&
+                        g_registry.apply_layout(model_id, rebuilt.layout, nullptr)) {
+                    store_runtime_plan_for_layout(model_id, rebuilt.layout, node_map);
+                    sync_model_state_from_cluster(model_id, false);
+                    persist_registry();
+                    record = g_registry.find(model_id);
+                    if (record == nullptr) {
+                        out = json({ { "error", "model vanished during relayout" } });
+                        return 500;
+                    }
+                    fprintf(stderr, "orchestrator: layout for %s recomputed\n", model_id.c_str());
+                } else {
+                    fprintf(stderr, "orchestrator: relayout of %s failed: %s\n",
+                            model_id.c_str(), rebuilt.error.c_str());
+                }
+            }
+        }
+
         progress_set(progress_id, "coverage_check");
         // Gate session on runtime blob coverage matching the stored install plan.
         if (record->layout.has_value() && record->manifest.has_value()) {
