@@ -2886,6 +2886,350 @@ static void usage(const char * prog) {
             prog);
 }
 
+// Core of session creation, extracted so the OpenAI-compatible endpoint can
+// create sessions without re-entering the HTTP server (a self-call would
+// occupy a second pool thread for the whole multi-minute create).
+// Returns the HTTP status; `out` is the full response body in every case,
+// success or failure, so the wire format is unchanged.
+static int session_create_core(const json & body, json & out) {
+
+        const std::string model_id = body.value("model", "");
+        const int request_ctx = body.value("n_ctx", g_n_ctx);
+        // Optional client-supplied id so a slow create can be watched through
+        // GET /session/progress/{id}. Absent -> no tracking, exactly as before.
+        const std::string progress_id = body.value("progress_id", "");
+        progress_begin(progress_id);
+        // Every early return below is a failure the watcher has to observe,
+        // otherwise the UI would poll a stuck "in progress" forever.
+        struct progress_fail_guard {
+            std::string id;
+            bool handled = false;
+            ~progress_fail_guard() {
+                if (!handled) {
+                    progress_fail(id, "session create failed");
+                }
+            }
+        } progress_guard{progress_id};
+
+        // Workers are spawned during this call (setup_runtime_graph ->
+        // configure_node -> perf_attach_trace), and DIST_PERF_TRACE is only
+        // readable by a worker once, at its own process start -- a later
+        // /session/generate enabling tracing can never reach an
+        // already-spawned worker. Without this, whether a worker gets
+        // traced depends on whichever stale enabled-state this orchestrator
+        // process happened to be sitting in, not on this request.
+        if (body.value("perf_trace", false) && !perf_trace_enabled()) {
+            dist_set_env("DIST_PERF_TRACE", "1");
+            perf_trace_reload_config();
+        }
+
+        if (model_id.empty()) {
+            out = json({ { "error", "model id required" } });
+            return 400;
+        }
+
+        dist_rss_scope rss("session_create", model_id.c_str());
+
+        const dist_model_record * record = g_registry.find(model_id);
+        if (!record) {
+            out = json({ { "error", "model not registered" } });
+            return 404;
+        }
+
+        std::map<std::string, dist_node_info> node_map;
+        int n_layers = 0;
+        if (record->manifest.has_value() && record->manifest->n_layer > 0) {
+            n_layers = static_cast<int>(record->manifest->n_layer);
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            for (const auto & kv : g_nodes) {
+                if (kv.second.online) {
+                    node_map[kv.first] = kv.second;
+                    if (n_layers <= 0 && kv.second.n_layer > 0) {
+                        n_layers = std::max(n_layers, kv.second.n_layer);
+                    }
+                }
+            }
+        }
+
+        if (node_map.size() < 1) {
+            out = json({ { "error", "need at least 1 registered node" } });
+            return 503;
+        }
+
+        const model_memory_requirements mem = get_model_memory_for_record(*record, request_ctx);
+        if (!mem.valid()) {
+            out = json({ { "error", "failed to estimate model memory" } });
+            return 503;
+        }
+
+        std::vector<dist_node_info> node_vec;
+        node_vec.reserve(node_map.size());
+        for (const auto & kv : node_map) {
+            node_vec.push_back(kv.second);
+        }
+        const cluster_memory_fits_result fit = dist_check_cluster_memory_fit(mem, node_vec);
+
+        if (!fit.fits) {
+            out = fit.to_json();
+            out["error"] = "model does not fit in cluster memory";
+            return 503;
+        }
+
+        std::vector<dist_planner_node_resources> planner_nodes;
+        planner_nodes.reserve(node_map.size());
+        for (const auto & kv : node_map) {
+            const auto & n = kv.second;
+            dist_planner_node_resources r{};
+            r.node_id        = n.node_id;
+            r.score          = n.score;
+            r.backend        = n.caps.gpu_backend;
+            r.has_gpu        = n.memory.has_gpu;
+            r.cpu_budget_bytes = n.memory.free_ram_bytes;
+            r.gpu_budget_bytes = n.memory.free_vram_bytes;
+            planner_nodes.push_back(r);
+        }
+
+        std::vector<dist_layer_assignment> assignments;
+        {
+            perf_session_span layout_span("SESSION_RESOLVE_LAYOUT", "orchestrator", "orchestrator");
+            if (record->layout.has_value() &&
+                    layout_has_full_coverage(record->layout->desired, n_layers)) {
+                assignments = assignments_from_desired_layout(
+                        record->layout->desired, node_map, n_layers);
+            }
+
+            if (assignments.empty()) {
+                const dist_planner_result plan = dist_plan_layers_memory_aware(mem, planner_nodes);
+                if (!plan.success) {
+                    out = fit.to_json();
+                    out["error"] = plan.error;
+                    out["planning_error"] = true;
+                    return 503;
+                }
+                assignments = plan.assignments;
+            }
+        }
+
+        dist_print_planner_report(record->model_id, mem, node_vec, fit, assignments);
+
+        const json planned = planned_layout_json(assignments);
+
+        for (const auto & kv : node_map) {
+            std::string herr;
+            if (!check_node_health(kv.second, herr)) {
+                out = json({
+                    { "error", herr },
+                    { "layout", planned },
+                });
+                return 503;
+            }
+        }
+
+        progress_set(progress_id, "coverage_check");
+        // Gate session on runtime blob coverage matching the stored install plan.
+        if (record->layout.has_value() && record->manifest.has_value()) {
+            perf_session_span coverage_span("SESSION_COVERAGE_CHECK", "orchestrator", "orchestrator");
+            actual_model_layout actual;
+            std::set<std::string> online_nodes;
+            poll_installed_layers_from_nodes(model_id, actual, online_nodes);
+
+            const semantic_runtime_descriptor rt =
+                    build_semantic_runtime_descriptor(*record->manifest);
+            const std::optional<runtime_install_node_map> runtime_nodes =
+                    runtime_install_nodes_for_layout(*record, record->layout->desired, node_map);
+            const runtime_install_node_map * runtime_ptr =
+                    runtime_nodes.has_value() ? &*runtime_nodes : nullptr;
+            const runtime_coverage_report rt_cov = compute_runtime_coverage(
+                    rt, record->layout->desired, actual, online_nodes, runtime_ptr);
+
+            if (!rt_cov.fully_ready()) {
+                out = rt_cov.to_json();
+                out["error"] = "runtime coverage not ready";
+                return 503;
+            }
+        }
+
+        const std::string session_id = make_id("sess");
+        const bool perf_on = perf_trace_enabled();
+        if (perf_on) {
+            perf_trace_set_component("orchestrator");
+            perf_trace_set_node_id("orchestrator");
+            perf_trace_begin_session(perf_make_session_trace_id(session_id), "session");
+        }
+        struct session_trace_end_guard {
+            bool active = false;
+            ~session_trace_end_guard() {
+                if (active) {
+                    perf_trace_end_session();
+                }
+            }
+        } session_trace_guard{perf_on};
+
+        dist_session session{};
+        session.session_id = session_id;
+        session.model      = record->model_id;
+        session.speculative_draft_model_url = body.value("speculative_draft_model_url", "");
+        session.speculative_draft_k         = body.value("speculative_draft_k", 4);
+        // Sampling settings are fixed for the session's lifetime: workers build
+        // their sampler chain once at spawn, so changing these needs a new
+        // session rather than a per-request override.
+        session.temp           = body.value("temp", 0.0f);
+        session.top_k          = body.value("top_k", 1);
+        session.top_p          = body.value("top_p", 1.0f);
+        session.min_p          = body.value("min_p", 0.0f);
+        session.repeat_penalty = body.value("repeat_penalty", 1.0f);
+        session.repeat_last_n  = body.value("repeat_last_n", 64);
+        session.seed           = body.value("seed", 0xFFFFFFFFu);
+        session.progress_id    = progress_id;
+
+        std::string err;
+        if (!setup_runtime_graph(session.session_id, n_layers, assignments, node_map, mem, session, err)) {
+            progress_fail(progress_id, err);
+            progress_guard.handled = true;
+            out = json({
+                { "error", err },
+                { "layout", planned },
+            });
+            return 500;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            session.created_at_ms = (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            g_sessions[session.session_id] = session;
+        }
+
+        progress_finish(progress_id, session.session_id);
+        progress_guard.handled = true;
+
+        fprintf(stderr, "orchestrator: session %s layout:", session.session_id.c_str());
+        for (const auto & s : session.pipeline) {
+            fprintf(stderr, " %s=[%d,%d)", s.node_id.c_str(), s.layer_start, s.layer_end);
+        }
+        fprintf(stderr, "\n");
+
+        json response = {
+            { "session_id", session.session_id },
+            { "layout", layout_json(session) },
+            { "pipeline", pipeline_json(session) },
+            { "runtime_graph", session.runtime.to_json() },
+            { "memory", {
+                { "required_gb", mem.total_gb() },
+                { "weights_gb", mem.weights_gb() },
+                { "kv_gb", mem.kv_gb() },
+                { "compute_gb", mem.compute_gb() },
+                { "scratch_gb", mem.scratch_gb() },
+            }},
+        };
+        out = response;
+        return 200;
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI-compatible surface
+//
+// The impedance mismatch this bridges: an OpenAI client names a model on every
+// request and knows nothing about sessions, while this runtime needs an
+// explicit create (seconds warm, minutes cold -- it spawns workers and loads
+// weights) before it can generate. So sessions are cached and reused, keyed by
+// model plus the sampling settings, because workers bake the sampler chain in
+// at spawn time and a different temperature genuinely needs a different
+// session.
+//
+// The whole surface is serialized on one mutex. That is not laziness: the
+// runtime is single-stream by design (multi-tenant batching is Task 23, out of
+// scope), so two concurrent generations would contend for the same workers
+// anyway. Serializing makes the behavior predictable instead of racy.
+// ---------------------------------------------------------------------------
+
+static std::mutex g_oai_mu;
+
+struct oai_cached_session {
+    std::string session_id;
+    int64_t     last_used_ms = 0;
+};
+
+static std::map<std::string, oai_cached_session> g_oai_sessions;
+
+// Sessions hold worker processes and weights on every node, so an abandoned
+// one is expensive. Reclaim after this much idle time.
+static constexpr int64_t OAI_SESSION_IDLE_MS = 15 * 60 * 1000;
+
+static std::string oai_cache_key(const json & body) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "|t=%.4f|k=%d|p=%.4f|mp=%.4f|rp=%.4f|rn=%d|s=%u",
+            body.value("temp", 0.0f), body.value("top_k", 1), body.value("top_p", 1.0f),
+            body.value("min_p", 0.0f), body.value("repeat_penalty", 1.0f),
+            body.value("repeat_last_n", 64), body.value("seed", 0xFFFFFFFFu));
+    return body.value("model", "") + buf;
+}
+
+static void oai_destroy_session(const std::string & session_id) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    const auto it = g_sessions.find(session_id);
+    if (it != g_sessions.end()) {
+        stop_session_workers_async(it->second);
+        g_sessions.erase(it);
+    }
+}
+
+// Called with g_oai_mu held.
+static void oai_evict_idle_locked(const std::string & keep_key) {
+    const int64_t now = progress_now_ms();
+    for (auto it = g_oai_sessions.begin(); it != g_oai_sessions.end();) {
+        if (it->first == keep_key || now - it->second.last_used_ms < OAI_SESSION_IDLE_MS) {
+            ++it;
+            continue;
+        }
+        fprintf(stderr, "orchestrator: openai session %s idle, releasing\n",
+                it->second.session_id.c_str());
+        oai_destroy_session(it->second.session_id);
+        it = g_oai_sessions.erase(it);
+    }
+}
+
+// Resolves (creating if needed) the session backing this request. Returns an
+// empty string and fills `err`/`status` on failure.
+static std::string oai_session_for(const json & create_body, std::string & err, int & status) {
+    const std::string key = oai_cache_key(create_body);
+    oai_evict_idle_locked(key);
+
+    const auto it = g_oai_sessions.find(key);
+    if (it != g_oai_sessions.end()) {
+        bool alive = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            alive = g_sessions.count(it->second.session_id) > 0;
+        }
+        if (alive) {
+            it->second.last_used_ms = progress_now_ms();
+            return it->second.session_id;
+        }
+        // Destroyed out from under us (dashboard, restart) -- fall through.
+        g_oai_sessions.erase(it);
+    }
+
+    json out;
+    status = session_create_core(create_body, out);
+    if (status != 200) {
+        err = out.value("error", "session create failed");
+        return {};
+    }
+    const std::string session_id = out.value("session_id", "");
+    if (session_id.empty()) {
+        status = 500;
+        err = "session create returned no id";
+        return {};
+    }
+    g_oai_sessions[key] = oai_cached_session{ session_id, progress_now_ms() };
+    fprintf(stderr, "orchestrator: openai session %s created for %s\n",
+            session_id.c_str(), key.c_str());
+    return session_id;
+}
+
 int main(int argc, char ** argv) {
     std::string listen = "0.0.0.0:9000";
 
@@ -3268,251 +3612,136 @@ int main(int argc, char ** argv) {
             res.set_content(R"({"error":"invalid json"})", "application/json");
             return;
         }
+        json out;
+        res.status = session_create_core(body, out);
+        res.set_content(out.dump(), "application/json");
+    });
 
-        const std::string model_id = body.value("model", "");
-        const int request_ctx = body.value("n_ctx", g_n_ctx);
-        // Optional client-supplied id so a slow create can be watched through
-        // GET /session/progress/{id}. Absent -> no tracking, exactly as before.
-        const std::string progress_id = body.value("progress_id", "");
-        progress_begin(progress_id);
-        // Every early return below is a failure the watcher has to observe,
-        // otherwise the UI would poll a stuck "in progress" forever.
-        struct progress_fail_guard {
-            std::string id;
-            bool handled = false;
-            ~progress_fail_guard() {
-                if (!handled) {
-                    progress_fail(id, "session create failed");
-                }
+    // GET /v1/models -- OpenAI shape. Only models that are actually installed
+    // are listed; a client picking one from here should be able to use it.
+    svr.Get("/v1/models", [](const httplib::Request &, httplib::Response & res) {
+        json data = json::array();
+        for (const auto & m : g_registry.list()) {
+            const bool ready = m.coverage.has_value() &&
+                    m.coverage->state == coverage_state::ready;
+            if (!ready) {
+                continue;
             }
-        } progress_guard{progress_id};
-
-        // Workers are spawned during this call (setup_runtime_graph ->
-        // configure_node -> perf_attach_trace), and DIST_PERF_TRACE is only
-        // readable by a worker once, at its own process start -- a later
-        // /session/generate enabling tracing can never reach an
-        // already-spawned worker. Without this, whether a worker gets
-        // traced depends on whichever stale enabled-state this orchestrator
-        // process happened to be sitting in, not on this request.
-        if (body.value("perf_trace", false) && !perf_trace_enabled()) {
-            dist_set_env("DIST_PERF_TRACE", "1");
-            perf_trace_reload_config();
+            data.push_back({
+                { "id", m.model_id },
+                { "object", "model" },
+                { "created", 0 },
+                { "owned_by", "distributed-llm" },
+            });
         }
+        res.set_content(json({ { "object", "list" }, { "data", data } }).dump(), "application/json");
+    });
 
-        if (model_id.empty()) {
-            res.status = 400;
-            res.set_content(json({ { "error", "model id required" } }).dump(), "application/json");
+    // POST /v1/chat/completions -- OpenAI shape, non-streaming.
+    svr.Post("/v1/chat/completions", [](const httplib::Request & req, httplib::Response & res) {
+        const auto fail = [&res](int status, const std::string & message, const std::string & type) {
+            res.status = status;
+            res.set_content(json({ { "error", {
+                { "message", message }, { "type", type }, { "code", nullptr },
+            } } }).dump(), "application/json");
+        };
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            fail(400, "invalid json", "invalid_request_error");
             return;
         }
 
-        dist_rss_scope rss("session_create", model_id.c_str());
-
-        const dist_model_record * record = g_registry.find(model_id);
-        if (!record) {
-            res.status = 404;
-            res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
+        const std::string model = body.value("model", "");
+        if (model.empty()) {
+            fail(400, "model required", "invalid_request_error");
+            return;
+        }
+        if (!body.contains("messages") || !body["messages"].is_array() || body["messages"].empty()) {
+            fail(400, "messages required", "invalid_request_error");
+            return;
+        }
+        if (body.value("stream", false)) {
+            // Better an explicit refusal than silently returning a
+            // non-streaming body a streaming client will fail to parse.
+            fail(400, "streaming is not supported yet; set stream=false", "invalid_request_error");
             return;
         }
 
-        std::map<std::string, dist_node_info> node_map;
-        int n_layers = 0;
-        if (record->manifest.has_value() && record->manifest->n_layer > 0) {
-            n_layers = static_cast<int>(record->manifest->n_layer);
+        // OpenAI names only a subset of what the sampler chain takes; the rest
+        // stay at this runtime's defaults.
+        json create_body = { { "model", model } };
+        if (body.contains("temperature")) create_body["temp"] = body["temperature"].get<float>();
+        if (body.contains("top_p"))       create_body["top_p"] = body["top_p"].get<float>();
+        if (body.contains("seed"))        create_body["seed"] = body["seed"].get<unsigned int>();
+        if (body.contains("frequency_penalty")) {
+            create_body["repeat_penalty"] = 1.0f + body["frequency_penalty"].get<float>();
         }
-        {
-            std::lock_guard<std::mutex> lock(g_mu);
-            for (const auto & kv : g_nodes) {
-                if (kv.second.online) {
-                    node_map[kv.first] = kv.second;
-                    if (n_layers <= 0 && kv.second.n_layer > 0) {
-                        n_layers = std::max(n_layers, kv.second.n_layer);
-                    }
-                }
-            }
+        // A temperature above zero has to leave the greedy path, otherwise the
+        // request would silently sample deterministically anyway.
+        if (create_body.value("temp", 0.0f) > 0.0f && !create_body.contains("top_k")) {
+            create_body["top_k"] = 0;   // 0 -> disabled, consider the whole vocab
         }
 
-        if (node_map.size() < 1) {
-            res.status = 503;
-            res.set_content(json({ { "error", "need at least 1 registered node" } }).dump(), "application/json");
-            return;
-        }
-
-        const model_memory_requirements mem = get_model_memory_for_record(*record, request_ctx);
-        if (!mem.valid()) {
-            res.status = 503;
-            res.set_content(json({ { "error", "failed to estimate model memory" } }).dump(), "application/json");
-            return;
-        }
-
-        std::vector<dist_node_info> node_vec;
-        node_vec.reserve(node_map.size());
-        for (const auto & kv : node_map) {
-            node_vec.push_back(kv.second);
-        }
-        const cluster_memory_fits_result fit = dist_check_cluster_memory_fit(mem, node_vec);
-
-        if (!fit.fits) {
-            res.status = 503;
-            json err = fit.to_json();
-            err["error"] = "model does not fit in cluster memory";
-            res.set_content(err.dump(), "application/json");
-            return;
-        }
-
-        std::vector<dist_planner_node_resources> planner_nodes;
-        planner_nodes.reserve(node_map.size());
-        for (const auto & kv : node_map) {
-            const auto & n = kv.second;
-            dist_planner_node_resources r{};
-            r.node_id        = n.node_id;
-            r.score          = n.score;
-            r.backend        = n.caps.gpu_backend;
-            r.has_gpu        = n.memory.has_gpu;
-            r.cpu_budget_bytes = n.memory.free_ram_bytes;
-            r.gpu_budget_bytes = n.memory.free_vram_bytes;
-            planner_nodes.push_back(r);
-        }
-
-        std::vector<dist_layer_assignment> assignments;
-        {
-            perf_session_span layout_span("SESSION_RESOLVE_LAYOUT", "orchestrator", "orchestrator");
-            if (record->layout.has_value() &&
-                    layout_has_full_coverage(record->layout->desired, n_layers)) {
-                assignments = assignments_from_desired_layout(
-                        record->layout->desired, node_map, n_layers);
-            }
-
-            if (assignments.empty()) {
-                const dist_planner_result plan = dist_plan_layers_memory_aware(mem, planner_nodes);
-                if (!plan.success) {
-                    res.status = 503;
-                    json err = fit.to_json();
-                    err["error"] = plan.error;
-                    err["planning_error"] = true;
-                    res.set_content(err.dump(), "application/json");
-                    return;
-                }
-                assignments = plan.assignments;
-            }
-        }
-
-        dist_print_planner_report(record->model_id, mem, node_vec, fit, assignments);
-
-        const json planned = planned_layout_json(assignments);
-
-        for (const auto & kv : node_map) {
-            std::string herr;
-            if (!check_node_health(kv.second, herr)) {
-                res.status = 503;
-                res.set_content(json({
-                    { "error", herr },
-                    { "layout", planned },
-                }).dump(), "application/json");
-                return;
-            }
-        }
-
-        progress_set(progress_id, "coverage_check");
-        // Gate session on runtime blob coverage matching the stored install plan.
-        if (record->layout.has_value() && record->manifest.has_value()) {
-            perf_session_span coverage_span("SESSION_COVERAGE_CHECK", "orchestrator", "orchestrator");
-            actual_model_layout actual;
-            std::set<std::string> online_nodes;
-            poll_installed_layers_from_nodes(model_id, actual, online_nodes);
-
-            const semantic_runtime_descriptor rt =
-                    build_semantic_runtime_descriptor(*record->manifest);
-            const std::optional<runtime_install_node_map> runtime_nodes =
-                    runtime_install_nodes_for_layout(*record, record->layout->desired, node_map);
-            const runtime_install_node_map * runtime_ptr =
-                    runtime_nodes.has_value() ? &*runtime_nodes : nullptr;
-            const runtime_coverage_report rt_cov = compute_runtime_coverage(
-                    rt, record->layout->desired, actual, online_nodes, runtime_ptr);
-
-            if (!rt_cov.fully_ready()) {
-                res.status = 503;
-                json err = rt_cov.to_json();
-                err["error"] = "runtime coverage not ready";
-                res.set_content(err.dump(), "application/json");
-                return;
-            }
-        }
-
-        const std::string session_id = make_id("sess");
-        const bool perf_on = perf_trace_enabled();
-        if (perf_on) {
-            perf_trace_set_component("orchestrator");
-            perf_trace_set_node_id("orchestrator");
-            perf_trace_begin_session(perf_make_session_trace_id(session_id), "session");
-        }
-        struct session_trace_end_guard {
-            bool active = false;
-            ~session_trace_end_guard() {
-                if (active) {
-                    perf_trace_end_session();
-                }
-            }
-        } session_trace_guard{perf_on};
-
-        dist_session session{};
-        session.session_id = session_id;
-        session.model      = record->model_id;
-        session.speculative_draft_model_url = body.value("speculative_draft_model_url", "");
-        session.speculative_draft_k         = body.value("speculative_draft_k", 4);
-        // Sampling settings are fixed for the session's lifetime: workers build
-        // their sampler chain once at spawn, so changing these needs a new
-        // session rather than a per-request override.
-        session.temp           = body.value("temp", 0.0f);
-        session.top_k          = body.value("top_k", 1);
-        session.top_p          = body.value("top_p", 1.0f);
-        session.min_p          = body.value("min_p", 0.0f);
-        session.repeat_penalty = body.value("repeat_penalty", 1.0f);
-        session.repeat_last_n  = body.value("repeat_last_n", 64);
-        session.seed           = body.value("seed", 0xFFFFFFFFu);
-        session.progress_id    = progress_id;
+        std::lock_guard<std::mutex> oai_lock(g_oai_mu);
 
         std::string err;
-        if (!setup_runtime_graph(session.session_id, n_layers, assignments, node_map, mem, session, err)) {
-            progress_fail(progress_id, err);
-            progress_guard.handled = true;
-            res.status = 500;
-            res.set_content(json({
-                { "error", err },
-                { "layout", planned },
-            }).dump(), "application/json");
+        int status = 200;
+        const std::string session_id = oai_session_for(create_body, err, status);
+        if (session_id.empty()) {
+            const int code = status == 200 ? 500 : status;
+            // Clients branch on this: a 404 for an unknown model is the
+            // caller's problem, a 503 from the cluster is ours.
+            fail(code, err, code < 500 ? "invalid_request_error" : "server_error");
             return;
         }
 
+        dist_session session{};
         {
             std::lock_guard<std::mutex> lock(g_mu);
-            session.created_at_ms = (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-            g_sessions[session.session_id] = session;
+            const auto it = g_sessions.find(session_id);
+            if (it == g_sessions.end()) {
+                fail(500, "session vanished", "server_error");
+                return;
+            }
+            session = it->second;
         }
 
-        progress_finish(progress_id, session.session_id);
-        progress_guard.handled = true;
+        const int max_tokens = body.value("max_tokens", DIST_MAX_NEW_TOKENS);
+        const json messages  = body["messages"];
 
-        fprintf(stderr, "orchestrator: session %s layout:", session.session_id.c_str());
-        for (const auto & s : session.pipeline) {
-            fprintf(stderr, " %s=[%d,%d)", s.node_id.c_str(), s.layer_start, s.layer_end);
+        json out_tokens = json::array();
+        std::string text;
+        json timing = json::object();
+        std::string gen_err;
+        if (!run_generation(session, "", max_tokens, out_tokens, text, gen_err,
+                    &timing, true, &messages)) {
+            fail(500, gen_err, "server_error");
+            return;
         }
-        fprintf(stderr, "\n");
 
-        json response = {
-            { "session_id", session.session_id },
-            { "layout", layout_json(session) },
-            { "pipeline", pipeline_json(session) },
-            { "runtime_graph", session.runtime.to_json() },
-            { "memory", {
-                { "required_gb", mem.total_gb() },
-                { "weights_gb", mem.weights_gb() },
-                { "kv_gb", mem.kv_gb() },
-                { "compute_gb", mem.compute_gb() },
-                { "scratch_gb", mem.scratch_gb() },
-            }},
-        };
-        res.set_content(response.dump(), "application/json");
+        const int64_t now_s = progress_now_ms() / 1000;
+        const int completion_tokens = (int) out_tokens.size();
+        res.set_content(json({
+            { "id", "chatcmpl-" + session_id },
+            { "object", "chat.completion" },
+            { "created", now_s },
+            { "model", model },
+            { "choices", json::array({ json{
+                { "index", 0 },
+                { "message", { { "role", "assistant" }, { "content", text } } },
+                // Nothing distinguishes "hit the token cap" from "the model
+                // stopped" at this layer yet, so report the honest generic value.
+                { "finish_reason", completion_tokens >= max_tokens ? "length" : "stop" },
+            } }) },
+            { "usage", {
+                { "prompt_tokens", 0 },
+                { "completion_tokens", completion_tokens },
+                { "total_tokens", completion_tokens },
+            } },
+        }).dump(), "application/json");
     });
 
     // GET /session/progress/{id} -- poll a create in flight. `id` is whatever
