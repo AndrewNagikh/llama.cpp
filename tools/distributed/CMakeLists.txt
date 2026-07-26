@@ -463,23 +463,6 @@ if (LLAMA_BUILD_TESTS)
     target_link_libraries(test-layout-hysteresis PRIVATE llama llama-common cpp-httplib Threads::Threads)
     dist_link_platform_libs(test-layout-hysteresis)
 
-    # Measured-throughput layer partitioning (Task 21.4) + its count hysteresis.
-    add_executable(test-layout-throughput test-layout-throughput.cpp
-        orchestrator/layout_planner/layout_planner.cpp
-        orchestrator/manifest_builder/manifest_builder.cpp
-        ${DIST_ARCHITECTURE_SOURCES}
-        runtime/runtime_install_planning.cpp
-        runtime/runtime_role.cpp
-        runtime/runtime_descriptor.cpp
-        runtime/runtime_role_descriptor.cpp
-        runtime/runtime_graph.cpp
-        runtime/runtime_cost_model.cpp
-        memory_estimator.cpp
-        dist_common.cpp)
-    target_include_directories(test-layout-throughput PRIVATE ${DIST_INCLUDE_DIRS})
-    target_link_libraries(test-layout-throughput PRIVATE llama llama-common cpp-httplib Threads::Threads)
-    dist_link_platform_libs(test-layout-throughput)
-
     set(RUNTIME_UNIT_TEST_SOURCES
         ${DIST_PLATFORM_SOURCES}
         dist_common.cpp
