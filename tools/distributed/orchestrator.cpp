@@ -92,6 +92,9 @@ struct dist_session {
     float        repeat_penalty = 1.0f;
     int          repeat_last_n  = 64;
     unsigned int seed           = 0xFFFFFFFF;
+    // Client-supplied correlation id for create-time progress reporting.
+    // Empty means the caller isn't watching, and no progress is recorded.
+    std::string progress_id;
 
     json sampling_json() const {
         return {
@@ -141,6 +144,127 @@ static json session_debug_json(const dist_session & session) {
 static std::mutex g_mu;
 static std::map<std::string, dist_node_info> g_nodes;
 static std::map<std::string, dist_session> g_sessions;
+
+// Session-create progress, keyed by a client-supplied correlation id.
+//
+// /session/create is one blocking call that can take from seconds (warm) to
+// minutes (cold, tens of GB of tensors to load), and the caller has no
+// session_id to poll with until it returns -- hence a correlation id the
+// client makes up and passes in. Omitting it disables tracking entirely, so
+// existing callers (soak, ceiling measurement, benchmark runner) are
+// unaffected.
+struct session_create_progress {
+    std::string phase;        // machine-readable stage key
+    std::string detail;       // which node / what is happening
+    int         step  = 0;    // 1-based within the phase, 0 = not countable
+    int         total = 0;
+    int64_t     started_ms = 0;
+    int64_t     updated_ms = 0;
+    bool        done   = false;
+    bool        failed = false;
+    std::string error;
+    std::string session_id;   // filled once the session exists
+
+    json to_json() const {
+        return {
+            { "phase", phase },
+            { "detail", detail },
+            { "step", step },
+            { "total", total },
+            { "started_ms", started_ms },
+            { "updated_ms", updated_ms },
+            { "elapsed_ms", updated_ms - started_ms },
+            { "done", done },
+            { "failed", failed },
+            { "error", error },
+            { "session_id", session_id },
+        };
+    }
+};
+
+static std::mutex g_progress_mu;
+static std::map<std::string, session_create_progress> g_session_progress;
+
+static int64_t progress_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Drop finished entries the client stopped polling for; without this the map
+// grows for the lifetime of the process.
+static void progress_gc_locked() {
+    const int64_t now = progress_now_ms();
+    for (auto it = g_session_progress.begin(); it != g_session_progress.end();) {
+        const bool stale = now - it->second.updated_ms > 10 * 60 * 1000;
+        it = stale ? g_session_progress.erase(it) : std::next(it);
+    }
+}
+
+static void progress_begin(const std::string & id) {
+    if (id.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_progress_mu);
+    progress_gc_locked();
+    session_create_progress p{};
+    p.phase      = "queued";
+    p.started_ms = progress_now_ms();
+    p.updated_ms = p.started_ms;
+    g_session_progress[id] = p;
+}
+
+static void progress_set(
+        const std::string & id,
+        const std::string & phase,
+        const std::string & detail = "",
+        int step = 0,
+        int total = 0) {
+    if (id.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_progress_mu);
+    const auto it = g_session_progress.find(id);
+    if (it == g_session_progress.end()) {
+        return;
+    }
+    it->second.phase      = phase;
+    it->second.detail     = detail;
+    it->second.step       = step;
+    it->second.total      = total;
+    it->second.updated_ms = progress_now_ms();
+}
+
+static void progress_finish(const std::string & id, const std::string & session_id) {
+    if (id.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_progress_mu);
+    const auto it = g_session_progress.find(id);
+    if (it == g_session_progress.end()) {
+        return;
+    }
+    it->second.phase      = "ready";
+    it->second.detail.clear();
+    it->second.done       = true;
+    it->second.session_id = session_id;
+    it->second.updated_ms = progress_now_ms();
+}
+
+static void progress_fail(const std::string & id, const std::string & error) {
+    if (id.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_progress_mu);
+    const auto it = g_session_progress.find(id);
+    if (it == g_session_progress.end()) {
+        return;
+    }
+    it->second.phase      = "failed";
+    it->second.done       = true;
+    it->second.failed     = true;
+    it->second.error      = error;
+    it->second.updated_ms = progress_now_ms();
+}
 static std::string g_model_path;
 static std::string g_models_dir;
 static int32_t g_n_ctx = 4096;
@@ -1757,6 +1881,9 @@ static bool setup_runtime_graph(
                 continue;
             }
 
+            progress_set(session.progress_id, "services",
+                    runtime_role_name(a.role) + " @ " + a.node_id);
+
             json prep = {
                 { "session_id", session_id },
                 { "model_id", session.model },
@@ -2012,12 +2139,17 @@ static bool setup_runtime_graph(
         }
 
         dist_rss_log_stage("prepare_runtime", stage.node_id.c_str());
+        // The long pole on a cold session: this is where each node loads its
+        // slice of tensors, up to tens of GB.
+        progress_set(session.progress_id, "prepare_nodes", stage.node_id,
+                (int) i + 1, (int) stages.size());
         if (!prepare_runtime_node(*node, prep, worker_ggufs[i], err, 600000)) {
             return false;
         }
     }
 
     if (draft_future.valid()) {
+        progress_set(session.progress_id, "draft_fetch", "");
         const auto [ok, result] = draft_future.get();
         if (ok) {
             session.speculative_draft_model_path = result;
@@ -2116,6 +2248,8 @@ static bool setup_runtime_graph(
             }
         }
 
+        progress_set(session.progress_id, "spawn_workers", stage.node_id,
+                (int) ri + 1, (int) stages.size());
         if (!configure_node(*node, cfg, err, 300000)) {
             return false;
         }
@@ -2124,12 +2258,15 @@ static bool setup_runtime_graph(
 #endif
     }
 
-    for (const auto & stage : stages) {
+    for (size_t si = 0; si < stages.size(); ++si) {
+        const auto & stage = stages[si];
         const dist_node_info * node = find_node(node_map, stage.node_id);
         if (!node) {
             err = "node vanished: " + stage.node_id;
             return false;
         }
+        progress_set(session.progress_id, "await_workers", stage.node_id,
+                (int) si + 1, (int) stages.size());
         if (!wait_node_worker_ready(*node, stage.role, err, 300000)) {
             return false;
         }
@@ -3134,6 +3271,21 @@ int main(int argc, char ** argv) {
 
         const std::string model_id = body.value("model", "");
         const int request_ctx = body.value("n_ctx", g_n_ctx);
+        // Optional client-supplied id so a slow create can be watched through
+        // GET /session/progress/{id}. Absent -> no tracking, exactly as before.
+        const std::string progress_id = body.value("progress_id", "");
+        progress_begin(progress_id);
+        // Every early return below is a failure the watcher has to observe,
+        // otherwise the UI would poll a stuck "in progress" forever.
+        struct progress_fail_guard {
+            std::string id;
+            bool handled = false;
+            ~progress_fail_guard() {
+                if (!handled) {
+                    progress_fail(id, "session create failed");
+                }
+            }
+        } progress_guard{progress_id};
 
         // Workers are spawned during this call (setup_runtime_graph ->
         // configure_node -> perf_attach_trace), and DIST_PERF_TRACE is only
@@ -3260,6 +3412,7 @@ int main(int argc, char ** argv) {
             }
         }
 
+        progress_set(progress_id, "coverage_check");
         // Gate session on runtime blob coverage matching the stored install plan.
         if (record->layout.has_value() && record->manifest.has_value()) {
             perf_session_span coverage_span("SESSION_COVERAGE_CHECK", "orchestrator", "orchestrator");
@@ -3316,9 +3469,12 @@ int main(int argc, char ** argv) {
         session.repeat_penalty = body.value("repeat_penalty", 1.0f);
         session.repeat_last_n  = body.value("repeat_last_n", 64);
         session.seed           = body.value("seed", 0xFFFFFFFFu);
+        session.progress_id    = progress_id;
 
         std::string err;
         if (!setup_runtime_graph(session.session_id, n_layers, assignments, node_map, mem, session, err)) {
+            progress_fail(progress_id, err);
+            progress_guard.handled = true;
             res.status = 500;
             res.set_content(json({
                 { "error", err },
@@ -3333,6 +3489,9 @@ int main(int argc, char ** argv) {
                     std::chrono::system_clock::now().time_since_epoch()).count();
             g_sessions[session.session_id] = session;
         }
+
+        progress_finish(progress_id, session.session_id);
+        progress_guard.handled = true;
 
         fprintf(stderr, "orchestrator: session %s layout:", session.session_id.c_str());
         for (const auto & s : session.pipeline) {
@@ -3354,6 +3513,20 @@ int main(int argc, char ** argv) {
             }},
         };
         res.set_content(response.dump(), "application/json");
+    });
+
+    // GET /session/progress/{id} -- poll a create in flight. `id` is whatever
+    // the client passed as progress_id on /session/create.
+    svr.Get(R"(/session/progress/([^/]+))", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string id = req.matches[1];
+        std::lock_guard<std::mutex> lock(g_progress_mu);
+        const auto it = g_session_progress.find(id);
+        if (it == g_session_progress.end()) {
+            res.status = 404;
+            res.set_content(json({ { "error", "unknown progress id" } }).dump(), "application/json");
+            return;
+        }
+        res.set_content(it->second.to_json().dump(), "application/json");
     });
 
     svr.Post("/planner/simulate", [](const httplib::Request & req, httplib::Response & res) {
