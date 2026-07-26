@@ -751,25 +751,41 @@ static const llama_vocab * tokenizer_service_vocab() {
     return g_tokenizer_service_model ? llama_model_get_vocab(g_tokenizer_service_model) : nullptr;
 }
 
-// Wraps a raw user prompt in the model's own chat template (single user
-// turn, assistant turn left open) instead of sending it as a bare string
-// -- instruct-tuned models otherwise treat the prompt as free-form text
-// continuation, not a question to answer. Returns false (leaving `prompt`
-// untouched) if the GGUF carries no chat template.
-static bool apply_chat_template_to_prompt(const llama_model * model, const std::string & prompt, std::string & out) {
+// Renders a whole conversation through the model's own chat template, with
+// the assistant turn left open. Instruct-tuned models otherwise treat the
+// input as free-form text to continue rather than a conversation to answer.
+// Returns false (leaving `out` untouched) if the GGUF carries no template.
+//
+// `roles` and `contents` are parallel arrays; they are kept as owned strings
+// by the caller because llama_chat_message holds bare pointers.
+static bool apply_chat_template_to_messages(
+        const llama_model * model,
+        const std::vector<std::string> & roles,
+        const std::vector<std::string> & contents,
+        std::string & out) {
     const char * tmpl = llama_model_chat_template(model, nullptr);
-    if (tmpl == nullptr || tmpl[0] == '\0') {
+    if (tmpl == nullptr || tmpl[0] == '\0' || roles.empty() || roles.size() != contents.size()) {
         return false;
     }
-    llama_chat_message msg{ "user", prompt.c_str() };
-    std::vector<char> buf(prompt.size() * 2 + 256);
-    int32_t n = llama_chat_apply_template(tmpl, &msg, 1, true, buf.data(), (int32_t) buf.size());
+
+    std::vector<llama_chat_message> msgs;
+    msgs.reserve(roles.size());
+    size_t total_chars = 0;
+    for (size_t i = 0; i < roles.size(); ++i) {
+        msgs.push_back(llama_chat_message{ roles[i].c_str(), contents[i].c_str() });
+        total_chars += roles[i].size() + contents[i].size();
+    }
+
+    std::vector<char> buf(total_chars * 2 + 256);
+    int32_t n = llama_chat_apply_template(
+            tmpl, msgs.data(), msgs.size(), true, buf.data(), (int32_t) buf.size());
     if (n < 0) {
         return false;
     }
     if ((size_t) n > buf.size()) {
         buf.resize((size_t) n);
-        n = llama_chat_apply_template(tmpl, &msg, 1, true, buf.data(), (int32_t) buf.size());
+        n = llama_chat_apply_template(
+                tmpl, msgs.data(), msgs.size(), true, buf.data(), (int32_t) buf.size());
         if (n < 0) {
             return false;
         }
@@ -2685,9 +2701,32 @@ int main(int argc, char ** argv) {
             res.set_content(R"({"ok":false,"error":"tokenizer service not configured"})", "application/json");
             return;
         }
-        if (body.value("chat", false) && g_tokenizer_service_model != nullptr) {
+        // messages[] renders the whole conversation; `chat` alone keeps the
+        // single-turn behavior for callers that still send a bare prompt.
+        if (g_tokenizer_service_model != nullptr) {
+            std::vector<std::string> roles;
+            std::vector<std::string> contents;
+            if (body.contains("messages") && body["messages"].is_array()) {
+                for (const auto & m : body["messages"]) {
+                    if (!m.is_object()) {
+                        continue;
+                    }
+                    const std::string role = m.value("role", "user");
+                    const std::string content = m.value("content", "");
+                    if (content.empty()) {
+                        continue;
+                    }
+                    roles.push_back(role);
+                    contents.push_back(content);
+                }
+            } else if (body.value("chat", false)) {
+                roles.push_back("user");
+                contents.push_back(prompt);
+            }
             std::string formatted;
-            if (apply_chat_template_to_prompt(g_tokenizer_service_model, prompt, formatted)) {
+            if (!roles.empty() &&
+                    apply_chat_template_to_messages(
+                            g_tokenizer_service_model, roles, contents, formatted)) {
                 prompt = formatted;
             }
         }

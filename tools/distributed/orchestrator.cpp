@@ -2596,7 +2596,8 @@ static bool run_generation(
         std::string & text_out,
         std::string & err,
         json * timing_out = nullptr,
-        bool apply_chat_template = false) {
+        bool apply_chat_template = false,
+        const json * messages = nullptr) {
     if (session.pipeline.empty()) {
         err = "empty pipeline";
         return false;
@@ -2635,7 +2636,10 @@ static bool run_generation(
         httplib::Client tcli(tok_assign->host.c_str(), tok_assign->http_port);
         tcli.set_connection_timeout(10, 0);
         tcli.set_read_timeout(60, 0);
-        const json tok_req = { { "prompt", prompt }, { "chat", apply_chat_template } };
+        json tok_req = { { "prompt", prompt }, { "chat", apply_chat_template } };
+        if (messages != nullptr && messages->is_array() && !messages->empty()) {
+            tok_req["messages"] = *messages;
+        }
         const auto tok_res = tcli.Post("/runtime/tokenizer/tokenize", tok_req.dump(), "application/json");
         if (!tok_res || tok_res->status != 200) {
             err = "tokenizer service failed on " + tok_assign->node_id;
@@ -3649,6 +3653,12 @@ int main(int argc, char ** argv) {
         const std::string prompt     = body.value("prompt", DEFAULT_GENERATE_PROMPT);
         const int max_tokens         = body.value("max_tokens", DIST_MAX_NEW_TOKENS);
         const bool chat_mode         = body.value("chat", false);
+        // messages[] carries a full conversation; the legacy single `prompt`
+        // string still works and is what the non-chat callers (ceiling
+        // measurement, soak scripts) send.
+        const json messages          = body.contains("messages") && body["messages"].is_array()
+                ? body["messages"] : json::array();
+        const json * messages_ptr    = messages.empty() ? nullptr : &messages;
 
         // Request-driven trace enablement: the benchmark harness runs on a
         // different host, so gating fanout on this process's env alone means
@@ -3684,7 +3694,7 @@ int main(int argc, char ** argv) {
         std::string text;
         std::string err;
         json pipeline_timing = json::object();
-        bool ok = run_generation(session, prompt, max_tokens, out_tokens, text, err, &pipeline_timing, chat_mode);
+        bool ok = run_generation(session, prompt, max_tokens, out_tokens, text, err, &pipeline_timing, chat_mode, messages_ptr);
         if (!ok) {
             const std::string first_err = err;
             std::string recovery_err;
@@ -3694,7 +3704,7 @@ int main(int argc, char ** argv) {
                 std::string retry_err;
                 json retry_tokens = json::array();
                 std::string retry_text;
-                if (run_generation(recovered, prompt, max_tokens, retry_tokens, retry_text, retry_err, &retry_timing, chat_mode)) {
+                if (run_generation(recovered, prompt, max_tokens, retry_tokens, retry_text, retry_err, &retry_timing, chat_mode, messages_ptr)) {
                     ok = true;
                     out_tokens = std::move(retry_tokens);
                     text = std::move(retry_text);
