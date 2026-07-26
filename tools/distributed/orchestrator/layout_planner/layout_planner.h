@@ -65,14 +65,6 @@ struct layout_node_input {
     bool        has_gpu = false;
     uint64_t    cpu_budget_bytes = 0;
     uint64_t    gpu_budget_bytes = 0;
-    // Measured RTT (p95, ms) to other nodes, keyed by peer node_id. Filled by
-    // the caller from each node's /network/stats (Task 19 level 2) before
-    // build_desired_layout() runs; left empty when unavailable, in which
-    // case entry placement falls back to the score-only order (see
-    // build_desired_layout's stage_order comment). Not populated by
-    // layout_node_from_dist() itself since network stats live outside
-    // dist_node_info -- the caller fills this in separately.
-    std::map<std::string, double> peer_rtt_p95_ms;
 };
 
 layout_node_input layout_node_from_dist(const dist_node_info & node);
