@@ -2054,6 +2054,26 @@ static bool setup_runtime_graph(
         stages.push_back(stage);
     }
 
+    // A one-stage pipeline is not a supported configuration: the role loop
+    // above assigns ENTRY on i == 0 and only reaches the FINAL branch for a
+    // later stage, so a single stage ends up with no final at all. Everything
+    // downstream then works against a pipeline that has no output head, no
+    // sampler placement and no fa/tc endpoints -- which crashed the whole
+    // orchestrator process when a layout concentrated every layer onto one
+    // node (2026-07-24, the Task 21.4 revert; see docs/KNOWN_ISSUES.md).
+    //
+    // Failing here turns that into a clean, explainable 500 instead of taking
+    // the process down. Supporting single-node inference properly is a
+    // separate piece of work -- this only refuses to pretend it works.
+    if (stages.size() < 2) {
+        err = "layout produced a " + std::to_string(stages.size()) +
+              "-stage pipeline; at least 2 stages are required. The stored "
+              "layout for this model likely concentrates every layer on one "
+              "node -- recompute it with POST /models/<id>/layout {\"force\":true} "
+              "and repair coverage afterwards.";
+        return false;
+    }
+
     // Task 19 Phase 3: draft placement follows `final` (SA). The draft is
     // a fixed model at a known URL -- no registry entry, just tell the
     // final node to fetch it (POST /draft/fetch). Kicked off now so it
