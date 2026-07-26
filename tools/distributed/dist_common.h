@@ -135,6 +135,17 @@ struct dist_configure_req {
     // and the normal chain response, it doesn't yet act on tc-link data.
     int            tc_port     = 0;
     std::string    tc_host;
+    // Sampling settings for whichever process ends up sampling (final worker,
+    // or the output service when the output head is on another node). Defaults
+    // here match the greedy chain used before these were configurable, so an
+    // omitted field keeps the old deterministic behavior.
+    float          temp           = 0.0f;
+    int            top_k          = 1;
+    float          top_p          = 1.0f;
+    float          min_p          = 0.0f;
+    float          repeat_penalty = 1.0f;
+    int            repeat_last_n  = 64;
+    unsigned int   seed           = 0xFFFFFFFF;  // LLAMA_DEFAULT_SEED
 };
 
 struct dist_gen_resp {

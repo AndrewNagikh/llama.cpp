@@ -247,6 +247,10 @@ static int g_embedding_service_port = 0;
 static llama_model * g_output_service_model = nullptr;
 static llama_context * g_output_service_ctx = nullptr;
 static llama_sampler * g_output_service_smpl = nullptr;
+// Sampling settings for the output service. Set by /runtime/output/configure
+// (and /runtime/sampler/configure) from the session's request; defaults are
+// the greedy chain, so an unconfigured service samples as it always did.
+static split_gen_sampler_params g_output_service_sampler_params{};
 static int32_t g_output_service_n_layer = 0;
 static int32_t g_output_service_n_vocab = 0;
 static bool g_external_output = false;
@@ -540,6 +544,35 @@ static bool ensure_output_service_loaded(std::string & err) {
     return true;
 }
 
+// Reads the session's sampling block into the output service's params and
+// drops any sampler already built from the old ones, so the next sample call
+// rebuilds the chain. Sessions are configured before they generate, so this
+// never races an in-flight sample.
+static void apply_sampler_params_from_body(const json & body) {
+    if (!body.contains("sampling") || !body["sampling"].is_object()) {
+        return;
+    }
+    const auto & s = body["sampling"];
+    split_gen_sampler_params p{};
+    p.temp           = s.value("temp", 0.0f);
+    p.top_k          = s.value("top_k", 1);
+    p.top_p          = s.value("top_p", 1.0f);
+    p.min_p          = s.value("min_p", 0.0f);
+    p.repeat_penalty = s.value("repeat_penalty", 1.0f);
+    p.repeat_last_n  = s.value("repeat_last_n", 64);
+    p.seed           = s.value("seed", (uint32_t) LLAMA_DEFAULT_SEED);
+    g_output_service_sampler_params = p;
+    if (g_output_service_smpl != nullptr) {
+        llama_sampler_free(g_output_service_smpl);
+        g_output_service_smpl = nullptr;
+    }
+    fprintf(stderr,
+            "node_agent: output-service sampler %s (temp=%.2f top_k=%d top_p=%.2f "
+            "min_p=%.2f repeat_penalty=%.2f last_n=%d seed=%u)\n",
+            p.is_greedy() ? "greedy" : "stochastic",
+            p.temp, p.top_k, p.top_p, p.min_p, p.repeat_penalty, p.repeat_last_n, p.seed);
+}
+
 static bool output_service_sample_local(
         const float * hidden,
         int32_t n_embd,
@@ -557,7 +590,7 @@ static bool output_service_sample_local(
         return false;
     }
     if (!g_output_service_smpl) {
-        g_output_service_smpl = split_gen_make_sampler();
+        g_output_service_smpl = split_gen_make_sampler_from(g_output_service_sampler_params);
     }
     token_out = (int32_t) llama_sampler_sample(g_output_service_smpl, g_output_service_ctx, -1);
     llama_sampler_accept(g_output_service_smpl, (llama_token) token_out);
@@ -1014,6 +1047,16 @@ static dist_configure_req parse_configure(const json & body) {
     req.draft_k     = body.value("draft_k", 4);
     req.tc_port     = body.value("tc_port", 0);
     req.tc_host     = body.value("tc_host", "127.0.0.1");
+    if (body.contains("sampling") && body["sampling"].is_object()) {
+        const auto & s = body["sampling"];
+        req.temp           = s.value("temp", 0.0f);
+        req.top_k          = s.value("top_k", 1);
+        req.top_p          = s.value("top_p", 1.0f);
+        req.min_p          = s.value("min_p", 0.0f);
+        req.repeat_penalty = s.value("repeat_penalty", 1.0f);
+        req.repeat_last_n  = s.value("repeat_last_n", 64);
+        req.seed           = s.value("seed", 0xFFFFFFFFu);
+    }
     return req;
 }
 
@@ -2009,6 +2052,23 @@ static bool start_worker(
             args.push_back("--tc-port");
             args.push_back(std::to_string(cfg.tc_port));
         }
+        // Sampling settings: only the final worker samples, so only it needs
+        // these. Passed unconditionally -- the defaults are the old greedy
+        // chain, so an unset session behaves exactly as before.
+        args.push_back("--temp");
+        args.push_back(std::to_string(cfg.temp));
+        args.push_back("--top-k");
+        args.push_back(std::to_string(cfg.top_k));
+        args.push_back("--top-p");
+        args.push_back(std::to_string(cfg.top_p));
+        args.push_back("--min-p");
+        args.push_back(std::to_string(cfg.min_p));
+        args.push_back("--repeat-penalty");
+        args.push_back(std::to_string(cfg.repeat_penalty));
+        args.push_back("--repeat-last-n");
+        args.push_back(std::to_string(cfg.repeat_last_n));
+        args.push_back("--seed");
+        args.push_back(std::to_string(cfg.seed));
     } else {
         err = "invalid role";
         return false;
@@ -2803,6 +2863,7 @@ int main(int argc, char ** argv) {
         }
         perf_consume_trace_from_body(body, "output");
         perf_session_span svc_span("SESSION_SERVICE_CONFIGURE", g_node_id.c_str(), "output_head");
+        apply_sampler_params_from_body(body);
         const std::string path = body.value("worker_gguf", "");
         const std::string model_id = body.value("model_id", "");
         if (!apply_service_model_source(path, model_id, g_output_service_gguf, g_output_service_model_id)) {
@@ -2881,6 +2942,7 @@ int main(int argc, char ** argv) {
         }
         perf_consume_trace_from_body(body, "sampler");
         perf_session_span svc_span("SESSION_SERVICE_CONFIGURE", g_node_id.c_str(), "sampler");
+        apply_sampler_params_from_body(body);
         g_sampler_service_ready = true;
         res.set_content(json({ { "ok", true }, { "sampler_ready", true } }).dump(), "application/json");
     });

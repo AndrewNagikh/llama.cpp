@@ -849,6 +849,7 @@ int main(int argc, char ** argv) {
     int draft_k = 4;
     const char * tc_host = "127.0.0.1";
     int tc_port = -1;
+    split_gen_sampler_params sampler_params{};
 
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--bc-port") == 0 && i + 1 < argc) {
@@ -879,6 +880,20 @@ int main(int argc, char ** argv) {
             tc_host = argv[++i];
         } else if (strcmp(argv[i], "--tc-port") == 0 && i + 1 < argc) {
             tc_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
+            sampler_params.temp = (float) atof(argv[++i]);
+        } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
+            sampler_params.top_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
+            sampler_params.top_p = (float) atof(argv[++i]);
+        } else if (strcmp(argv[i], "--min-p") == 0 && i + 1 < argc) {
+            sampler_params.min_p = (float) atof(argv[++i]);
+        } else if (strcmp(argv[i], "--repeat-penalty") == 0 && i + 1 < argc) {
+            sampler_params.repeat_penalty = (float) atof(argv[++i]);
+        } else if (strcmp(argv[i], "--repeat-last-n") == 0 && i + 1 < argc) {
+            sampler_params.repeat_last_n = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            sampler_params.seed = (uint32_t) strtoul(argv[++i], nullptr, 10);
         } else {
             usage(argv[0]);
             return 1;
@@ -944,7 +959,16 @@ int main(int argc, char ** argv) {
     }
 
     llama_set_layer_range(ctx, layer_start, effective_layer_end);
-    llama_sampler * smpl = external_output ? nullptr : split_gen_make_sampler();
+    llama_sampler * smpl = external_output ? nullptr : split_gen_make_sampler_from(sampler_params);
+    if (!external_output) {
+        fprintf(stderr,
+                "gen3_c: sampler %s (temp=%.2f top_k=%d top_p=%.2f min_p=%.2f "
+                "repeat_penalty=%.2f last_n=%d seed=%u)\n",
+                sampler_params.is_greedy() ? "greedy" : "stochastic",
+                sampler_params.temp, sampler_params.top_k, sampler_params.top_p,
+                sampler_params.min_p, sampler_params.repeat_penalty,
+                sampler_params.repeat_last_n, sampler_params.seed);
+    }
 
     dist_debug_load_config();
     dist_debug_reset_recorder("final");

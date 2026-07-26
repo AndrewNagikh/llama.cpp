@@ -61,15 +61,60 @@ static void split_gen_write_ready_state(const std::string & ready_file, const ch
     std::fclose(f);
 }
 
-static llama_sampler * split_gen_make_sampler() {
+// Sampling settings carried from /session/create down to whichever process
+// actually samples (the final pipeline worker, or the output service when the
+// output head lives on another node). Defaults reproduce the greedy chain this
+// runtime used before the settings were exposed, so anything that does not set
+// them explicitly keeps the old deterministic argmax behavior.
+struct split_gen_sampler_params {
+    float    temp           = 0.0f;   // <= 0 -> greedy (deterministic argmax)
+    int32_t  top_k          = 1;      // <= 0 -> disabled (whole vocab)
+    float    top_p          = 1.0f;   // 1.0 -> disabled
+    float    min_p          = 0.0f;   // 0.0 -> disabled
+    float    repeat_penalty = 1.0f;   // 1.0 -> disabled
+    int32_t  repeat_last_n  = 64;     // 0 -> disabled, -1 -> context size
+    uint32_t seed           = LLAMA_DEFAULT_SEED;
+
+    bool is_greedy() const { return temp <= 0.0f; }
+};
+
+// Chain order follows llama.cpp's own convention (penalties -> truncation ->
+// temperature -> selection); penalties deliberately come first so the
+// repetition scan runs before top-k/top-p have narrowed the candidate set.
+static llama_sampler * split_gen_make_sampler_from(const split_gen_sampler_params & p) {
     auto sparams = llama_sampler_chain_default_params();
     sparams.no_perf = true;
     llama_sampler * smpl = llama_sampler_chain_init(sparams);
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_k(1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(1.0f, 1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.0f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+
+    if (p.is_greedy()) {
+        // Preserved verbatim from the original hardcoded chain.
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(1));
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(1.0f, 1));
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.0f));
+        llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+        return smpl;
+    }
+
+    if (p.repeat_penalty != 1.0f && p.repeat_last_n != 0) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
+                p.repeat_last_n, p.repeat_penalty, 0.0f, 0.0f));
+    }
+    if (p.top_k > 0) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(p.top_k));
+    }
+    if (p.top_p < 1.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(p.top_p, 1));
+    }
+    if (p.min_p > 0.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_min_p(p.min_p, 1));
+    }
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(p.temp));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(p.seed));
     return smpl;
+}
+
+static llama_sampler * split_gen_make_sampler() {
+    return split_gen_make_sampler_from(split_gen_sampler_params{});
 }
 
 static std::string split_gen_token_text(const llama_vocab * vocab, llama_token id) {

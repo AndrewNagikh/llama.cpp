@@ -82,6 +82,28 @@ struct dist_session {
     std::string speculative_draft_model_url;
     std::string speculative_draft_model_path;
     int         speculative_draft_k = 4;
+    // Sampling settings for this session, forwarded to whichever node ends up
+    // sampling. Defaults reproduce the greedy chain the runtime used before
+    // these were configurable.
+    float        temp           = 0.0f;
+    int          top_k          = 1;
+    float        top_p          = 1.0f;
+    float        min_p          = 0.0f;
+    float        repeat_penalty = 1.0f;
+    int          repeat_last_n  = 64;
+    unsigned int seed           = 0xFFFFFFFF;
+
+    json sampling_json() const {
+        return {
+            { "temp", temp },
+            { "top_k", top_k },
+            { "top_p", top_p },
+            { "min_p", min_p },
+            { "repeat_penalty", repeat_penalty },
+            { "repeat_last_n", repeat_last_n },
+            { "seed", seed },
+        };
+    }
 };
 
 static json session_debug_json(const dist_session & session) {
@@ -1811,6 +1833,7 @@ static bool setup_runtime_graph(
                     { "session_id", session_id },
                     { "model_id", session.model },
                     { "worker_gguf", configure_worker_artifact(artifact) },
+                    { "sampling", session.sampling_json() },
                 };
                 perf_attach_trace(cfg);
                 const std::string svc_role = runtime_role_name(a.role);
@@ -1838,6 +1861,7 @@ static bool setup_runtime_graph(
                 json cfg = {
                     { "session_id", session_id },
                     { "model_id", session.model },
+                    { "sampling", session.sampling_json() },
                 };
                 perf_attach_trace(cfg);
                 const std::string svc_role = runtime_role_name(a.role);
@@ -2034,6 +2058,10 @@ static bool setup_runtime_graph(
         if (stage.role == DIST_ROLE_FINAL) {
             cfg["role"] = "final";
             cfg["peer_port"] = stage.peer_port;
+            // Only the final stage samples, so it is the only one that needs
+            // these (the output service gets its own copy below when the
+            // output head lives elsewhere).
+            cfg["sampling"] = session.sampling_json();
             if (speculative) {
                 cfg["draft_model"] = session.speculative_draft_model_path;
                 cfg["draft_k"]     = session.speculative_draft_k;
@@ -3274,6 +3302,16 @@ int main(int argc, char ** argv) {
         session.model      = record->model_id;
         session.speculative_draft_model_url = body.value("speculative_draft_model_url", "");
         session.speculative_draft_k         = body.value("speculative_draft_k", 4);
+        // Sampling settings are fixed for the session's lifetime: workers build
+        // their sampler chain once at spawn, so changing these needs a new
+        // session rather than a per-request override.
+        session.temp           = body.value("temp", 0.0f);
+        session.top_k          = body.value("top_k", 1);
+        session.top_p          = body.value("top_p", 1.0f);
+        session.min_p          = body.value("min_p", 0.0f);
+        session.repeat_penalty = body.value("repeat_penalty", 1.0f);
+        session.repeat_last_n  = body.value("repeat_last_n", 64);
+        session.seed           = body.value("seed", 0xFFFFFFFFu);
 
         std::string err;
         if (!setup_runtime_graph(session.session_id, n_layers, assignments, node_map, mem, session, err)) {
