@@ -193,6 +193,128 @@ static bool node_sort_order(const layout_internal_node & a, const layout_interna
     return a.input.node_id < b.input.node_id;
 }
 
+// Pipeline order of a stored layout: nodes by first appearance walking
+// placements by ascending layer index, i.e. entry, middle..., final.
+static std::vector<std::string> stage_order_from_layout(const desired_model_layout & layout) {
+    std::vector<const layer_placement *> sorted;
+    sorted.reserve(layout.placements.size());
+    for (const auto & p : layout.placements) {
+        sorted.push_back(&p);
+    }
+    std::sort(sorted.begin(), sorted.end(),
+            [](const layer_placement * a, const layer_placement * b) {
+                return a->layer_index < b->layer_index;
+            });
+
+    std::vector<std::string> order;
+    std::set<std::string> seen;
+    for (const auto * p : sorted) {
+        if (seen.insert(p->node_id).second) {
+            order.push_back(p->node_id);
+        }
+    }
+    return order;
+}
+
+// Invert the stage assignment back into the score ordering it came from.
+// build_desired_layout lays stages out as [active[1], active[2], ...,
+// active[N-1], active[0]] -- final (heaviest stage) to the strongest node,
+// entry to the second strongest -- so a stored layout read back in pipeline
+// order has to be un-rotated before it can be compared against a freshly
+// score-sorted `active`.
+static std::vector<std::string> score_order_from_layout(const desired_model_layout & layout) {
+    const std::vector<std::string> stages = stage_order_from_layout(layout);
+    if (stages.size() < 2) {
+        return stages;
+    }
+    std::vector<std::string> scored;
+    scored.reserve(stages.size());
+    scored.push_back(stages.back());   // final was active[0]
+    scored.push_back(stages.front());  // entry was active[1]
+    for (size_t i = 1; i + 1 < stages.size(); ++i) {
+        scored.push_back(stages[i]);   // middles were active[2..]
+    }
+    return scored;
+}
+
+// Relayout hysteresis. `active` arrives sorted by the current (noisy) scores;
+// if the previous layout used a different ordering of the very same nodes,
+// keep the previous one unless the node that would take the more important
+// role is meaningfully -- not marginally -- stronger.
+//
+// Applied as a single decision over the whole ordering rather than as a
+// tie-break inside node_sort_order: a pairwise "keep previous unless better
+// by X%" comparator is not a strict weak ordering (scores 100/105/111 at 10%
+// yield A<B, B<C, C<A), and feeding that to std::sort is undefined behavior.
+static void apply_role_hysteresis(
+        std::vector<layout_internal_node *> & active,
+        const desired_model_layout * previous) {
+    if (previous == nullptr || previous->placements.empty() || active.size() < 2) {
+        return;
+    }
+
+    std::map<std::string, layout_internal_node *> by_id;
+    for (auto * w : active) {
+        by_id[w->input.node_id] = w;
+    }
+
+    // Build the previous ordering, restricted to nodes that are still active.
+    std::vector<layout_internal_node *> prev_order;
+    prev_order.reserve(active.size());
+    for (const auto & node_id : score_order_from_layout(*previous)) {
+        const auto it = by_id.find(node_id);
+        if (it != by_id.end()) {
+            prev_order.push_back(it->second);
+        }
+    }
+
+    // Only meaningful when the previous layout covers exactly today's active
+    // set. A node that joined or dropped out is a real topology change, not
+    // score noise -- take the fresh ordering.
+    if (prev_order.size() != active.size()) {
+        return;
+    }
+
+    // Never let hysteresis pull a GPU node behind a CPU-only one; that
+    // ordering rule reflects hardware, not a measured score.
+    bool seen_non_gpu = false;
+    for (const auto * w : prev_order) {
+        if (w->input.has_gpu && seen_non_gpu) {
+            return;
+        }
+        seen_non_gpu = seen_non_gpu || !w->input.has_gpu;
+    }
+
+    // First position where the fresh ordering disagrees with the previous one
+    // decides it: everything before that is unchanged anyway.
+    for (size_t i = 0; i < active.size(); ++i) {
+        if (active[i]->input.node_id == prev_order[i]->input.node_id) {
+            continue;
+        }
+        const double incumbent = prev_order[i]->input.score;
+        const double challenger = active[i]->input.score;
+        const double threshold =
+                std::max(incumbent, 1.0) * (1.0 + LAYOUT_ROLE_HYSTERESIS_PERCENT / 100.0);
+        if (challenger > threshold) {
+            fprintf(stderr,
+                    "layout_planner: role reorder accepted at position %zu -- %s (score %.1f) "
+                    "displaces %s (score %.1f), gain exceeds %.0f%% hysteresis\n",
+                    i, active[i]->input.node_id.c_str(), challenger,
+                    prev_order[i]->input.node_id.c_str(), incumbent,
+                    LAYOUT_ROLE_HYSTERESIS_PERCENT);
+            return;
+        }
+        fprintf(stderr,
+                "layout_planner: keeping previous role order -- %s (score %.1f) does not beat "
+                "%s (score %.1f) by the %.0f%% hysteresis margin\n",
+                active[i]->input.node_id.c_str(), challenger,
+                prev_order[i]->input.node_id.c_str(), incumbent,
+                LAYOUT_ROLE_HYSTERESIS_PERCENT);
+        active = prev_order;
+        return;
+    }
+}
+
 } // namespace
 
 bool layout_has_no_overlap(const desired_model_layout & layout) {
@@ -298,7 +420,8 @@ layout_build_result build_desired_layout(
         const std::string & model_id,
         const model_manifest & manifest,
         const std::vector<layout_node_input> & nodes,
-        int32_t n_ctx) {
+        int32_t n_ctx,
+        const desired_model_layout * previous) {
     layout_build_result result{};
     result.layout.model_id = model_id;
 
@@ -367,6 +490,8 @@ layout_build_result build_desired_layout(
         result.error = "no node can hold even one layer";
         return result;
     }
+
+    apply_role_hysteresis(active, previous);
 
     // Score-proportional layer counts, then clamp to per-node memory caps.
     std::vector<double> scores;

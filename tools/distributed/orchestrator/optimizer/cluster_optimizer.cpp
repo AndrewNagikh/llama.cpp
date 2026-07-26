@@ -208,8 +208,12 @@ optimization_result run_cluster_optimization(
         return result;
     }
 
+    // Role hysteresis against the layout currently in place: the optimizer
+    // already gates on a throughput improvement threshold, but that compares
+    // estimates -- this keeps the node *ordering* itself from flip-flopping on
+    // score noise before the estimate is even computed.
     const layout_build_result built = build_desired_layout(
-            model_id, manifest, active_inputs, n_ctx);
+            model_id, manifest, active_inputs, n_ctx, current_layout);
     if (!built.success || !built.layout.fits_cluster) {
         result.reason = built.error.empty() ? "candidate layout does not fit" : built.error;
         if (current_layout != nullptr) {

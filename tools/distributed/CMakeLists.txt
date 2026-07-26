@@ -444,6 +444,25 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(test-runtime-cost PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-runtime-cost PRIVATE llama llama-common Threads::Threads)
 
+    # Relayout role hysteresis (Task 21.5): layer placement must not follow
+    # score noise between nodes. Guards the invariant that made the Task 21.1
+    # revert necessary -- see docs/KNOWN_ISSUES.md.
+    add_executable(test-layout-hysteresis test-layout-hysteresis.cpp
+        orchestrator/layout_planner/layout_planner.cpp
+        orchestrator/manifest_builder/manifest_builder.cpp
+        ${DIST_ARCHITECTURE_SOURCES}
+        runtime/runtime_install_planning.cpp
+        runtime/runtime_role.cpp
+        runtime/runtime_descriptor.cpp
+        runtime/runtime_role_descriptor.cpp
+        runtime/runtime_graph.cpp
+        runtime/runtime_cost_model.cpp
+        memory_estimator.cpp
+        dist_common.cpp)
+    target_include_directories(test-layout-hysteresis PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-layout-hysteresis PRIVATE llama llama-common cpp-httplib Threads::Threads)
+    dist_link_platform_libs(test-layout-hysteresis)
+
     set(RUNTIME_UNIT_TEST_SOURCES
         ${DIST_PLATFORM_SOURCES}
         dist_common.cpp

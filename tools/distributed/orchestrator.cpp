@@ -4254,7 +4254,12 @@ int main(int argc, char ** argv) {
             previous = record->layout->desired;
         }
 
-        const auto built = build_desired_layout(model_id, *record->manifest, nodes, request_ctx);
+        // Pass the previous layout so role ordering only changes when a node
+        // is meaningfully stronger, not merely momentarily luckier (score is
+        // measured live and drifts under unrelated load).
+        const auto built = build_desired_layout(
+                model_id, *record->manifest, nodes, request_ctx,
+                previous.placements.empty() ? nullptr : &previous);
         if (!built.success) {
             res.status = 502;
             res.set_content(json({

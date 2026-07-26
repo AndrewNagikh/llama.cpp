@@ -74,12 +74,29 @@ model_memory_requirements memory_requirements_from_manifest(
         const model_manifest & manifest,
         int32_t n_ctx = 0);
 
+// Relayout hysteresis: how much better a node's score must be before it is
+// allowed to take a more important pipeline role away from whoever holds it
+// in the previous layout. Node score is derived from live measurements
+// (decode/prefill throughput, memory), so it drifts under unrelated load --
+// and every role reorder moves that model's layers between nodes, orphaning
+// the ones left behind (see the Task 21.1 revert in KNOWN_ISSUES.md for what
+// that costs in practice: five models in DEGRADED coverage at once).
+// Deliberately 2x the 5% score-delta that /register uses to notice a cluster
+// change at all: we look at a 5% drift, but only act on a 10% one.
+constexpr double LAYOUT_ROLE_HYSTERESIS_PERCENT = 10.0;
+
 // Build desired per-layer layout from manifest + cluster nodes.
+//
+// `previous`, when non-null and non-empty, enables role hysteresis: the
+// previous layout's node ordering is kept unless some node's score beats the
+// node it would displace by more than LAYOUT_ROLE_HYSTERESIS_PERCENT. Pass
+// nullptr for a fresh, unconstrained layout.
 layout_build_result build_desired_layout(
         const std::string & model_id,
         const model_manifest & manifest,
         const std::vector<layout_node_input> & nodes,
-        int32_t n_ctx = 0);
+        int32_t n_ctx = 0,
+        const desired_model_layout * previous = nullptr);
 
 // Validation helpers (used by tests and planner).
 bool validate_desired_layout(
