@@ -5516,7 +5516,7 @@ int main(int argc, char ** argv) {
             const runtime_install_node_map * runtime_ptr =
                     runtime_nodes.has_value() ? &*runtime_nodes : nullptr;
             coverage = compute_runtime_coverage(
-                    rt, record->layout->desired, actual, online_nodes, runtime_ptr).layer_coverage;
+                    rt, record->layout->desired, actual_merged, online_nodes, runtime_ptr).layer_coverage;
         }
         g_registry.apply_coverage(model_id, coverage, record);
 

@@ -129,6 +129,16 @@ static std::map<std::string, installed_layer> index_actual_layers(
     return indexed;
 }
 
+// NOTE: an empty `online_nodes` means "no liveness information -- assume every
+// node is up", which is what tests and layout-only callers want. It is also a
+// footgun: a caller that simply forgets the argument silently gets the unsafe
+// reading, and that is exactly how the install planner came to judge a stopped
+// machine as if it had answered (fixed 2026-07-28).
+//
+// It matters at runtime in one case: if a poll reaches *nobody*, the set is
+// empty and every node reads as online, so every layer reads as missing.
+// Callers that derive the set from a live poll must treat "nobody answered" as
+// "we know nothing", not as a cluster-wide loss.
 static bool node_is_online(
         const std::string & node_id,
         const std::set<std::string> & online_nodes) {
