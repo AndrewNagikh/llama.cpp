@@ -176,12 +176,20 @@ runtime_coverage_report compute_runtime_coverage(
                 : blob.id;
 
         for (const std::string & node_id : targets) {
+            // A node we cannot reach tells us nothing about its own disk, so
+            // its blobs are counted neither ready nor missing. Counting them
+            // missing is the offline-means-lost mistake in yet another place.
+            const bool reachable = online_nodes.empty() || online_nodes.count(node_id) > 0;
             for (const auto & slot : blob.tensors) {
-                ++storage_total;
                 if (blob_ready_on_node(actual, node_id, storage_id, slot.name)) {
+                    ++storage_total;
                     ++storage_ready;
                     continue;
                 }
+                if (!reachable) {
+                    continue;
+                }
+                ++storage_total;
                 report.missing_blobs.push_back(node_id + ":" + storage_id + "/" + slot.name);
                 ++storage_missing;
             }
@@ -198,6 +206,13 @@ runtime_coverage_report compute_runtime_coverage(
                 continue;
             }
             if (std::find(targets.begin(), targets.end(), layer.node_id) != targets.end()) {
+                continue;
+            }
+            // `targets` is derived from the reachable nodes, so an offline
+            // node is never in it. Its blobs are exactly where the layout put
+            // them -- calling them misplaced turned a switched-off machine
+            // into a DEGRADED model with a repair button.
+            if (!online_nodes.empty() && online_nodes.count(layer.node_id) == 0) {
                 continue;
             }
             report.misplaced_blobs.push_back(
@@ -235,6 +250,10 @@ runtime_coverage_report compute_runtime_coverage(
 
     if (report.fully_ready()) {
         report.layer_coverage.state = coverage_state::ready;
+    } else if (report.layer_coverage.state == coverage_state::unavailable) {
+        // Leave it alone. Whatever the runtime layer concluded, it could not
+        // see one of the nodes, so it is in no position to call the model
+        // damaged.
     } else if (report.runtime_state == coverage_state::degraded) {
         report.layer_coverage.state = coverage_state::degraded;
     }
