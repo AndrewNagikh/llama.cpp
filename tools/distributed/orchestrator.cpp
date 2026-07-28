@@ -916,7 +916,8 @@ static bool build_and_store_install_plan(
             actual_for_plan,
             coverage_for_plan,
             resolve_model_source_url(*record),
-            runtime_nodes_ptr);
+            runtime_nodes_ptr,
+            online_nodes);
     if (!built.success) {
         return false;
     }

@@ -395,7 +395,8 @@ install_plan_build_result build_install_plan(
         const actual_model_layout & actual,
         const coverage_report & coverage,
         const std::string & source_url,
-        const runtime_install_node_map * runtime_nodes) {
+        const runtime_install_node_map * runtime_nodes,
+        const std::set<std::string> & online_nodes) {
     install_plan_build_result result{};
     result.plan.model_id = desired.model_id.empty() ? coverage.model_id : desired.model_id;
 
@@ -412,7 +413,7 @@ install_plan_build_result build_install_plan(
     // Task 9.9 — idempotent fast path: fully ready layout needs zero operations.
     {
         const runtime_coverage_report rt_cov = compute_runtime_coverage(
-                rt, desired, actual, {}, runtime_nodes);
+                rt, desired, actual, online_nodes, runtime_nodes);
         if (rt_cov.fully_ready()) {
             result.success = true;
             finalize_plan(result.plan);
@@ -487,6 +488,21 @@ install_plan_build_result build_install_plan(
                 source_url,
                 actual,
                 ready_blobs);
+    }
+
+    // Never schedule work onto a machine we cannot reach. Its layers are not
+    // known to be gone -- most often they are sitting on its disk, and the
+    // operation would delete and re-download data that was never lost. This is
+    // the last gate before a plan becomes destructive, so it is enforced here
+    // rather than trusted to each producer above.
+    if (!online_nodes.empty()) {
+        operations.erase(
+                std::remove_if(operations.begin(), operations.end(),
+                        [&online_nodes](const install_operation & op) {
+                            return !op.node_id.empty() &&
+                                   online_nodes.count(op.node_id) == 0;
+                        }),
+                operations.end());
     }
 
     result.plan.operations = std::move(operations);

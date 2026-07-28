@@ -8,6 +8,7 @@
 #include "nlohmann/json.hpp"
 
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -100,13 +101,19 @@ layer_byte_range manifest_role_byte_range(
 layer_byte_range manifest_global_preamble_range(const model_manifest & manifest);
 
 // Build install plan from registry state inputs.
+// `online_nodes` are the nodes reachable right now. Operations targeting any
+// other node are dropped: an unreachable machine's layers cannot be verified,
+// are not known to be gone, and must never be scheduled for re-download onto
+// the very node that still holds them. An empty set disables the filter, for
+// callers with no liveness information (tests).
 install_plan_build_result build_install_plan(
         const model_manifest & manifest,
         const desired_model_layout & desired,
         const actual_model_layout & actual,
         const coverage_report & coverage,
         const std::string & source_url = "",
-        const runtime_install_node_map * runtime_nodes = nullptr);
+        const runtime_install_node_map * runtime_nodes = nullptr,
+        const std::set<std::string> & online_nodes = {});
 
 // Group consecutive same-node operations (sorted by node, layer).
 std::vector<install_plan_group> group_install_operations(
