@@ -884,8 +884,16 @@ static bool build_and_store_install_plan(
         return false;
     }
 
+    // Plan against the registry's merged view, not the raw poll. The poll only
+    // contains nodes that answered, so using it directly reintroduces exactly
+    // what apply_actual() was changed to prevent: an offline node's layers look
+    // absent and get scheduled for re-download onto the machine that already
+    // has them (gemma-3-1b's 320 MB embedding, measured 2026-07-28).
+    const actual_model_layout & actual_for_plan =
+            record->actual.has_value() ? *record->actual : actual;
+
     const coverage_report & coverage_for_plan = layout_override
-            ? compute_coverage(*layout_override, actual, online_nodes)
+            ? compute_coverage(*layout_override, actual_for_plan, online_nodes)
             : *record->coverage;
 
     std::map<std::string, dist_node_info> node_map;
@@ -905,7 +913,7 @@ static bool build_and_store_install_plan(
     const auto built = build_install_plan(
             *record->manifest,
             *target,
-            actual,
+            actual_for_plan,
             coverage_for_plan,
             resolve_model_source_url(*record),
             runtime_nodes_ptr);
@@ -5479,10 +5487,16 @@ int main(int argc, char ** argv) {
         }
         refresh_model_coverage(model_id, online_nodes, record);
 
+        // Same reason as build_and_store_install_plan: the raw poll omits
+        // nodes that did not answer, and reconciling against it would call
+        // their intact layers missing.
+        const actual_model_layout & actual_merged =
+                record->actual.has_value() ? *record->actual : actual;
+
         const reconciliation_result result = reconcile_layers(
-                record->layout->desired, actual, online_nodes);
+                record->layout->desired, actual_merged, online_nodes);
         coverage_report coverage = compute_coverage(
-                record->layout->desired, actual, online_nodes);
+                record->layout->desired, actual_merged, online_nodes);
         if (record->manifest.has_value()) {
             const semantic_runtime_descriptor rt =
                     build_semantic_runtime_descriptor(*record->manifest);
