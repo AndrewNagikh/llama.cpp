@@ -496,11 +496,38 @@ install_plan_build_result build_install_plan(
     // the last gate before a plan becomes destructive, so it is enforced here
     // rather than trusted to each producer above.
     if (!online_nodes.empty()) {
+        // Is any node this layout depends on unreachable? If so we cannot see
+        // the copies the layout considers authoritative.
+        bool layout_incomplete = false;
+        for (const auto & placement : desired.placements) {
+            if (online_nodes.count(placement.node_id) == 0) {
+                layout_incomplete = true;
+                break;
+            }
+        }
+
         operations.erase(
                 std::remove_if(operations.begin(), operations.end(),
-                        [&online_nodes](const install_operation & op) {
-                            return !op.node_id.empty() &&
-                                   online_nodes.count(op.node_id) == 0;
+                        [&online_nodes, layout_incomplete](const install_operation & op) {
+                            // Never schedule work onto a machine we cannot
+                            // reach: its layers are not known to be gone, and
+                            // the operation would move data that was never
+                            // lost.
+                            if (!op.node_id.empty() && online_nodes.count(op.node_id) == 0) {
+                                return true;
+                            }
+                            // While part of the layout is invisible, deleting
+                            // anything is a guess. The blobs being cleaned up
+                            // are stale copies from an earlier layout, and the
+                            // replacements live on the node we cannot see --
+                            // so this is precisely when we cannot confirm the
+                            // data survives the delete. Cleanup can wait for
+                            // the cluster to be whole; the layers cannot be
+                            // un-deleted.
+                            if (layout_incomplete && op.action == install_action::delete_op) {
+                                return true;
+                            }
+                            return false;
                         }),
                 operations.end());
     }
