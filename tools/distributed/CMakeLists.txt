@@ -111,6 +111,7 @@ set(DIST_COMMON_SOURCES
     orchestrator/model_provider/huggingface_provider.cpp
     orchestrator/manifest_builder/manifest_builder.cpp
     orchestrator/layout_planner/layout_planner.cpp
+    orchestrator/layout_policy/layout_policy.cpp
     orchestrator/layout_estimator/layout_estimator.cpp
     orchestrator/optimizer/cluster_optimizer.cpp
     orchestrator/coverage/coverage.cpp
@@ -443,6 +444,25 @@ if (LLAMA_BUILD_TESTS)
         dist_common.cpp)
     target_include_directories(test-runtime-cost PRIVATE ${DIST_INCLUDE_DIRS})
     target_link_libraries(test-runtime-cost PRIVATE llama llama-common Threads::Threads)
+
+    # Task 24 layout policy: decides keep/repair/recompute/unavailable. Pure
+    # function, so the cases that cost data on 2026-07-24 are unit-testable.
+    add_executable(test-layout-policy test-layout-policy.cpp
+        orchestrator/layout_policy/layout_policy.cpp
+        orchestrator/coverage/coverage.cpp
+        ${DIST_ARCHITECTURE_SOURCES}
+        runtime/runtime_install_planning.cpp
+        runtime/runtime_role.cpp
+        runtime/runtime_descriptor.cpp
+        runtime/runtime_role_descriptor.cpp
+        runtime/runtime_graph.cpp
+        runtime/runtime_cost_model.cpp
+        orchestrator/manifest_builder/manifest_builder.cpp
+        memory_estimator.cpp
+        dist_common.cpp)
+    target_include_directories(test-layout-policy PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-layout-policy PRIVATE llama llama-common cpp-httplib Threads::Threads)
+    dist_link_platform_libs(test-layout-policy)
 
     # Relayout role hysteresis (Task 21.5): layer placement must not follow
     # score noise between nodes. Guards the invariant that made the Task 21.1
