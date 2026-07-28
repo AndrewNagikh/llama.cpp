@@ -149,6 +149,26 @@ static std::mutex g_mu;
 static std::map<std::string, dist_node_info> g_nodes;
 static std::map<std::string, dist_session> g_sessions;
 
+// A node counts as online only while its heartbeats keep arriving. node_agent
+// re-registers every 5s, so silence this long means the machine is actually
+// gone rather than briefly busy.
+//
+// Until 2026-07-28 `online` was set true on registration and never set false
+// anywhere in the tree, and `last_seen` was recorded but read by nothing. A
+// stopped node therefore stayed "online" until the orchestrator itself
+// restarted. That was not cosmetic: coverage polls kept going to a machine
+// that was not there, came back with its layers marked missing, and every
+// model placed on it read as DEGRADED -- which is how a perfectly healthy
+// cluster kept looking broken, and why the same false alarm was investigated
+// twice as if it were data loss. It also made layout_policy's `unavailable`
+// verdict unreachable: the branch that exists specifically to protect an
+// absent node's layers could never be taken, because no node was ever absent.
+static constexpr int64_t NODE_OFFLINE_AFTER_S = 30;
+
+static bool node_is_online(const dist_node_info & n) {
+    return n.online && (dist_now_unix() - n.last_seen) <= NODE_OFFLINE_AFTER_S;
+}
+
 // Session-create progress, keyed by a client-supplied correlation id.
 //
 // /session/create is one blocking call that can take from seconds (warm) to
@@ -777,7 +797,7 @@ static std::map<std::string, dist_node_info> collect_online_nodes_copy() {
     std::map<std::string, dist_node_info> nodes_copy;
     std::lock_guard<std::mutex> lock(g_mu);
     for (const auto & kv : g_nodes) {
-        if (kv.second.online) {
+        if (node_is_online(kv.second)) {
             nodes_copy[kv.first] = kv.second;
         }
     }
@@ -872,7 +892,7 @@ static bool build_and_store_install_plan(
     for (const std::string & node_id : online_nodes) {
         std::lock_guard<std::mutex> lock(g_mu);
         const auto it = g_nodes.find(node_id);
-        if (it != g_nodes.end() && it->second.online) {
+        if (it != g_nodes.end() && node_is_online(it->second)) {
             node_map[node_id] = it->second;
         }
     }
@@ -1154,7 +1174,7 @@ static void trigger_cluster_optimization_async() {
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto & entry : g_nodes) {
-                if (entry.second.online) {
+                if (node_is_online(entry.second)) {
                     online_nodes.insert(entry.first);
                 }
             }
@@ -1487,7 +1507,7 @@ static std::vector<dist_layer_assignment> assignments_from_desired_layout(
             continue;
         }
         const auto node_it = node_map.find(placement.node_id);
-        if (node_it == node_map.end() || !node_it->second.online) {
+        if (node_it == node_map.end() || !node_is_online(node_it->second)) {
             return {};
         }
 
@@ -1752,7 +1772,7 @@ static void dist_print_planner_report(
     fprintf(stderr, "Required: %.1f GB\n", mem.total_gb());
     fprintf(stderr, "Cluster:\n");
     for (const auto & n : nodes) {
-        if (!n.online) {
+        if (!node_is_online(n)) {
             continue;
         }
         const char * kind = n.memory.has_gpu ? "GPU" : "CPU";
@@ -1842,7 +1862,7 @@ static bool poll_installed_layers_from_nodes(
     std::vector<std::future<node_layer_poll_result>> futures;
     futures.reserve(nodes_copy.size());
     for (const auto & kv : nodes_copy) {
-        if (!kv.second.online) {
+        if (!node_is_online(kv.second)) {
             continue;
         }
         const dist_node_info node = kv.second;
@@ -3094,7 +3114,7 @@ static int session_create_core(const json & body, json & out) {
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto & kv : g_nodes) {
-                if (kv.second.online) {
+                if (node_is_online(kv.second)) {
                     node_map[kv.first] = kv.second;
                     if (n_layers <= 0 && kv.second.n_layer > 0) {
                         n_layers = std::max(n_layers, kv.second.n_layer);
@@ -3367,7 +3387,7 @@ static uint64_t cluster_free_budget_bytes() {
     uint64_t total = 0;
     std::lock_guard<std::mutex> lock(g_mu);
     for (const auto & kv : g_nodes) {
-        if (!kv.second.online) {
+        if (!node_is_online(kv.second)) {
             continue;
         }
         total += kv.second.memory.has_gpu
@@ -3824,7 +3844,7 @@ int main(int argc, char ** argv) {
                     { "decode_tps", n.performance.decode_tps },
                     { "prefill_tps", n.performance.prefill_tps },
                     { "load_ms", n.performance.load_ms },
-                    { "online", n.online },
+                    { "online", node_is_online(n) },
                     { "last_seen", n.last_seen },
                     { "gpu", n.hardware.gpu_name },
                     { "ram_gb", n.hardware.ram_gb },
@@ -3865,7 +3885,7 @@ int main(int argc, char ** argv) {
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto & kv : g_nodes) {
-                if (!kv.second.online) {
+                if (!node_is_online(kv.second)) {
                     continue;
                 }
                 ram_gb  += dist_bytes_to_gb(kv.second.memory.total_ram_bytes);
@@ -4305,7 +4325,7 @@ int main(int argc, char ** argv) {
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto & kv : g_nodes) {
-                if (kv.second.online && kv.second.n_layer > 0) {
+                if (node_is_online(kv.second) && kv.second.n_layer > 0) {
                     node_map[kv.first] = kv.second;
                     n_layers = std::max(n_layers, kv.second.n_layer);
                 }
@@ -4416,7 +4436,7 @@ int main(int argc, char ** argv) {
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto & kv : g_nodes) {
-                if (kv.second.online && kv.second.n_layer > 0) {
+                if (node_is_online(kv.second) && kv.second.n_layer > 0) {
                     node_map[kv.first] = kv.second;
                 }
             }
@@ -4853,7 +4873,7 @@ int main(int argc, char ** argv) {
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto & kv : g_nodes) {
-                if (kv.second.online) {
+                if (node_is_online(kv.second)) {
                     nodes.push_back(kv.second);
                 }
             }
@@ -4972,7 +4992,7 @@ int main(int argc, char ** argv) {
             job_id = g_catalog.create_install_job(model_id);
             g_catalog.update_job_status(job_id, install_status::downloading, "", 0.0);
             for (const auto & [_, node] : g_nodes) {
-                if (node.online) {
+                if (node_is_online(node)) {
                     online_nodes.push_back(node);
                     g_install_node_results[job_id][node.node_id] = {
                         { "status", "pending" },
@@ -5182,7 +5202,7 @@ int main(int argc, char ** argv) {
                 {
                     std::lock_guard<std::mutex> lock(g_mu);
                     for (const auto & kv : g_nodes) {
-                        if (kv.second.online) {
+                        if (node_is_online(kv.second)) {
                             node_map[kv.first] = kv.second;
                         }
                     }
@@ -5210,7 +5230,7 @@ int main(int argc, char ** argv) {
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto & kv : g_nodes) {
-                if (kv.second.online) {
+                if (node_is_online(kv.second)) {
                     nodes.push_back(layout_node_from_dist(kv.second));
                 }
             }
@@ -5247,7 +5267,7 @@ int main(int argc, char ** argv) {
             {
                 std::lock_guard<std::mutex> lock(g_mu);
                 for (const auto & kv : g_nodes) {
-                    if (kv.second.online) {
+                    if (node_is_online(kv.second)) {
                         node_map[kv.first] = kv.second;
                     }
                 }
@@ -5588,7 +5608,7 @@ int main(int argc, char ** argv) {
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto & kv : g_nodes) {
-                if (kv.second.online) {
+                if (node_is_online(kv.second)) {
                     nodes_copy[kv.first] = kv.second;
                 }
             }
@@ -5716,7 +5736,7 @@ int main(int argc, char ** argv) {
         {
             std::lock_guard<std::mutex> lock(g_mu);
             for (const auto & kv : g_nodes) {
-                if (kv.second.online) {
+                if (node_is_online(kv.second)) {
                     nodes_copy[kv.first] = kv.second;
                 }
             }
