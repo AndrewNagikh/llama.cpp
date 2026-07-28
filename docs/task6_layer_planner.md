@@ -110,20 +110,20 @@ std::vector<dist_layer_assignment> dist_plan_layers(
 # Linux orchestrator + node-a (score 100)
 ./orchestrator --model model.gguf --listen 0.0.0.0:9000
 ./node_agent --model model.gguf --listen 0.0.0.0:9001 \
-  --advertise-host 192.168.50.154 --orchestrator http://127.0.0.1:9000 \
+  --advertise-host 192.0.2.10 --orchestrator http://127.0.0.1:9000 \
   --node-id node-a --score 100
 
 # Mac node-b (score 50)
 ./node_agent ... --node-id node-b --score 50 --listen 0.0.0.0:9002 \
-  --advertise-host 192.168.50.254 --orchestrator http://192.168.50.154:9000
+  --advertise-host 192.0.2.12 --orchestrator http://192.0.2.10:9000
 
 # Mac node-c (score 25)
 ./node_agent ... --node-id node-c --score 25 --listen 0.0.0.0:9003 \
-  --advertise-host 192.168.50.254 --orchestrator http://192.168.50.154:9000
+  --advertise-host 192.0.2.12 --orchestrator http://192.0.2.10:9000
 ```
 
 ```bash
-curl -s http://192.168.50.154:9000/session/create \
+curl -s http://192.0.2.10:9000/session/create \
   -H 'Content-Type: application/json' -d '{"model":"llama-3.2-1b"}' | jq '.layout'
 ```
 
