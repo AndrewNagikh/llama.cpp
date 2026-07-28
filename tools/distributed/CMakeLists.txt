@@ -464,6 +464,24 @@ if (LLAMA_BUILD_TESTS)
     target_link_libraries(test-layout-policy PRIVATE llama llama-common cpp-httplib Threads::Threads)
     dist_link_platform_libs(test-layout-policy)
 
+    # Task 24 principle 2: a layer on a switched-off node is unavailable, not
+    # missing. Guards the distinction that made healthy models read as damaged.
+    add_executable(test-coverage-offline test-coverage-offline.cpp
+        orchestrator/coverage/coverage.cpp
+        ${DIST_ARCHITECTURE_SOURCES}
+        runtime/runtime_install_planning.cpp
+        runtime/runtime_role.cpp
+        runtime/runtime_descriptor.cpp
+        runtime/runtime_role_descriptor.cpp
+        runtime/runtime_graph.cpp
+        runtime/runtime_cost_model.cpp
+        orchestrator/manifest_builder/manifest_builder.cpp
+        memory_estimator.cpp
+        dist_common.cpp)
+    target_include_directories(test-coverage-offline PRIVATE ${DIST_INCLUDE_DIRS})
+    target_link_libraries(test-coverage-offline PRIVATE llama llama-common cpp-httplib Threads::Threads)
+    dist_link_platform_libs(test-coverage-offline)
+
     # Relayout role hysteresis (Task 21.5): layer placement must not follow
     # score noise between nodes. Guards the invariant that made the Task 21.1
     # revert necessary -- see docs/KNOWN_ISSUES.md.

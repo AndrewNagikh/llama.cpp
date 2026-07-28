@@ -172,6 +172,7 @@ std::string coverage_state_to_string(coverage_state s) {
         case coverage_state::partial:  return "PARTIAL";
         case coverage_state::ready:    return "READY";
         case coverage_state::degraded: return "DEGRADED";
+        case coverage_state::unavailable: return "UNAVAILABLE";
     }
     return "EMPTY";
 }
@@ -182,6 +183,7 @@ coverage_state coverage_state_from_string(const std::string & s) {
     if (upper == "PARTIAL")  return coverage_state::partial;
     if (upper == "READY")    return coverage_state::ready;
     if (upper == "DEGRADED") return coverage_state::degraded;
+    if (upper == "UNAVAILABLE") return coverage_state::unavailable;
     return coverage_state::empty;
 }
 
@@ -255,6 +257,10 @@ json coverage_report::to_json() const {
     for (int32_t layer : corrupted) {
         corrupted_json.push_back(layer);
     }
+    json unavailable_json = json::array();
+    for (int32_t layer : unavailable) {
+        unavailable_json.push_back(layer);
+    }
     return {
         { "model", model_id },
         { "model_id", model_id },
@@ -263,8 +269,10 @@ json coverage_report::to_json() const {
         { "ready_layers", ready_layers },
         { "missing_layers", missing_layers },
         { "corrupted_layers", corrupted_layers },
+        { "unavailable_layers", unavailable_layers },
         { "missing", missing_json },
         { "corrupted", corrupted_json },
+        { "unavailable", unavailable_json },
     };
 }
 
@@ -276,6 +284,7 @@ coverage_report coverage_report::from_json(const json & j) {
     report.ready_layers = j.value("ready_layers", 0);
     report.missing_layers = j.value("missing_layers", 0);
     report.corrupted_layers = j.value("corrupted_layers", 0);
+    report.unavailable_layers = j.value("unavailable_layers", 0);
     if (j.contains("missing") && j["missing"].is_array()) {
         for (const auto & item : j["missing"]) {
             report.missing.push_back(item.get<int32_t>());
@@ -284,6 +293,11 @@ coverage_report coverage_report::from_json(const json & j) {
     if (j.contains("corrupted") && j["corrupted"].is_array()) {
         for (const auto & item : j["corrupted"]) {
             report.corrupted.push_back(item.get<int32_t>());
+        }
+    }
+    if (j.contains("unavailable") && j["unavailable"].is_array()) {
+        for (const auto & item : j["unavailable"]) {
+            report.unavailable.push_back(item.get<int32_t>());
         }
     }
     return report;
@@ -298,6 +312,9 @@ json reconciliation_result::to_json() const {
     for (int32_t layer : corrupted) {
         corrupted_json.push_back(layer);
     }
+    // No `unavailable` here on purpose: this is what the install planner
+    // consumes, and it must only ever be told about work to actually do.
+    // Layers on an unreachable node are not work.
     return {
         { "model", model_id },
         { "model_id", model_id },
@@ -338,15 +355,17 @@ coverage_report compute_coverage(
     report.total_layers = static_cast<int>(desired.placements.size());
 
     const auto indexed = index_actual_layers(actual, layer_tensors);
-    bool node_loss_missing = false;
 
     for (const auto & placement : desired.placements) {
         const std::string key = layer_key(placement.layer_index, placement.node_id);
         const auto it = indexed.find(key);
 
+        // A layer on an unreachable node is not missing -- we simply cannot
+        // see it. Counting it as missing made a switched-off machine look
+        // identical to lost data, and an install plan built from that count
+        // would re-download layers that were never gone.
         if (!node_is_online(placement.node_id, online_nodes)) {
-            report.missing.push_back(placement.layer_index);
-            node_loss_missing = true;
+            report.unavailable.push_back(placement.layer_index);
             continue;
         }
 
@@ -380,22 +399,29 @@ coverage_report compute_coverage(
     std::sort(report.corrupted.begin(), report.corrupted.end());
     report.corrupted.erase(std::unique(report.corrupted.begin(), report.corrupted.end()),
             report.corrupted.end());
+    std::sort(report.unavailable.begin(), report.unavailable.end());
+    report.unavailable.erase(std::unique(report.unavailable.begin(), report.unavailable.end()),
+            report.unavailable.end());
 
     report.missing_layers = static_cast<int>(report.missing.size());
     report.corrupted_layers = static_cast<int>(report.corrupted.size());
+    report.unavailable_layers = static_cast<int>(report.unavailable.size());
 
+    // Order is by what the operator should act on. Damage and genuine absence
+    // are actionable now; an unreachable node is only actionable by turning it
+    // back on, so it ranks last and never masks a real problem.
     if (report.total_layers == 0) {
         report.state = coverage_state::empty;
     } else if (report.corrupted_layers > 0) {
         report.state = coverage_state::degraded;
-    } else if (node_loss_missing) {
-        report.state = coverage_state::degraded;
-    } else if (report.ready_layers == 0) {
-        report.state = coverage_state::empty;
-    } else if (report.missing_layers == 0 && report.ready_layers == report.total_layers) {
-        report.state = coverage_state::ready;
     } else if (report.missing_layers > 0) {
         report.state = coverage_state::partial;
+    } else if (report.unavailable_layers > 0) {
+        report.state = coverage_state::unavailable;
+    } else if (report.ready_layers == 0) {
+        report.state = coverage_state::empty;
+    } else if (report.ready_layers == report.total_layers) {
+        report.state = coverage_state::ready;
     } else {
         report.state = coverage_state::partial;
     }

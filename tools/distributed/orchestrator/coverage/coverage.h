@@ -58,7 +58,18 @@ enum class coverage_state {
     empty,
     partial,
     ready,
-    degraded
+    degraded,
+
+    // Every layer we can see is fine, but a node holding some of them is not
+    // reachable. Distinct from `degraded` on purpose: nothing is damaged and
+    // nothing needs downloading -- the layers are on a disk that is currently
+    // switched off, and they come back with the machine.
+    //
+    // Before 2026-07-28 this case was reported as `degraded` with the absent
+    // node's layers counted as missing, so a closed laptop was indistinguishable
+    // from data loss. That reading is what prompted manual "repairs" of models
+    // that were never broken (Task 24, principle 2: offline is not lost).
+    unavailable
 };
 
 std::string coverage_state_to_string(coverage_state s);
@@ -73,8 +84,14 @@ struct coverage_report {
     int missing_layers  = 0;
     int corrupted_layers = 0;
 
+    // Placed on a node that is not reachable right now. Deliberately not part
+    // of `missing_layers`: consumers treat that count as "must be downloaded",
+    // and these must not be.
+    int unavailable_layers = 0;
+
     std::vector<int32_t> missing;
     std::vector<int32_t> corrupted;
+    std::vector<int32_t> unavailable;
 
     nlohmann::json to_json() const;
     static coverage_report from_json(const nlohmann::json & j);
