@@ -346,6 +346,7 @@ bool cluster_model_registry::apply_runtime_plan(
 bool cluster_model_registry::apply_actual(
         const std::string & model_id,
         const actual_model_layout & actual_layout,
+        const std::set<std::string> & responded_nodes,
         dist_model_record * out) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = records_.find(model_id);
@@ -354,7 +355,26 @@ bool cluster_model_registry::apply_actual(
     }
 
     dist_model_record & r = it->second;
-    r.actual = actual_layout;
+
+    // Only nodes that answered may change their own records. This used to be a
+    // wholesale replacement, so a poll taken while a machine was switched off
+    // erased that machine's layers from the registry -- and everything
+    // downstream then read them as absent. The install planner does not
+    // consult node liveness at all, so it would happily plan a re-download of
+    // a 320 MB embedding onto the very node that was offline and still had it
+    // (measured on gemma-3-1b, 2026-07-28).
+    //
+    // Silence is not evidence of an empty disk (Task 24, principle 3:
+    // deletion requires positive evidence).
+    actual_model_layout merged = actual_layout;
+    if (r.actual.has_value()) {
+        for (const auto & layer : r.actual->layers) {
+            if (responded_nodes.count(layer.node_id) == 0) {
+                merged.layers.push_back(layer);
+            }
+        }
+    }
+    r.actual = merged;
 
     if (out) {
         *out = r;

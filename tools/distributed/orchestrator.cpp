@@ -733,7 +733,7 @@ static void coordinate_install_plan_execute(
                     poll_installed_layers_from_nodes(model_id, actual, online_nodes);
                 dist_model_record * record = g_registry.find(model_id);
                 if (record) {
-                    g_registry.apply_actual(model_id, actual, record);
+                    g_registry.apply_actual(model_id, actual, online_nodes, record);
                     refresh_model_coverage(model_id, online_nodes, record);
                     record = g_registry.find(model_id);
                     if (record) {
@@ -876,7 +876,7 @@ static bool build_and_store_install_plan(
     actual_model_layout actual;
     std::set<std::string> online_nodes;
     poll_installed_layers_from_nodes(model_id, actual, online_nodes);
-    g_registry.apply_actual(model_id, actual, record);
+    g_registry.apply_actual(model_id, actual, online_nodes, record);
     refresh_model_coverage(model_id, online_nodes, record);
 
     record = g_registry.find(model_id);
@@ -1020,7 +1020,7 @@ static void coordinate_rebalance_pipeline(const std::string model_id) {
     actual_model_layout actual;
     std::set<std::string> online_nodes;
     poll_installed_layers_from_nodes(model_id, actual, online_nodes);
-    g_registry.apply_actual(model_id, actual);
+    g_registry.apply_actual(model_id, actual, online_nodes);
     g_registry.refresh_pending_coverage(model_id, online_nodes);
 
     record = g_registry.find(model_id);
@@ -1051,7 +1051,7 @@ static void sync_model_state_from_cluster(
     actual_model_layout actual;
     std::set<std::string> online_nodes;
     poll_installed_layers_from_nodes(model_id, actual, online_nodes);
-    g_registry.apply_actual(model_id, actual, record);
+    g_registry.apply_actual(model_id, actual, online_nodes, record);
 
     record = g_registry.find(model_id);
     if (!record) {
@@ -5418,7 +5418,7 @@ int main(int argc, char ** argv) {
         std::set<std::string> online_nodes;
         poll_installed_layers_from_nodes(model_id, actual, online_nodes);
 
-        if (!g_registry.apply_actual(model_id, actual, record)) {
+        if (!g_registry.apply_actual(model_id, actual, online_nodes, record)) {
             res.status = 404;
             res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
             return;
@@ -5472,7 +5472,7 @@ int main(int argc, char ** argv) {
         std::set<std::string> online_nodes;
         poll_installed_layers_from_nodes(model_id, actual, online_nodes);
 
-        if (!g_registry.apply_actual(model_id, actual, record)) {
+        if (!g_registry.apply_actual(model_id, actual, online_nodes, record)) {
             res.status = 404;
             res.set_content(json({ { "error", "model not registered" } }).dump(), "application/json");
             return;
@@ -5711,7 +5711,7 @@ int main(int argc, char ** argv) {
         actual_model_layout actual;
         std::set<std::string> online_nodes;
         poll_installed_layers_from_nodes(model_id, actual, online_nodes);
-        g_registry.apply_actual(model_id, actual, record);
+        g_registry.apply_actual(model_id, actual, online_nodes, record);
         refresh_model_coverage(model_id, online_nodes, record);
         record = g_registry.find(model_id);
         if (!record) {

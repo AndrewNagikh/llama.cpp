@@ -117,9 +117,16 @@ public:
             dist_model_record * out = nullptr);
 
     // Store actual installed layers reported by nodes.
+    //
+    // `responded_nodes` are the nodes that actually answered the poll. Records
+    // for any other node are kept as they were: a node that did not answer has
+    // told us nothing about its disk, and treating silence as an empty disk is
+    // how the registry came to "forget" layers that were sitting right there.
+    // Pass an empty set only when there is genuinely nothing to preserve.
     bool apply_actual(
             const std::string & model_id,
             const actual_model_layout & actual,
+            const std::set<std::string> & responded_nodes,
             dist_model_record * out = nullptr);
 
     // Store a computed coverage report.
