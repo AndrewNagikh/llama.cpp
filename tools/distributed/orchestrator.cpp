@@ -3776,6 +3776,27 @@ int main(int argc, char ** argv) {
             const auto prev_it = g_nodes.find(node.node_id);
             if (prev_it == g_nodes.end()) {
                 cluster_changed = true;
+            } else if (!node_is_online(prev_it->second)) {
+                // A node that had gone quiet and is heartbeating again is a
+                // membership change, even though its map entry never went
+                // away and its score is unchanged.
+                //
+                // Nothing erases entries from g_nodes, so before this the
+                // only "new node" was one that had never registered since
+                // the orchestrator started. A returning machine looked like
+                // an ordinary heartbeat: no resync, no re-poll, and every
+                // model on it kept whatever coverage was recorded while it
+                // was absent. Measured 2026-07-28 -- ten models left
+                // DEGRADED, node-a back and healthy for minutes, not one of
+                // them recovered until each was refreshed by hand.
+                //
+                // Re-polling here is safe to do eagerly: what may actually
+                // be *done* to a layout is decided by decide_layout_action(),
+                // which keeps or repairs and only recomputes when there is no
+                // runnable layout to protect.
+                cluster_changed = true;
+                fprintf(stderr, "orchestrator: %s is back after being offline -- resyncing\n",
+                        node.node_id.c_str());
             } else {
                 const auto & prev = prev_it->second;
                 const double score_base = std::max(prev.score, 1.0);
