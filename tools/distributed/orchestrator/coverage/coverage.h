@@ -93,6 +93,11 @@ struct coverage_report {
     std::vector<int32_t> corrupted;
     std::vector<int32_t> unavailable;
 
+    // Which machines those unavailable layers are on. Carried so a caller can
+    // say "start node-c" instead of "some node is down" -- naming it is the
+    // difference between an actionable message and a shrug.
+    std::vector<std::string> unavailable_nodes;
+
     nlohmann::json to_json() const;
     static coverage_report from_json(const nlohmann::json & j);
 };

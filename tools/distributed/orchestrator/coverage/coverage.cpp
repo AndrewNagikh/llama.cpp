@@ -280,6 +280,7 @@ json coverage_report::to_json() const {
         { "missing_layers", missing_layers },
         { "corrupted_layers", corrupted_layers },
         { "unavailable_layers", unavailable_layers },
+        { "unavailable_nodes", unavailable_nodes },
         { "missing", missing_json },
         { "corrupted", corrupted_json },
         { "unavailable", unavailable_json },
@@ -295,6 +296,11 @@ coverage_report coverage_report::from_json(const json & j) {
     report.missing_layers = j.value("missing_layers", 0);
     report.corrupted_layers = j.value("corrupted_layers", 0);
     report.unavailable_layers = j.value("unavailable_layers", 0);
+    if (j.contains("unavailable_nodes") && j["unavailable_nodes"].is_array()) {
+        for (const auto & item : j["unavailable_nodes"]) {
+            report.unavailable_nodes.push_back(item.get<std::string>());
+        }
+    }
     if (j.contains("missing") && j["missing"].is_array()) {
         for (const auto & item : j["missing"]) {
             report.missing.push_back(item.get<int32_t>());
@@ -376,6 +382,10 @@ coverage_report compute_coverage(
         // would re-download layers that were never gone.
         if (!node_is_online(placement.node_id, online_nodes)) {
             report.unavailable.push_back(placement.layer_index);
+            if (std::find(report.unavailable_nodes.begin(), report.unavailable_nodes.end(),
+                    placement.node_id) == report.unavailable_nodes.end()) {
+                report.unavailable_nodes.push_back(placement.node_id);
+            }
             continue;
         }
 

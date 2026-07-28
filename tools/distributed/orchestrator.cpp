@@ -936,6 +936,78 @@ static bool build_and_store_install_plan(
     return applied;
 }
 
+// A model whose layers sit on a node that is not answering is UNAVAILABLE, not
+// broken. "Repairing" it means fetching that node's share from the internet
+// again and spreading it over whoever is left: correct when the machine is
+// gone for good, pure waste when it is merely switched off -- and the second
+// case is far more common in a home cluster.
+//
+// So the calls that would move data refuse by default and name the machine to
+// turn on instead. `confirm_unavailable: true` is the caller stating that node
+// is not coming back; the dashboard sends it from its confirm dialog.
+struct unavailable_advice {
+    bool                     applies = false;
+    std::vector<std::string> offline_nodes;
+    int                      unavailable_layers = 0;
+};
+
+static unavailable_advice describe_unavailable(const dist_model_record & record) {
+    unavailable_advice out;
+    if (!record.coverage.has_value() ||
+            record.coverage->state != coverage_state::unavailable) {
+        return out;
+    }
+    out.applies = true;
+    out.unavailable_layers = record.coverage->unavailable_layers;
+
+    // compute_coverage already worked out which machines those layers are on.
+    out.offline_nodes = record.coverage->unavailable_nodes;
+    return out;
+}
+
+static json unavailable_advice_json(
+        const unavailable_advice & advice,
+        const std::string & model_id) {
+    std::string nodes;
+    for (size_t i = 0; i < advice.offline_nodes.size(); ++i) {
+        nodes += (i ? ", " : "") + advice.offline_nodes[i];
+    }
+    if (nodes.empty()) {
+        nodes = "(unknown)";
+    }
+
+    return json{
+        { "state", "UNAVAILABLE" },
+        { "offline_nodes", advice.offline_nodes },
+        { "unavailable_layers", advice.unavailable_layers },
+        { "message",
+          "Model is UNAVAILABLE, not damaged: " + std::to_string(advice.unavailable_layers) +
+          " layer(s) are on " + nodes + ", which is not answering. Those layers are "
+          "still on that machine's disk. Start it and the model returns on its own, "
+          "with nothing transferred." },
+        { "recommended_action", "start " + nodes + ", then re-check /models/" + model_id + "/coverage" },
+        { "if_node_is_gone_for_good",
+          "Proceeding re-downloads those layers from the internet and spreads them "
+          "over the nodes that are left. Only do this if " + nodes + " is not coming back." },
+        { "command",
+          "curl -X POST <orchestrator>/models/" + model_id +
+          "/optimize -H 'Content-Type: application/json' -d '{\"confirm_unavailable\":true}'" },
+    };
+}
+
+// Body flag by which a caller states the offline node is not coming back.
+static bool body_confirms_unavailable(const std::string & body) {
+    if (body.empty()) {
+        return false;
+    }
+    try {
+        const json j = json::parse(body);
+        return j.value("confirm_unavailable", false);
+    } catch (...) {
+        return false;
+    }
+}
+
 static optimization_result optimize_registered_model(
         const std::string & model_id,
         const optimizer_policy * policy_override = nullptr) {
@@ -5379,6 +5451,21 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        // Relaying out an UNAVAILABLE model abandons the absent node's copies
+        // and re-fetches them elsewhere. Right when that machine is gone,
+        // destructive when it is merely off -- so say so and let the caller
+        // decide, rather than guessing on their behalf.
+        {
+            const unavailable_advice advice = describe_unavailable(*record);
+            if (advice.applies && !body_confirms_unavailable(req.body)) {
+                json out = unavailable_advice_json(advice, model_id);
+                out["error"] = "model is UNAVAILABLE -- refusing to relayout without confirmation";
+                res.status = 409;
+                res.set_content(out.dump(), "application/json");
+                return;
+            }
+        }
+
         const optimization_result result = optimize_registered_model(model_id, &policy);
         if (result.decision == optimizer_decision::rebalance) {
             std::thread([model_id]() {
@@ -5576,13 +5663,23 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        res.set_content(json({
+        json plan_out = json{
             { "status", "ok" },
             { "model", model_id },
             { "operation_count", record->stored_install_plan->operation_count },
             { "total_download_bytes", record->stored_install_plan->total_download_bytes },
             { "install_plan", record->stored_install_plan->to_json() },
-        }).dump(), "application/json");
+        };
+        // Read-only call, so nothing to refuse -- but this is where an operator
+        // looks before repairing, and it is the right moment to say that
+        // turning the machine back on is free and this is not.
+        {
+            const unavailable_advice advice = describe_unavailable(*record);
+            if (advice.applies) {
+                plan_out["warning"] = unavailable_advice_json(advice, model_id);
+            }
+        }
+        res.set_content(plan_out.dump(), "application/json");
 
         if (perf_on) {
             char attrs[256];
@@ -5638,6 +5735,18 @@ int main(int argc, char ** argv) {
             res.status = 404;
             res.set_content(json({ { "error", "manifest not ready" } }).dump(), "application/json");
             return;
+        }
+
+        // Same gate as /optimize: this is the call that actually moves bytes.
+        {
+            const unavailable_advice advice = describe_unavailable(*record);
+            if (advice.applies && !body_confirms_unavailable(req.body)) {
+                json out = unavailable_advice_json(advice, model_id);
+                out["error"] = "model is UNAVAILABLE -- refusing to install without confirmation";
+                res.status = 409;
+                res.set_content(out.dump(), "application/json");
+                return;
+            }
         }
 
         std::map<std::string, dist_node_info> nodes_copy;

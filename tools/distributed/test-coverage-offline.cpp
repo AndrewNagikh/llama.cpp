@@ -79,6 +79,11 @@ int main() {
         check("  its layers are unavailable, not missing",
                 r.unavailable_layers == 3 && r.missing_layers == 0, summary(r));
         check("  visible layers still counted ready", r.ready_layers == 6, summary(r));
+        // The name is what makes the message actionable: "start node-a", not
+        // "a node is down".
+        check("  names the machine to switch on",
+                r.unavailable_nodes.size() == 1 && r.unavailable_nodes[0] == "node-a",
+                r.unavailable_nodes.empty() ? "(none)" : r.unavailable_nodes[0]);
 
         // The install planner consumes this. If an absent node's layers leaked
         // into `missing` here, returning from a reboot would re-download them.
