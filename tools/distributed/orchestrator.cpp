@@ -3992,6 +3992,133 @@ int main(int argc, char ** argv) {
         }).dump(), "application/json");
     });
 
+    // GET /hf/draft-candidates?repo=...  -- look for a speculative draft model
+    // to pair with a target.
+    //
+    // There is no declared field for this. Hugging Face metadata has no
+    // draft/speculative key, `base_model` points at a GGUF's unquantized
+    // source rather than a pair, and target model cards do not mention drafts
+    // at all (checked on Llama-3.3-70B: zero occurrences).
+    //
+    // What does exist: draft models name their target in the repo name
+    // (alamios/Mistral-Small-3.1-DRAFT-0.5B) and state the pairing in README
+    // prose ("meant to be used as draft model for speculative decoding with
+    // <link>"). So this searches by family and reports the evidence it found
+    // per candidate -- it is a shortlist to measure, never an assertion that a
+    // pair works. Acceptance is strongly pair-dependent: the same 1B draft gave
+    // x1.64 on Llama-3.2-3B and a 19% hit rate with no speedup on
+    // Llama-3.3-70B.
+    svr.Get("/hf/draft-candidates", [](const httplib::Request & req, httplib::Response & res) {
+        const std::string repo = req.get_param_value("repo");
+        if (repo.empty()) {
+            res.status = 400;
+            res.set_content(json({ { "error", "repo required" } }).dump(), "application/json");
+            return;
+        }
+
+        // Family stem: drop the owner, then the quant/format suffixes that
+        // would never appear in a draft's name ("bartowski/Qwen3-14B-GGUF" ->
+        // "Qwen3").
+        std::string stem = repo.substr(repo.find('/') + 1);
+        for (const char * suffix : { "-GGUF", "-gguf", "-Instruct", "-instruct" }) {
+            const size_t at = stem.find(suffix);
+            if (at != std::string::npos) {
+                stem = stem.substr(0, at);
+            }
+        }
+        // Keep the family and its size marker, e.g. "Qwen3-14B" -> "Qwen3".
+        const size_t dash = stem.find('-');
+        const std::string family = dash == std::string::npos ? stem : stem.substr(0, dash);
+
+        // The target's own size marker ("70b", "14b"). A candidate carrying it
+        // is the target itself under some other name, not a draft for it --
+        // searching "Llama draft" turns up
+        // Llama-3.3-70B-Instruct-Q3_K_M-draft-layers, which is the 70B.
+        std::string target_size;
+        {
+            std::string lower_stem = stem;
+            std::transform(lower_stem.begin(), lower_stem.end(), lower_stem.begin(),
+                    [](unsigned char c) { return (char) std::tolower(c); });
+            for (size_t i = 0; i + 1 < lower_stem.size(); ++i) {
+                if (!std::isdigit((unsigned char) lower_stem[i])) {
+                    continue;
+                }
+                size_t j = i;
+                while (j < lower_stem.size() && std::isdigit((unsigned char) lower_stem[j])) {
+                    ++j;
+                }
+                if (j < lower_stem.size() && lower_stem[j] == 'b') {
+                    target_size = lower_stem.substr(i, j - i + 1);
+                }
+            }
+        }
+
+        httplib::Client cli("https://huggingface.co");
+        cli.set_connection_timeout(10, 0);
+        cli.set_read_timeout(30, 0);
+        cli.set_follow_location(true);
+
+        const std::string query = family + " draft";
+        const std::string path = "/api/models?filter=gguf&sort=downloads&direction=-1&limit=10&search=" +
+                httplib::encode_uri_component(query);
+
+        const auto hf = cli.Get(path.c_str(), hf_headers());
+        if (!hf || hf->status != 200) {
+            res.status = hf ? hf->status : 502;
+            res.set_content(json({ { "error", "Hugging Face search failed" } }).dump(), "application/json");
+            return;
+        }
+
+        json parsed;
+        try {
+            parsed = json::parse(hf->body);
+        } catch (...) {
+            res.status = 502;
+            res.set_content(json({ { "error", "invalid JSON from Hugging Face" } }).dump(), "application/json");
+            return;
+        }
+
+        json candidates = json::array();
+        if (parsed.is_array()) {
+            for (const auto & m : parsed) {
+                const std::string id = m.value("id", "");
+                if (id.empty() || id == repo) {
+                    continue;
+                }
+                // Only things that actually call themselves a draft.
+                std::string lower = id;
+                std::transform(lower.begin(), lower.end(), lower.begin(),
+                        [](unsigned char c) { return (char) std::tolower(c); });
+                if (lower.find("draft") == std::string::npos &&
+                        lower.find("drafter") == std::string::npos) {
+                    continue;
+                }
+                // Same size as the target means it is the target, not a draft.
+                if (!target_size.empty() && lower.find(target_size) != std::string::npos) {
+                    continue;
+                }
+                candidates.push_back({
+                    { "repository", id },
+                    { "downloads", m.value("downloads", 0) },
+                    // Named after the family we searched for; the pairing is
+                    // still unproven until measured.
+                    { "evidence", "name matches family + draft" },
+                });
+            }
+        }
+
+        res.set_content(json({
+            { "target", repo },
+            { "family", family },
+            { "candidates", candidates },
+            // Said explicitly so the UI cannot present this as a fact.
+            { "verified", false },
+            { "note", "heuristic shortlist; Hugging Face has no declared draft-pair "
+                      "field. Acceptance must be measured -- it is strongly "
+                      "pair-dependent." },
+        }).dump(), "application/json");
+    });
+
     // GET /v1/models -- OpenAI shape. Only models that are actually installed
     // are listed; a client picking one from here should be able to use it.
     svr.Get("/v1/models", [](const httplib::Request &, httplib::Response & res) {
