@@ -7,6 +7,7 @@
 #include "orchestrator/registry_persistence.h"
 #include "orchestrator/manifest_builder/manifest_builder.h"
 #include "orchestrator/layout_planner/layout_planner.h"
+#include "orchestrator/layout_policy/layout_policy.h"
 #include "orchestrator/coverage/coverage.h"
 #include "orchestrator/coverage/runtime_coverage.h"
 #include "architecture/semantic_runtime_descriptor.h"
@@ -1145,76 +1146,86 @@ static void trigger_cluster_optimization_async() {
             }
         }
 
+        // Read the online set once. The policy's first question is whether the
+        // layout's own nodes are up, and re-reading per model would let the
+        // answer change halfway through the sweep -- so some models would be
+        // judged against a three-node cluster and others against two.
+        std::set<std::string> online_nodes;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            for (const auto & entry : g_nodes) {
+                if (entry.second.online) {
+                    online_nodes.insert(entry.first);
+                }
+            }
+        }
+
         const auto models = g_registry.list();
         for (const auto & model : models) {
             if (!model.manifest.has_value()) {
                 continue;
             }
-            if (model.coverage.has_value() &&
-                    model.coverage->state == coverage_state::ready) {
-                // Healthy again -- forget any earlier futile attempts so a
-                // later, genuine problem still gets its retries.
-                std::lock_guard<std::mutex> lock(g_optimize_attempt_mu);
-                g_optimize_attempts.erase(model.model_id);
-                continue;
-            }
 
-            // Every layer is present and intact, so the LAYOUT is not the
-            // problem -- what is left is stale state from an earlier layout
-            // (blobs sitting on nodes the current plan no longer uses).
-            //
-            // Relaying out here is actively harmful: it moves the expected
-            // placement again and orphans a fresh set of blobs, which keeps
-            // the model non-READY, which qualifies it for yet another
-            // relayout on the next cluster change. Observed on gemma-3-1b,
-            // which came back DEGRADED after every restart with 0 missing and
-            // 0 corrupted layers -- its repair plan was 479 operations, all
-            // DELETE, zero bytes to download.
-            //
-            // Cleanup is left to an explicit request (the Models screen's
-            // repair action) rather than started here, because it deletes
-            // data and a background sweep is the wrong place to decide that.
-            if (model.coverage.has_value() &&
-                    model.coverage->total_layers > 0 &&
-                    model.coverage->missing_layers == 0 &&
-                    model.coverage->corrupted_layers == 0 &&
-                    model.coverage->ready_layers == model.coverage->total_layers) {
-                fprintf(stderr,
-                        "orchestrator: %s has all %d layers but is not READY -- stale blobs from "
-                        "a previous layout; skipping relayout (repair it to clean them up)\n",
-                        model.model_id.c_str(), model.coverage->total_layers);
-                continue;
-            }
-
-            // A node that is merely offline still holds its layers. Relaying
-            // out around it would move the model onto the survivors and delete
-            // those copies -- turning a temporary absence into permanent data
-            // loss the moment the node comes back.
-            if (model.layout.has_value()) {
-                std::set<std::string> layout_nodes;
+            // What may be done to this layout is decided by one pure function
+            // (Task 24) rather than by a stack of guards accumulated one
+            // incident at a time. Each guard here was correct about the case
+            // that produced it and silent about the ones it didn't, which is
+            // why data loss kept recurring in a slightly different shape.
+            layout_policy_input in;
+            in.has_stored_layout = model.layout.has_value() &&
+                    !model.layout->desired.placements.empty();
+            if (in.has_stored_layout) {
                 for (const auto & p : model.layout->desired.placements) {
-                    layout_nodes.insert(p.node_id);
-                }
-                bool any_offline = false;
-                {
-                    std::lock_guard<std::mutex> lock(g_mu);
-                    for (const auto & nid : layout_nodes) {
-                        const auto it = g_nodes.find(nid);
-                        if (it == g_nodes.end() || !it->second.online) {
-                            any_offline = true;
-                            break;
-                        }
-                    }
-                }
-                if (any_offline) {
-                    fprintf(stderr,
-                            "orchestrator: %s uses a node that is not online -- leaving its layout "
-                            "alone until the cluster is whole\n",
-                            model.model_id.c_str());
-                    continue;
+                    in.layout_nodes.insert(p.node_id);
                 }
             }
+            in.online_nodes = online_nodes;
+            // Every model with a manifest was re-polled at the top of this
+            // sweep, which is the whole reason that loop exists.
+            in.coverage_fresh = true;
+            if (model.coverage.has_value()) {
+                in.coverage         = model.coverage->state;
+                in.missing_layers   = model.coverage->missing_layers;
+                in.corrupted_layers = model.coverage->corrupted_layers;
+                in.total_layers     = model.coverage->total_layers;
+                in.ready_layers     = model.coverage->ready_layers;
+            }
 
+            std::string reason;
+            const layout_action action = decide_layout_action(in, reason);
+
+            if (action == layout_action::keep) {
+                // Nothing to do -- and if it is healthy, forget earlier futile
+                // attempts so a later, genuine problem still gets its retries.
+                if (in.coverage == coverage_state::ready) {
+                    std::lock_guard<std::mutex> lock(g_optimize_attempt_mu);
+                    g_optimize_attempts.erase(model.model_id);
+                }
+                continue;
+            }
+
+            if (action == layout_action::unavailable) {
+                fprintf(stderr, "orchestrator: %s layout left alone -- %s\n",
+                        model.model_id.c_str(), reason.c_str());
+                continue;
+            }
+
+            if (action == layout_action::repair) {
+                // A data problem, not a placement problem: the fix is to move
+                // blobs toward the stored layout, never to choose a new one.
+                // Not started here, because repair plans contain DELETEs and a
+                // background sweep is the wrong place to decide to delete
+                // anything. Surfaced for the Models screen's repair action.
+                fprintf(stderr,
+                        "orchestrator: %s needs repair against its stored layout (%s) -- "
+                        "not relaying out; run repair to fix the data\n",
+                        model.model_id.c_str(), reason.c_str());
+                continue;
+            }
+
+            // Only `recompute` reaches a relayout, and the policy makes that
+            // rare by design: no stored layout, or a stored one that cannot
+            // produce a runnable pipeline.
             {
                 std::lock_guard<std::mutex> lock(g_optimize_attempt_mu);
                 const int attempts = g_optimize_attempts[model.model_id];
@@ -1227,6 +1238,9 @@ static void trigger_cluster_optimization_async() {
                 }
                 g_optimize_attempts[model.model_id] = attempts + 1;
             }
+
+            fprintf(stderr, "orchestrator: %s relayout -- %s\n",
+                    model.model_id.c_str(), reason.c_str());
 
             const optimization_result result = optimize_registered_model(model.model_id);
             if (result.decision == optimizer_decision::rebalance) {
