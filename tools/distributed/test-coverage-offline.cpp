@@ -112,6 +112,36 @@ int main() {
                 r.state == coverage_state::degraded, summary(r));
     }
 
+    {   // The name is read off the layout, not matched against known ids, so a
+        // cluster of "garage-pc" and "attic-box" reports just as usefully.
+        // Guards the same property as the three-node de-hardcoding: node ids
+        // are labels the operator chooses, not a fixed set.
+        desired_model_layout odd;
+        odd.model_id = "test-model";
+        const char * odd_nodes[] = { "garage-pc", "attic-box" };
+        for (int i = 0; i < 4; ++i) {
+            layer_placement p;
+            p.layer_index = i;
+            p.node_id     = odd_nodes[i / 2];
+            odd.placements.push_back(p);
+        }
+        actual_model_layout inst;
+        inst.model_id = "test-model";
+        for (int i = 0; i < 4; ++i) {
+            installed_layer l;
+            l.layer_index = i;
+            l.node_id     = odd_nodes[i / 2];
+            l.state       = install_state::ready;
+            inst.layers.push_back(l);
+        }
+        const coverage_report r = compute_coverage(odd, inst, { "garage-pc" });
+        check("arbitrary node ids are named too",
+                r.state == coverage_state::unavailable &&
+                r.unavailable_nodes.size() == 1 &&
+                r.unavailable_nodes[0] == "attic-box",
+                r.unavailable_nodes.empty() ? "(none)" : r.unavailable_nodes[0]);
+    }
+
     {   // Round-trip, so a persisted registry keeps the distinction instead of
         // silently decaying back to DEGRADED on restart.
         const coverage_report r = compute_coverage(desired, actual, { "node-b", "node-c" });
